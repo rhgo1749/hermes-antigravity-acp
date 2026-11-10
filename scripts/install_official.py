@@ -73,8 +73,8 @@ def _launcher_variants(target: Path, default_args: tuple[str, ...]) -> tuple[str
     """The current and legacy launcher bodies this installer considers managed."""
     if os.name == "nt":
         joined_args = " ".join(default_args)
-        content = f'@echo off\r\nREM managed by hermes-antigravity-acp\r\n"{target}" {joined_args} %*\r\n'
-        legacy = f'@echo off\r\n"{target}" {joined_args} %*\r\n'
+        content = f'@echo off\nREM managed by hermes-antigravity-acp\n"{target}" {joined_args} %*\n'
+        legacy = f'@echo off\n"{target}" {joined_args} %*\n'
     else:
         quoted_target = str(target).replace("'", "'\\''")
         quoted_args = " ".join("'" + arg.replace("'", "'\\''") + "'" for arg in default_args)

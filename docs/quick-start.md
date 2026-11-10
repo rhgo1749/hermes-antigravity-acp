@@ -27,6 +27,13 @@ here assumes a personal mux, an account router, or a Hermes Core patch.
 
 ## 1. Install
 
+On Windows, after obtaining this repository, double-click `install-windows.cmd`.
+It uses the Python installed with Hermes when available, then falls back to the
+Windows Python launcher. It installs the pinned server and provider without
+signing in. This is a checkout-based shortcut, not a Hermes Catalog install;
+Windows execution remains unverified until tested on a Windows machine.
+
+From a terminal on Linux or macOS, run:
 ```bash
 python3 scripts/install_acp.py install
 ```

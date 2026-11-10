@@ -179,6 +179,21 @@ def test_clean_vanilla_install_and_provider_registration(monkeypatch, tmp_path, 
 
 
 
+def test_windows_launcher_text_round_trips_universal_newlines(monkeypatch, tmp_path):
+    official = _load_script(SCRIPTS / "install_official.py", "windows_launcher_newline_test")
+    login = _load_script(ROOT / "hermes-plugin" / "antigravity-acp" / "login.py", "windows_login_newline_test")
+    target = tmp_path / "server.exe"
+    with monkeypatch.context() as scoped:
+        scoped.setattr(official.os, "name", "nt")
+        current, legacy = official._launcher_variants(target, ())
+        login_bodies = login._managed_launcher_bodies(str(target), ())
+    assert {current, legacy} == login_bodies
+    launcher = tmp_path / "launcher.cmd"
+    for content in (current, legacy):
+        launcher.write_bytes(content.replace("\n", "\r\n").encode("utf-8"))
+        assert launcher.read_text(encoding="utf-8") == content
+
+
 def test_installer_refuses_to_replace_an_unmanaged_launcher(tmp_path):
     official = _load_script(SCRIPTS / "install_official.py", "official_installer_guard_test")
     launcher = tmp_path / "bin" / "antigravity-acp-official"
@@ -187,6 +202,18 @@ def test_installer_refuses_to_replace_an_unmanaged_launcher(tmp_path):
     with pytest.raises(RuntimeError, match="unmanaged official ACP launcher"):
         official._write_launcher(launcher, tmp_path / "server.par", ())
     assert "user-owned wrapper" in launcher.read_text(encoding="utf-8")
+
+
+def test_default_home_matches_windows_hermes_and_preserves_override(tmp_path):
+    deployer = _load_script(SCRIPTS / "deploy_hermes_profiles.py", "windows_home_resolution_test")
+    local = tmp_path / "Local"
+    home = tmp_path / "user"
+    resolve = deployer._default_hermes_home
+    assert resolve("win32", {"LOCALAPPDATA": str(local)}, home) == local / "hermes"
+    assert resolve("win32", {}, home) == home / "AppData" / "Local" / "hermes"
+    assert resolve("linux", {}, home) == home / ".hermes"
+    assert resolve("win32", {"LOCALAPPDATA": str(local), "HERMES_HOME": str(home / "custom")}, home) == home / "custom"
+    assert resolve("win32", {"LOCALAPPDATA": str(local), "HERMES_DATA_DIR_SUFFIX": "-test"}, home) == local / "hermes-test"
 
 
 def test_installer_default_hermes_home_respects_environment(monkeypatch, tmp_path):

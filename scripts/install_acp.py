@@ -33,7 +33,7 @@ import install_official as official_installer  # noqa: E402
 
 DEFAULT_PREFIX = Path.home() / ".local" / "opt" / "antigravity-acp"
 DEFAULT_BIN_DIR = Path.home() / ".local" / "bin"
-DEFAULT_HERMES_HOME = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes").expanduser()
+DEFAULT_HERMES_HOME = provider_installer._default_hermes_home(sys.platform, os.environ, Path.home())
 PROBE = SCRIPTS / "acp_probe.py"
 
 # Diagnostics NEVER echo raw server stderr. That text is NOT trusted: a server
