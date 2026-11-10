@@ -68,13 +68,20 @@ def main() -> int:
                 message = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if message.get("id") != 1:
+            if not isinstance(message, dict) or message.get("jsonrpc") != "2.0":
+                continue
+            if type(message.get("id")) is not int or message.get("id") != 1:
                 continue
             if "error" in message:
                 raise RuntimeError(f"initialize failed: {message['error']}")
-            result = message.get("result") or {}
+            result = message.get("result")
+            if not isinstance(result, dict):
+                raise RuntimeError("initialize failed: expected result object in response")
+            protocol_version = result.get("protocolVersion")
+            if type(protocol_version) is not int or protocol_version != 1:
+                raise RuntimeError("initialize failed: unsupported protocolVersion")
             summary = {
-                "protocolVersion": result.get("protocolVersion"),
+                "protocolVersion": protocol_version,
                 "agentInfo": result.get("agentInfo"),
                 "authMethods": result.get("authMethods"),
                 "agentCapabilities": result.get("agentCapabilities"),

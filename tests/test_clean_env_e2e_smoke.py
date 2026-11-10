@@ -734,6 +734,64 @@ def test_probe_timeout_path_suppresses_server_stderr_itself(tmp_path):
     assert re.search(r"sha256=[0-9a-f]{16}", combined)
 
 
+@pytest.mark.parametrize(
+    "payload, expected_err",
+    [
+        ('{"id": 1}', "Timed out waiting for ACP initialize"),
+        ('{"jsonrpc": "2.0", "id": 1}', "expected result object"),
+        ('{"jsonrpc": "2.0", "id": 1, "result": {}}', "unsupported protocolVersion"),
+        ('{"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": 2}}', "unsupported protocolVersion"),
+        ('{"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": "1"}}', "unsupported protocolVersion"),
+        ('{"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": true}}', "unsupported protocolVersion"),
+    ],
+)
+def test_acp_probe_validates_jsonrpc_result_and_protocol_version(tmp_path, payload, expected_err):
+    server = tmp_path / "fake_server.py"
+    server.write_text(
+        "import sys\n"
+        "for line in sys.stdin:\n"
+        f"    print({payload!r}, flush=True)\n"
+        "    break\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS / "acp_probe.py"), "--timeout", "2", "--",
+         sys.executable, str(server)],
+        capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode != 0
+    assert expected_err in result.stderr
+
+
+def test_acp_probe_succeeds_on_valid_initialize_response(tmp_path):
+    server = tmp_path / "fake_server.py"
+    valid_resp = json.dumps({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "protocolVersion": 1,
+            "agentInfo": {"name": "test"},
+        },
+    })
+    server.write_text(
+        "import sys\n"
+        "for line in sys.stdin:\n"
+        f"    print({valid_resp!r}, flush=True)\n"
+        "    break\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS / "acp_probe.py"), "--timeout", "2", "--",
+         sys.executable, str(server)],
+        capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode == 0
+    summary = json.loads(result.stdout)
+    assert summary["protocolVersion"] == 1
+    assert summary["agentInfo"] == {"name": "test"}
+    assert summary["authMethods"] is None
+
+
 def test_server_stderr_summary_echoes_nothing_and_never_reverses_secrets():
     installer = _load_script(SCRIPTS / "install_acp.py", "clean_env_smoke_summary")
     noisy = "\n".join(
