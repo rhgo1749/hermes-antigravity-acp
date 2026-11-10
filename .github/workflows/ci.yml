@@ -178,6 +178,95 @@ jobs:
           test ! -e "$HOME/.gemini"
           echo "runner-user live state: untouched"
 
+  windows-install:
+    name: Windows install and unauthenticated ACP (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2022
+            arch: x64
+            machine: AMD64
+          - runner: windows-11-arm
+            arch: arm64
+            machine: ARM64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      HERMES_HOME: ${{ runner.temp }}\acp-hermes
+      USERPROFILE: ${{ runner.temp }}\acp-user
+      HOME: ${{ runner.temp }}\acp-user
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install official Hermes without interactive setup
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path $env:USERPROFILE | Out-Null
+          $installer = Join-Path $env:RUNNER_TEMP 'hermes-install.ps1'
+          Invoke-WebRequest -Uri 'https://hermes-agent.nousresearch.com/install.ps1' -OutFile $installer
+          & $installer -NonInteractive -SkipBrowser -SkipComputerUse
+          if ($LASTEXITCODE -ne 0) { throw "Hermes installer failed: $LASTEXITCODE" }
+      - name: Run the actual Windows installer
+        shell: cmd
+        run: call install-windows.cmd < NUL
+      - name: Verify architecture, provider registration and ACP initialize
+        shell: pwsh
+        env:
+          EXPECTED_MACHINE: ${{ matrix.machine }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $python = Get-ChildItem "$env:HERMES_HOME\tools\python-*\python.exe" | Select-Object -Last 1 -ExpandProperty FullName
+          if (-not $python) { throw 'Hermes managed Python is missing' }
+          & $python -c 'import os, platform; assert platform.machine().upper() == os.environ["EXPECTED_MACHINE"], "unexpected native machine"'
+          if ($LASTEXITCODE -ne 0) { throw 'Native architecture check failed' }
+          $hermes = Get-ChildItem "$env:HERMES_HOME\bin\hermes.*" -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^hermes\.(exe|cmd)$' } | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $hermes) { throw 'Hermes launcher is missing' }
+          $plugins = & $hermes plugins list --plain
+          if ($LASTEXITCODE -ne 0) { throw 'Hermes plugin listing failed' }
+          if (($plugins -join "`n") -notmatch '(?m)^enabled\s+user\s+\S+\s+antigravity-acp-provider\s*$') {
+            throw 'Installed provider is not enabled'
+          }
+          & $python scripts/install_acp.py verify
+          if ($LASTEXITCODE -ne 0) { throw 'Unauthenticated ACP initialization failed' }
+      - name: Verify the login helper execution path without authenticating
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $python = Get-ChildItem "$env:HERMES_HOME\tools\python-*\python.exe" | Select-Object -Last 1 -ExpandProperty FullName
+          $check = @'
+          import json, os, runpy, subprocess, sys
+          from pathlib import Path
+
+          login = Path(os.environ['HERMES_HOME']) / 'plugins/model-providers/antigravity-acp/login.py'
+          module = runpy.run_path(str(login))
+          command, _ = module['_resolve_official_command']()
+          child_env = module['_child_env']()
+          probe = Path('scripts/acp_probe.py').resolve()
+          try:
+              result = subprocess.run(
+                  [sys.executable, str(probe), '--timeout', '30', '--', *command],
+                  env=child_env, capture_output=True, text=True, timeout=40,
+              )
+          except subprocess.TimeoutExpired:
+              raise SystemExit('Login-path initialization exceeded its hard limit') from None
+          if result.returncode:
+              raise SystemExit('Login-path initialization failed; server output suppressed')
+          try:
+              summary = json.loads(result.stdout)
+          except (ValueError, TypeError):
+              raise SystemExit('Login-path initialization returned malformed output') from None
+          if summary.get('protocolVersion') != 1:
+              raise SystemExit('Login-path initialization returned an unsupported protocol version')
+          print('Verified official login executable and restricted-environment ACP initialization; no login attempted')
+          '@
+          $check | & $python -
+          if ($LASTEXITCODE -ne 0) { throw 'Login helper initialization failed' }
+
   upstream-hermes-compat:
     name: Vanilla NousResearch Hermes provider API
     runs-on: ubuntu-latest
