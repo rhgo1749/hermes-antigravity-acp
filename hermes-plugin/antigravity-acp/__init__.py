@@ -13,16 +13,39 @@ from typing import Any, cast
 from providers import register_provider
 from providers.base import ProviderProfile
 
-# Every probe below spawns the official server process from scratch (the ACP
-# stdio contract is one process per session).  On Windows the spawn pays a
-# full cold start of the multi-hundred-MB official binary through a cmd.exe
-# wrapper, which stalled the CLI on every status render and every ``/model``
-# open.  A signed-in probe and a live model surface are stable within a
-# session, so cache them in-process with a TTL instead of re-spawning.
+# Status probes and model discovery each need a live server surface.  The
+# warm process pool in client.py usually serves these from a parked process,
+# but the first call in a Hermes process still cold-spawns the official
+# binary — through a cmd.exe wrapper on Windows, which stalled the CLI on
+# every status render and every ``/model`` open.  A signed-in probe and a
+# live model surface are stable within a session, so cache them in-process
+# with a TTL instead of re-probing.
 # A negative login probe is never cached: the sign-in wizard re-checks
 # seconds after an interactive login and must re-probe immediately.
 _LOGIN_TRUE_TTL_SECONDS = 300.0
 _MODELS_TTL_SECONDS = 300.0
+
+# First-call budgets for spawn + initialize + one round-trip.  On Windows
+# ARM64 laptops every fresh server process is scanned by Defender before it
+# answers, so a cold spawn alone can exceed 20s; the previous 20s/25s hard
+# budgets turned a merely slow machine into a false "did not answer a status
+# probe" / "Login failed" even right after a successful interactive login.
+# The TTL caches above mean this budget is paid at most once per process, so
+# generous defaults cost nothing on healthy machines.  Overridable per box.
+_PROBE_TIMEOUT_SECONDS = 60.0
+_DISCOVERY_TIMEOUT_SECONDS = 60.0
+
+
+def _env_timeout(name: str, default: float) -> float:
+    """Positive float from ``name`` or ``default``; junk falls back silently."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
 
 _DEFAULT_RATE_LIMIT_RETRIES = 2
 _MAX_RATE_LIMIT_RETRIES = 8
@@ -155,18 +178,23 @@ class AntigravityACPProfile(ProviderProfile):
             return None
         return [str(row.get("id") or "").strip() for row in rows if row.get("id")] or None
 
-    def _probe_login_state(self, *, timeout_seconds: float = 20.0) -> bool:
+    def _probe_login_state(self, *, timeout_seconds: float | None = None) -> bool:
         """True when a fresh server session opens; False on the auth boundary.
 
-        Spawns the official server once and performs only ``initialize`` and
-        ``session/new`` — never authenticate, login, or a model prompt. Any
-        non-auth failure raises so callers can fail closed instead of
-        reporting a false "logged in". A fresh cached answer (see the TTL
-        constants) is returned without spawning.
+        Spawns (or warm-reuses) the official server and performs only
+        ``initialize`` and ``session/new`` — never authenticate, login, or a
+        model prompt. Any non-auth failure raises so callers can fail closed
+        instead of reporting a false "logged in". A fresh cached answer (see
+        the TTL constants) is returned without spawning.
         """
         cached = self._cached_login_probe()
         if cached is not None:
             return cached
+        if timeout_seconds is None:
+            timeout_seconds = _env_timeout(
+                "HERMES_ANTIGRAVITY_ACP_PROBE_TIMEOUT_SECONDS",
+                _PROBE_TIMEOUT_SECONDS,
+            )
         client = self.create_client(
             command=self.process_command,
             args=list(self.process_args),
@@ -260,7 +288,10 @@ class AntigravityACPProfile(ProviderProfile):
             return None
         try:
             config_entries, legacy_entries = client.session_model_surface(
-                timeout_seconds=25.0
+                timeout_seconds=_env_timeout(
+                    "HERMES_ANTIGRAVITY_ACP_DISCOVERY_TIMEOUT_SECONDS",
+                    _DISCOVERY_TIMEOUT_SECONDS,
+                )
             )
         except Exception:
             return None

@@ -418,3 +418,56 @@ def test_negative_login_probe_is_never_cached(monkeypatch, tmp_path) -> None:
     assert profile.setup_status()["logged_in"] is False
     assert profile.setup_status()["logged_in"] is False
     assert spawns["count"] == 2
+
+
+def test_probe_and_discovery_budgets_survive_slow_spawns(monkeypatch, tmp_path) -> None:
+    """Windows ARM64 cold-spawn regression: Defender scans each fresh server
+    process, so the first probe can exceed the old 20s/25s hard budgets. That
+    produced a false "did not answer a status probe" and "Login failed" even
+    immediately after a successful interactive login. The budgets must be
+    generous by default and env-overridable."""
+    module = _load_plugin(monkeypatch)
+    profile = module.antigravity_acp
+    launcher = tmp_path / "antigravity-acp-official"
+    launcher.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setattr(profile, "process_command", str(launcher))
+
+    budgets = {}
+
+    class BudgetClient:
+        def list_models(self, *, timeout_seconds):
+            budgets["probe"] = timeout_seconds
+            return ["server-model-a"]
+
+        def session_model_surface(self, *, timeout_seconds):
+            budgets["discovery"] = timeout_seconds
+            return ([{"value": "server-model-a", "name": "Server Model A"}], [])
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(profile, "create_client", lambda **kw: BudgetClient())
+
+    assert profile.setup_status()["logged_in"] is True
+    assert profile.discover_models() is not None
+    assert budgets["probe"] >= 60.0
+    assert budgets["discovery"] >= 60.0
+
+    monkeypatch.setenv("HERMES_ANTIGRAVITY_ACP_PROBE_TIMEOUT_SECONDS", "120")
+    monkeypatch.setenv("HERMES_ANTIGRAVITY_ACP_DISCOVERY_TIMEOUT_SECONDS", "90")
+    profile._login_probe_cache = None
+    profile._models_cache = None
+    assert profile.setup_status()["logged_in"] is True
+    assert profile.discover_models() is not None
+    assert budgets["probe"] == 120.0
+    assert budgets["discovery"] == 90.0
+
+    # Junk or non-positive overrides must not shrink the budget below default.
+    monkeypatch.setenv("HERMES_ANTIGRAVITY_ACP_PROBE_TIMEOUT_SECONDS", "nonsense")
+    monkeypatch.setenv("HERMES_ANTIGRAVITY_ACP_DISCOVERY_TIMEOUT_SECONDS", "-5")
+    profile._login_probe_cache = None
+    profile._models_cache = None
+    assert profile.setup_status()["logged_in"] is True
+    assert profile.discover_models() is not None
+    assert budgets["probe"] == 60.0
+    assert budgets["discovery"] == 60.0
