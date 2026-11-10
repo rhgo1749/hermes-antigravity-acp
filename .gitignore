@@ -1,0 +1,32 @@
+__pycache__/
+.pytest_cache/
+*.pyc
+.venv/
+
+# Local credentials, account registries, and generated runtime state.
+.env
+.env.*
+!.env.example
+credentials.json
+client_secret.json
+token.json
+acp-accounts.json
+acp-mux-state.json
+antigravity-acp-sessions.json
+antigravity-acp-native-limits.json
+
+# Logs, downloaded vendor binaries, and private deployment/recovery artifacts.
+*.log
+*.pem
+*.key
+*.p12
+*.pfx
+*.par
+*.zip
+logs/
+plugin-backups/
+deployment-artifacts/
+.deploy/
+.local-deploy/
+dist/
+build/

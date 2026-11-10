@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "default_home": "/srv/acp/lanes/default",
+  "accounts": [
+    {
+      "home": null,
+      "label": "primary",
+      "priority": 0
+    },
+    {
+      "home": "/srv/acp/lanes/secondary",
+      "label": "secondary",
+      "priority": 0
+    },
+    {
+      "home": "/srv/acp/lanes/fallback",
+      "label": "fallback",
+      "priority": 1
+    }
+  ]
+}

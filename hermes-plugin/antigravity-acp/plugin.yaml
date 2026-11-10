@@ -1,0 +1,19 @@
+name: antigravity-acp-provider
+kind: model-provider
+version: 0.7.1
+description: Google Antigravity through Google's official ACP server
+author: rhgo1749
+# Compatibility floor proven by CI (catalog-floor-gate job): official Hermes
+# v0.21.6 passes `hermes plugins validate --install-deps` and the strict
+# provider-seam tests. Raise only with a new floor-gate run; never guess.
+requires_hermes: ">=0.21.6"
+# Registered surface, verified against the validate capability probe: this
+# plugin registers exactly one model-provider profile and nothing else.
+provides_tools: []
+provides_hooks: []
+provides_middleware: []
+# No credential environment variables: the official ACP child authenticates
+# through Google's own runtime, never through keys read by this plugin.
+requires_env: []
+# Stdlib-only plugin source (plus the public providers seam).
+python_dependencies: []

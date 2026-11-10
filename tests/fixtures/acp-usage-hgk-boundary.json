@@ -1,0 +1,47 @@
+{
+  "fixture_id": "antigravity-acp-usage-hgk-default-zero-v1",
+  "scope": "Documented sanitized boundary fixture; not a live Hermes Core or HGK integration test.",
+  "provider_response": {
+    "usage": null,
+    "antigravity_usage_telemetry": {
+      "schema_id": "antigravity-acp-usage-v1",
+      "status": "unavailable",
+      "provider": "antigravity-acp",
+      "model": "gemini-3.8-flash-high",
+      "request_usage": {
+        "input_tokens": null,
+        "output_tokens": null,
+        "cache_read_tokens": null,
+        "cache_write_tokens": null,
+        "reasoning_tokens": null
+      },
+      "provenance": {
+        "source": "official_acp_v1.4.0",
+        "request_usage": "SessionPromptResult has no per-request token accounting",
+        "context_occupancy": "usage_update.used is per-model-call consumption, not billing usage"
+      },
+      "native_session_id_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "turn_id_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "context_occupancy": null
+    }
+  },
+  "hermes_core_state": {
+    "session_model_usage_rows": [],
+    "sessions_row_defaults": {
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "billing_provider": null
+    }
+  },
+  "hgk_local_usage_projection": {
+    "model_key": "unknown/gemini-3.8-flash-high",
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "total_tokens": 0
+  },
+  "run_attribution_diagnostic": {
+    "class": "worker_session_id_missing",
+    "observed_runs": 173,
+    "independent_of_acp_usage_unavailability": true
+  }
+}

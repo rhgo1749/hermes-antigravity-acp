@@ -1,0 +1,341 @@
+name: Credential-free ACP checks
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  fake-acp:
+    name: Fake ACP regressions and static checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+      - name: Install test tools
+        run: python -m pip install --disable-pip-version-check pytest==9.1.1 pytest-asyncio==1.4.0 ruff==0.15.10
+      - name: Run static checks
+        run: ruff check scripts hermes-plugin tests
+      - name: Audit repository hygiene
+        run: python scripts/audit_public_tree.py
+      - name: Run credential-free regressions
+        # Auto-discovery: every file under tests/ runs unless upstream-venv-only.
+        # test_upstream_hermes_runtime_contracts.py needs the upstream Hermes
+        # venv and is exercised by the upstream-hermes-compat job below.
+        run: >-
+          python -m pytest -q tests
+          --ignore=tests/test_upstream_hermes_runtime_contracts.py
+      - name: Clean-env install smoke (verified vs registry-pinned OS tiers)
+        # Credential-free fake-ACP lifecycle for install paths
+        # A/B/combined plus the per-platform registry-pin install mechanics
+        # behind the README verification tiers (Linux x86_64 carries a bounded
+        # out-of-repo initialize-only canary record; macOS arm64, Windows
+        # x64/arm64, Linux aarch64 are registry-pinned only). The executed
+        # real-binary install lifecycle for Linux x86_64 lives in the
+        # acp-clean-room job below — this job authenticates nothing and never
+        # executes the real Google binary.
+        run: python -m pytest -q tests/test_clean_env_e2e_smoke.py
+
+  acp-clean-room:
+    name: Fresh-UID clean room with official ACP binary (ubuntu-24.04)
+    # This GitHub-hosted
+    # ubuntu-24.04 VM is the clean room. A dedicated OS UID created with
+    # useradd executes the whole credential-free real-binary chain (fetch
+    # official ACP 1.4.4 -> exact publisher SHA-256 pin -> standalone install
+    # -> status/verify -> real unauthenticated initialize -> Hermes provider
+    # selection/model-discovery entry -> uninstall/reinstall -> fail-closed
+    # diagnostics) with an empty disposable HOME and HERMES_HOME.
+    # No Docker-in-Docker, no privileged containers, no secrets.*, no Google
+    # credentials or login, no live inference, no catalog submission (that
+    # is separate). Prior private-container attempts stay NOT EXECUTED.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      CLEAN_ROOM_USER: acpcr94
+      CLEAN_ROOM_HOME: /home/acpcr94
+      CLEAN_ROOM_HERMES_HOME: /home/acpcr94/hermes-home
+      CLEAN_ROOM_UPSTREAM: /home/acpcr94/upstream-hermes
+      ACP_EXPECTED_SHA256: baf31b7a97602dee359cf2a43f72b6e11c6bf354be874987d80660cd3526bb6a
+      HERMES_CORE_REF: a9ff9799e273f525b82718cdc69fdec71b1dca5a
+      CLEAN_ROOM_EVIDENCE_FILE: /tmp/clean-room-evidence.jsonl
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Preflight host and reviewed supply-chain pin
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, platform, sys
+          sys.path.insert(0, ".")
+          from antigravity_acp.registry import VERSION, resolve_distribution
+          dist = resolve_distribution("linux", "x86_64")
+          assert platform.machine() == "x86_64", "clean room requires an x86_64 runner"
+          assert VERSION == "1.4.4", f"registry version drifted: {VERSION}"
+          expected = os.environ["ACP_EXPECTED_SHA256"]
+          message = "registry pin no longer equals the reviewed digest"
+          assert dist.sha256 == expected, message
+          print("preflight: reviewed ACP 1.4.4 publisher pin active")
+          PY
+      - name: Provide pinned uv to the clean-room UID
+        run: |
+          set -euo pipefail
+          # A world-readable venv under /opt: a pip user-site install would
+          # land under /home/runner and be non-traversable by other UIDs.
+          sudo python3 -m venv /opt/uv94
+          sudo /opt/uv94/bin/pip install --disable-pip-version-check --quiet uv==0.13.5
+          sudo chmod -R a+rX /opt/uv94
+          sudo ln -sf /opt/uv94/bin/uv /usr/local/bin/uv
+          /opt/uv94/bin/uv --version
+      - name: Checkout official Hermes Core at the reviewed pinned commit
+        uses: actions/checkout@v4
+        with:
+          repository: NousResearch/hermes-agent
+          ref: ${{ env.HERMES_CORE_REF }}
+          path: upstream-hermes-src
+          persist-credentials: false
+      - name: Create dedicated clean-room OS UID
+        run: |
+          set -euo pipefail
+          sudo useradd --create-home --shell /bin/bash "$CLEAN_ROOM_USER"
+          sudo mkdir -p "$CLEAN_ROOM_HERMES_HOME"
+          sudo mv upstream-hermes-src "$CLEAN_ROOM_UPSTREAM"
+          # Stage a clean-room copy of the repo code the driver executes.
+          # The workspace checkout stays runner-owned and is deliberately
+          # not traversable by the clean-room UID (DAC isolation).
+          sudo mkdir -p "$CLEAN_ROOM_HOME/repo"
+          sudo cp -a "$GITHUB_WORKSPACE/scripts" "$GITHUB_WORKSPACE/antigravity_acp" \
+            "$GITHUB_WORKSPACE/hermes-plugin" "$CLEAN_ROOM_HOME/repo/"
+          sudo chown -R "$CLEAN_ROOM_USER:" "$CLEAN_ROOM_HOME" "$CLEAN_ROOM_HERMES_HOME" "$CLEAN_ROOM_UPSTREAM"
+          # Prove the world-readable pinned uv resolves for the clean-room
+          # identity itself before any chain step depends on it.
+          sudo -u "$CLEAN_ROOM_USER" env -i \
+            HOME="$CLEAN_ROOM_HOME" PATH=/usr/local/bin:/usr/bin:/bin \
+            /usr/local/bin/uv --version
+          # OS-UID separation proof: a private canary only the runner user
+          # can read; the driver fails closed if the clean-room UID can.
+          install -d -m 700 "$HOME/.cr94canary"
+          printf 'cr94-private-canary\n' > "$HOME/.cr94canary/private"
+          chmod 600 "$HOME/.cr94canary/private"
+          {
+            echo "## Fresh-UID clean room"
+            echo "- runner image: ${ImageOS:-unknown} ${ImageVersion:-unknown}"
+            echo "- $(lsb_release -ds) / $(uname -sr)"
+            echo "- runner user uid: $(id -u)"
+            echo "- clean-room user: $CLEAN_ROOM_USER uid=$(id -u "$CLEAN_ROOM_USER")"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Execute the real-binary clean-room chain as the dedicated UID
+        run: |
+          set -euo pipefail
+          sudo -u "$CLEAN_ROOM_USER" env -i \
+            HOME="$CLEAN_ROOM_HOME" \
+            USER="$CLEAN_ROOM_USER" \
+            LOGNAME="$CLEAN_ROOM_USER" \
+            PATH=/usr/local/bin:/usr/bin:/bin \
+            HERMES_HOME="$CLEAN_ROOM_HERMES_HOME" \
+            LANG=C.UTF-8 \
+            LC_ALL=C.UTF-8 \
+            ACP_EXPECTED_SHA256="$ACP_EXPECTED_SHA256" \
+            HERMES_CORE_REF="$HERMES_CORE_REF" \
+            CLEAN_ROOM_EVIDENCE_FILE="$CLEAN_ROOM_EVIDENCE_FILE" \
+            /usr/bin/python3 "$CLEAN_ROOM_HOME/repo/scripts/hosted_clean_room_ci.py"
+      - name: Fail closed on secret shapes in the sanitized evidence
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ ! -f "$CLEAN_ROOM_EVIDENCE_FILE" ]; then
+            echo "clean-room driver produced no evidence file; run is not acceptable" >&2
+            exit 1
+          fi
+          /usr/bin/python3 "$GITHUB_WORKSPACE/scripts/hosted_clean_room_ci.py" \
+            --scan-file "$CLEAN_ROOM_EVIDENCE_FILE"
+          {
+            echo "### Sanitized clean-room evidence (JSONL)"
+            echo
+            echo '```text'
+            cat "$CLEAN_ROOM_EVIDENCE_FILE"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Confirm the runner user has no live ACP/Hermes/Google state
+        if: always()
+        run: |
+          set -euo pipefail
+          test ! -e "$HOME/.local/opt/antigravity-acp"
+          test ! -e "$HOME/.local/bin/antigravity-acp-official"
+          test ! -e "$HOME/.hermes"
+          test ! -e "$HOME/.gemini"
+          echo "runner-user live state: untouched"
+
+  upstream-hermes-compat:
+    name: Vanilla NousResearch Hermes provider API
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: NousResearch/hermes-agent
+          ref: main
+          path: upstream-hermes
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Install pinned uv from the upstream toolchain lock
+        run: python -m pip install --disable-pip-version-check uv==0.13.5
+      - name: Record exact official Hermes target
+        id: hermes-target
+        shell: bash
+        run: |
+          set -eu
+          commit=$(git -C upstream-hermes rev-parse HEAD)
+          tree=$(git -C upstream-hermes rev-parse 'HEAD^{tree}')
+          printf 'commit=%s\ntree=%s\n' "$commit" "$tree" >> "$GITHUB_OUTPUT"
+          printf '%s\n' \
+            '### Upstream Hermes compatibility target' \
+            '- Repository: `NousResearch/hermes-agent`' \
+            '- Requested ref: `main`' >> "$GITHUB_STEP_SUMMARY"
+          printf '%s\n' \
+            "- Tested commit: \`$commit\`" \
+            "- Tested tree: \`$tree\`" \
+            "- Python: $(python --version 2>&1)" \
+            "- uv: $(uv --version)" >> "$GITHUB_STEP_SUMMARY"
+          printf 'NousResearch/hermes-agent main %s\nTree %s\n' "$commit" "$tree" > upstream-hermes-provenance.txt
+      - name: Install official Hermes from its committed lock
+        working-directory: upstream-hermes
+        run: uv sync --frozen --python 3.14 --group dev
+      - name: Record resolved dependency versions
+        working-directory: upstream-hermes
+        run: |
+          set -eu
+          sha256sum uv.lock > "$GITHUB_WORKSPACE/upstream-hermes-lock.sha256"
+          uv pip freeze --python .venv/bin/python > "$GITHUB_WORKSPACE/upstream-hermes-dependencies.txt"
+          printf '%s\n' \
+            '### Resolved upstream Hermes dependencies' \
+            '- Exact versions: `upstream-hermes-dependencies.txt` artifact' \
+            '- Lockfile digest: `upstream-hermes-lock.sha256` artifact' >> "$GITHUB_STEP_SUMMARY"
+      - name: Require the real public provider package
+        working-directory: upstream-hermes
+        run: >-
+          .venv/bin/python -c
+          'import providers; from providers import register_provider; from providers.base import ProviderProfile; assert callable(register_provider); assert callable(ProviderProfile.create_client); print(providers.__file__)'
+      - name: Official catalog admission validation (upstream main)
+        # Same checks the official plugin-catalog CI runs at admission:
+        # manifest, requires_hermes, capability probe, security scan,
+        # no core override, private imports. Non-zero exit blocks.
+        env:
+          HERMES_HOME: ${{ runner.temp }}/hermes-validate-home
+        run: >-
+          upstream-hermes/.venv/bin/hermes plugins validate
+          hermes-plugin/antigravity-acp --install-deps
+      - name: Exercise plugin registration, client factory, and core dispatch
+        env:
+          HERMES_STRICT_SEAM_TEST: "1"
+          HERMES_TESTED_COMMIT: ${{ steps.hermes-target.outputs.commit }}
+          HERMES_TESTED_TREE: ${{ steps.hermes-target.outputs.tree }}
+          UPSTREAM_HERMES_DIR: ${{ github.workspace }}/upstream-hermes
+          OPENAI_API_KEY: ""
+          ANTHROPIC_API_KEY: ""
+        run: >-
+          upstream-hermes/.venv/bin/python -m pytest -q
+          tests/test_vanilla_hermes_seam.py
+          tests/test_upstream_hermes_runtime_contracts.py
+      - name: Confirm Hermes Core source remained unmodified
+        run: |
+          git -C upstream-hermes diff --exit-code
+          git -C upstream-hermes diff --cached --exit-code
+          test -z "$(git -C upstream-hermes status --porcelain --untracked-files=no)"
+      - name: Upload upstream compatibility provenance
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: upstream-hermes-compat-${{ steps.hermes-target.outputs.commit }}
+          path: |
+            upstream-hermes-provenance.txt
+            upstream-hermes-lock.sha256
+            upstream-hermes-dependencies.txt
+          if-no-files-found: ignore
+
+  catalog-floor-gate:
+    name: Catalog admission + seam at Hermes floor v0.21.6
+    # plugin.yaml declares requires_hermes ">=0.21.6". This job pins that
+    # promise: the first SemVer release must keep passing the official
+    # admission validation and the strict provider seam. Raising the floor
+    # requires updating both the manifest and this ref together, with a
+    # recorded reason — never a silent bump.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      HERMES_FLOOR_REF: v0.21.6
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: NousResearch/hermes-agent
+          ref: v0.21.6
+          path: upstream-hermes
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Install pinned uv from the upstream toolchain lock
+        run: python -m pip install --disable-pip-version-check uv==0.13.5
+      - name: Install official Hermes ${{ env.HERMES_FLOOR_REF }} from its committed lock
+        working-directory: upstream-hermes
+        run: uv sync --frozen --python 3.14 --group dev
+      - name: Record floor gate provenance
+        shell: bash
+        run: |
+          set -eu
+          commit=$(git -C upstream-hermes rev-parse HEAD)
+          tree=$(git -C upstream-hermes rev-parse 'HEAD^{tree}')
+          printf 'commit=%s\ntree=%s\n' "$commit" "$tree" >> "$GITHUB_OUTPUT"
+          printf '%s\n' \
+            '### Catalog floor gate' \
+            "- Hermes ref: \`$HERMES_FLOOR_REF\`" \
+            "- Tested commit: \`$commit\`" \
+            "- Tested tree: \`$tree\`" >> "$GITHUB_STEP_SUMMARY"
+        id: floor-target
+      - name: Official catalog admission validation (floor ref)
+        env:
+          HERMES_HOME: ${{ runner.temp }}/hermes-validate-home
+        run: >-
+          upstream-hermes/.venv/bin/hermes plugins validate
+          hermes-plugin/antigravity-acp --install-deps
+      - name: Exercise provider seam at the floor ref
+        env:
+          HERMES_STRICT_SEAM_TEST: "1"
+          HERMES_TESTED_COMMIT: ${{ steps.floor-target.outputs.commit }}
+          HERMES_TESTED_TREE: ${{ steps.floor-target.outputs.tree }}
+          UPSTREAM_HERMES_DIR: ${{ github.workspace }}/upstream-hermes
+          OPENAI_API_KEY: ""
+          ANTHROPIC_API_KEY: ""
+        run: >-
+          upstream-hermes/.venv/bin/python -m pytest -q
+          tests/test_vanilla_hermes_seam.py
+          tests/test_upstream_hermes_runtime_contracts.py
+      - name: Confirm Hermes Core source remained unmodified
+        run: |
+          git -C upstream-hermes diff --exit-code
+          git -C upstream-hermes diff --cached --exit-code
+          test -z "$(git -C upstream-hermes status --porcelain --untracked-files=no)"

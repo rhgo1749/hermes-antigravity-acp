@@ -1,0 +1,433 @@
+"""Attended, vendor-owned ACP browser login driver (no model request).
+
+The Google official ACP server owns the OAuth flow and its credential store.
+This command sends only ACP ``initialize`` and ``authenticate``; it never
+reads, copies, or inspects vendor credential files. Nothing about the account
+or its models is hardcoded: authentication methods are validated against the
+methods the server advertises, and the official binary is accepted only when
+the launcher matches this project's installer-managed bytes exactly.
+
+Run as ``python /path/to/plugins/model-providers/antigravity-acp/login.py``
+from an interactive terminal, or let ``hermes model`` start it inline when
+the server reports it is not logged in.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import queue
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+from typing import TextIO
+from urllib.parse import parse_qs, urlsplit
+
+class LoginError(RuntimeError):
+    """Safe, fixed-text failure without untrusted server output."""
+
+
+_MAX_LINE = 65536
+_PROMPT = "Open the following link to authenticate the ACP server: "
+_MANAGED_MARKER = "# managed by hermes-antigravity-acp"
+# The ACP protocol majors this driver speaks; the server's advertised
+# protocolVersion must be one of these, never a single pinned literal.
+_SUPPORTED_PROTOCOL_VERSIONS = frozenset({1})
+_ENV_KEYS = frozenset({
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "TERM",
+    "TMPDIR", "TEMP", "TMP", "PYTHONUTF8", "HERMES_REAL_HOME", "HERMES_HOME",
+    "GEMINI_HOME", "LC_ALL", "LC_CTYPE", "LC_MESSAGES", "LC_COLLATE",
+    "LC_MONETARY", "LC_NUMERIC", "LC_TIME", "SYSTEMROOT", "WINDIR",
+})
+
+
+def _safe_auth_url(line: str) -> str | None:
+    if not line.startswith(_PROMPT):
+        return None
+    candidate = line[len(_PROMPT):].strip()
+    if any(ord(ch) < 33 or ord(ch) > 126 for ch in candidate):
+        raise LoginError("Server supplied an invalid login URL; refused.")
+    try:
+        url = urlsplit(candidate)
+        if (url.scheme != "https" or url.hostname != "accounts.google.com"
+                or url.username is not None or url.password is not None
+                or url.port not in (None, 443) or url.fragment
+                or url.path not in ("/o/oauth2/auth", "/o/oauth2/v2/auth")):
+            raise ValueError
+        query = parse_qs(url.query, strict_parsing=True, keep_blank_values=True)
+        forbidden = {"code", "access_token", "refresh_token", "id_token", "client_secret", "code_verifier"}
+        if forbidden.intersection(key.lower() for key in query):
+            raise ValueError
+        redirect_values = query.get("redirect_uri", [])
+        if len(redirect_values) != 1:
+            raise ValueError
+        redirect = urlsplit(redirect_values[0])
+        if (redirect.scheme != "http" or redirect.hostname != "127.0.0.1"
+                or redirect.port is None or not 1 <= redirect.port <= 65535
+                or redirect.username is not None or redirect.password is not None
+                or redirect.path != "/" or redirect.query or redirect.fragment):
+            raise ValueError
+        if query.get("response_type") != ["code"] or not query.get("client_id"):
+            raise ValueError
+    except (TypeError, ValueError):
+        raise LoginError("Server supplied an invalid login URL; refused.") from None
+    return candidate
+
+
+def _child_env() -> dict[str, str]:
+    # No ambient provider keys, mux control variables, or session identifiers.
+    return {k: v for k, v in os.environ.items() if k.upper() in _ENV_KEYS}
+
+
+def run_login(command: list[str], *, env: dict[str, str], method: str,
+              timeout: float, output: TextIO,
+              confirm_method=None) -> None:
+    """Run the bounded stdio exchange; the command list is caller-validated.
+
+    No server text is printed except a validated Google authorization URL to
+    the user's terminal. Terminal recording or browser history may retain
+    that URL. ``confirm_method`` receives the server's advertised method ids
+    after ``initialize``; the requested method must be among them.
+    """
+    if not method or not isinstance(method, str):
+        raise LoginError("An authentication method must be requested.")
+    if not 0 < timeout <= 3600:
+        raise LoginError("Invalid login timeout.")
+    try:
+        proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, env=env, text=True,
+                                encoding="utf-8", errors="replace", bufsize=1)
+    except OSError:
+        raise LoginError("Could not start the official ACP server.") from None
+    assert proc.stdin is not None and proc.stdout is not None and proc.stderr is not None
+    child_in, child_out, child_err = proc.stdin, proc.stdout, proc.stderr
+    events: queue.Queue[tuple[str, str | None]] = queue.Queue(maxsize=128)
+    overflow = threading.Event()
+
+    def emit(source: str, line: str | None) -> None:
+        try:
+            events.put_nowait((source, line))
+        except queue.Full:
+            overflow.set()
+
+    def pump(source: str, stream: TextIO) -> None:
+        try:
+            while True:
+                line = stream.readline(_MAX_LINE + 1)
+                if not line:
+                    break
+                if len(line) > _MAX_LINE or not line.endswith("\n"):
+                    overflow.set()
+                    break
+                emit(source, line)
+        finally:
+            emit(source, None)
+
+    threads = [threading.Thread(target=pump, args=(name, stream), daemon=True)
+               for name, stream in (("stdout", child_out), ("stderr", child_err))]
+    for thread in threads:
+        thread.start()
+
+    def send(identifier: int, rpc_method: str, params: dict) -> None:
+        try:
+            child_in.write(json.dumps({"jsonrpc": "2.0", "id": identifier,
+                                       "method": rpc_method, "params": params}) + "\n")
+            child_in.flush()
+        except (OSError, ValueError):
+            raise LoginError("Official ACP server stopped before login completed.") from None
+
+    deadline = time.monotonic() + timeout
+    phase = "initialize"
+    shown_url = False
+    success = False
+    auth_sent = False
+    try:
+        send(1, "initialize", {
+            "protocolVersion": 1,
+            "clientCapabilities": {"fs": {"readTextFile": False, "writeTextFile": False},
+                                   "terminal": False},
+            "clientInfo": {"name": "antigravity-acp-login", "version": "1.0"},
+        })
+        while not success:
+            if overflow.is_set():
+                raise LoginError("Official ACP server output exceeded safety limits.")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise LoginError("Login timed out; no automatic retry was attempted.")
+            try:
+                source, line = events.get(timeout=remaining)
+            except queue.Empty:
+                raise LoginError("Login timed out; no automatic retry was attempted.") from None
+            if line is None:
+                if source == "stdout":
+                    raise LoginError("Official ACP server stopped before login completed.")
+                continue
+            if source == "stderr":
+                url = _safe_auth_url(line)
+                if url is not None:
+                    if phase != "authenticate" or shown_url:
+                        raise LoginError("Unexpected login URL; refused.")
+                    output.write("Open this Google sign-in URL privately in your browser:\n" + url + "\n")
+                    output.flush()
+                    shown_url = True
+                continue
+            try:
+                message = json.loads(line)
+            except (ValueError, TypeError):
+                raise LoginError("Official ACP server returned malformed protocol data.") from None
+            if not isinstance(message, dict) or message.get("jsonrpc") != "2.0":
+                raise LoginError("Official ACP server returned malformed protocol data.")
+            expected = 1 if phase == "initialize" else 2
+            if type(message.get("id")) is not int or message["id"] != expected:
+                raise LoginError("Unexpected ACP protocol message; login refused.")
+            if "error" in message or not isinstance(message.get("result"), dict):
+                raise LoginError("Official ACP server did not complete the requested step.")
+            result = message["result"]
+            if phase == "initialize":
+                version = result.get("protocolVersion")
+                methods = result.get("authMethods")
+                if (type(version) is not int or version not in _SUPPORTED_PROTOCOL_VERSIONS
+                        or not isinstance(methods, list)):
+                    raise LoginError("Official ACP server returned an unsupported initialize result.")
+                advertised = [
+                    str(entry.get("id") or "")
+                    for entry in methods if isinstance(entry, dict)
+                ]
+                if callable(confirm_method):
+                    confirm_method(advertised)
+                if method not in advertised:
+                    raise LoginError("Requested authentication method is not advertised.")
+                phase = "authenticate"
+                auth_sent = True
+                send(2, "authenticate", {"methodId": method})
+            else:
+                success = True
+    except LoginError as exc:
+        if auth_sent:
+            raise LoginError(
+                f"{exc} Authentication may have completed; check before retrying."
+            ) from None
+        raise
+    finally:
+        cleanup_failed = False
+        if proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=3)
+                except (subprocess.TimeoutExpired, OSError):
+                    cleanup_failed = True
+            except OSError:
+                cleanup_failed = True
+        for thread in threads:
+            thread.join(timeout=2)
+        try:
+            child_in.close()
+        except (OSError, ValueError):
+            pass
+        for stream, thread in zip((child_out, child_err), threads):
+            # Closing a TextIOWrapper while another thread is blocked reading
+            # can itself hang on its internal lock. Leave it to process exit.
+            if thread.is_alive():
+                cleanup_failed = True
+            else:
+                stream.close()
+        if cleanup_failed:
+            raise LoginError(
+                "Server cleanup did not complete; authentication outcome may be unknown. "
+                "Check before retrying."
+            ) from None
+    # Process any stderr lines that raced the final JSON-RPC response. This is
+    # important for validating a promptly exiting server, including tests.
+    while not events.empty():
+        source, line = events.get_nowait()
+        if source == "stderr" and line is not None:
+            try:
+                url = _safe_auth_url(line)
+            except LoginError:
+                raise LoginError(
+                    "A login URL was refused after the server response; "
+                    "authentication may have completed. Check before retrying."
+                ) from None
+            if url is not None:
+                if phase != "authenticate" or shown_url:
+                    raise LoginError(
+                        "Unexpected login URL after the server response; "
+                        "authentication may have completed. Check before retrying."
+                    )
+                output.write("Open this Google sign-in URL privately in your browser:\n" + url + "\n")
+                output.flush()
+                shown_url = True
+    if overflow.is_set():
+        raise LoginError(
+            "Official ACP server output exceeded safety limits; "
+            "authentication may have completed. Check before retrying."
+        )
+
+
+def _launcher_name() -> str:
+    return "antigravity-acp-official.cmd" if os.name == "nt" else "antigravity-acp-official"
+
+
+def _managed_launcher_bodies(target: str, args: tuple[str, ...] | list[str]) -> set[str]:
+    """Exactly the launcher bodies the official installer writes (POSIX + cmd).
+
+    Mirrors scripts/install_official._launcher_variants; a launcher is only
+    ever spawned when its full text is one of these byte-for-byte.
+    """
+    if os.name == "nt":
+        joined = " ".join(args)
+        return {
+            f'@echo off\r\n{_MANAGED_MARKER}\r\n"{target}" {joined} %*\r\n',
+            f'@echo off\r\n"{target}" {joined} %*\r\n',
+        }
+    quoted_target = target.replace("'", "'\\''")
+    quoted_args = " ".join("'" + arg.replace("'", "'\\''") + "'" for arg in args)
+    suffix = f" {quoted_args}" if quoted_args else ""
+    command = f"exec '{quoted_target}'{suffix} \"$@\"\n"
+    return {
+        f"#!/bin/sh\n{_MANAGED_MARKER}\n{command}",
+        f"#!/bin/sh\n{command}",
+    }
+
+
+def _registry_path() -> Path:
+    """The publisher-pin registry source for this driver.
+
+    Repository checkout by default; ``HERMES_ANTIGRAVITY_ACP_REGISTRY`` may
+    point at an explicit registry file (used by offline tests and by any
+    packaging layout that vendors the pin beside the plugin).
+    """
+    override = os.environ.get("HERMES_ANTIGRAVITY_ACP_REGISTRY", "").strip()
+    if override:
+        return Path(override).expanduser()
+    return Path(__file__).resolve().parents[2] / "antigravity_acp" / "registry.py"
+
+
+def _pinned_digests() -> dict[str, dict[str, str]]:
+    """``{version: {filename: sha256}}`` from the repository registry pin.
+
+    The plugin tree ships no registry copy; the repository checkout that
+    installed the official server owns the publisher digests. A missing
+    registry means the pin cannot be checked, which fails closed.
+    """
+    registry_path = _registry_path()
+    if not registry_path.is_file():
+        raise LoginError("Publisher pin registry is unavailable; login refused.")
+    try:
+        source = registry_path.read_text(encoding="utf-8")
+        namespace: dict = {}
+        exec(compile(source, str(registry_path), "exec"), namespace)
+        version = str(namespace["VERSION"])
+        distributions = namespace["_DISTRIBUTIONS"]
+        digest_by_file: dict[str, str] = {}
+        for distribution in distributions.values():
+            digest_by_file[distribution.executable] = distribution.sha256
+        return {version: digest_by_file}
+    except (OSError, UnicodeError, SyntaxError, KeyError, TypeError, ValueError):
+        raise LoginError("Publisher pin registry is unreadable; login refused.") from None
+
+
+def _resolve_official_command() -> tuple[list[str], list[str]]:
+    """The installer-managed official launcher and its recorded extra args.
+
+    The launcher is accepted only when its exact text is a body the official
+    installer writes for a binary that (a) sits at the installer's versioned
+    path, (b) is named by the publisher registry, and (c) hashes to the
+    pinned publisher digest. Returns (spawn_command, launcher_extra_args).
+    """
+    command = str(Path.home() / ".local" / "bin" / _launcher_name())
+    launcher = Path(command)
+    if not launcher.is_file() or launcher.is_symlink():
+        raise LoginError("Official ACP launcher is missing; run the project installer first.")
+    try:
+        raw = launcher.read_bytes().decode("utf-8")
+    except (OSError, UnicodeError):
+        raise LoginError("Official ACP launcher is unreadable; login refused.") from None
+    texts = {raw, raw.replace("\r\n", "\n")}
+    import hashlib as _hashlib
+
+    pins = _pinned_digests()
+    prefix = Path.home() / ".local" / "opt" / "antigravity-acp"
+    for version, digests in pins.items():
+        version_dir = prefix / version
+        if version_dir.is_symlink() or not version_dir.is_dir():
+            continue
+        for filename, expected in digests.items():
+            target = version_dir / filename
+            if target.is_symlink() or not target.is_file():
+                continue
+            try:
+                actual = _hashlib.sha256(target.read_bytes()).hexdigest()
+            except OSError:
+                continue
+            if actual != expected:
+                continue
+            for args in _candidate_launch_args(target):
+                for body in _managed_launcher_bodies(str(target), args):
+                    if body in texts:
+                        return [command], list(args)
+    raise LoginError("Official ACP launcher is not managed; login refused.")
+
+
+def _candidate_launch_args(target: Path) -> tuple[tuple[str, ...], ...]:
+    """Launcher argument sets this project's installers have shipped.
+
+    Historical plus current contracts: no-args (user-scoped generic install)
+    and the ``--uid=`` registry form. The launcher text must match one of
+    these bodies byte-for-byte; unknown shapes are refused.
+    """
+    return ((), ("--uid=",))
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--method", default=None,
+                        help="ACP authentication method id; defaults to oauth-personal "
+                             "and is always re-validated against the server's advertised methods.")
+    parser.add_argument("--timeout", type=float, default=330.0)
+    args = parser.parse_args(argv)
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        print("Interactive terminal required; unattended login is refused.", file=sys.stderr)
+        return 2
+    if any(os.environ.get(key, "").strip() for key in (
+        "HERMES_ANTIGRAVITY_ACP_COMMAND", "HERMES_ANTIGRAVITY_ACP_ARGS",
+    )):
+        print("Custom ACP command is set; select a direct official server instead.", file=sys.stderr)
+        return 2
+    plugin_dir = Path(__file__).resolve().parent
+    if any((plugin_dir / name).exists() or (plugin_dir / name).is_symlink()
+           for name in ("launch_config.json", "par.txt")):
+        print("Custom provider launch configuration detected; direct login refused.", file=sys.stderr)
+        return 2
+    method = args.method or "oauth-personal"
+    print("The official server performs login and manages its own credentials.")
+    print("Confirm that this route is permitted by your Google terms before continuing.")
+    print("Do not share the login URL or record the terminal. No model prompt is sent.")
+    try:
+        if input("Type LOGIN to continue: ").strip() != "LOGIN":
+            print("Login cancelled.")
+            return 1
+        command, _ = _resolve_official_command()
+        run_login(command, env=_child_env(), method=method,
+                  timeout=args.timeout, output=sys.stdout)
+    except (OSError, RuntimeError, ValueError, EOFError) as exc:
+        # Vendor output and exception text are not trusted.
+        message = str(exc) if isinstance(exc, LoginError) else "Login could not be completed."
+        print(message, file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("Login interrupted. If the server started, authentication may "
+              "have completed; check before retrying.", file=sys.stderr)
+        return 130
+    print("Official ACP authenticate completed. Model inference was not run.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

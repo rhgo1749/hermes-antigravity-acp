@@ -1,0 +1,14 @@
+{
+  "accounts": [
+    {
+      "home": null,
+      "label": "primary",
+      "priority": 0
+    },
+    {
+      "home": "/Users/you/.agy-acp/secondary",
+      "label": "secondary",
+      "priority": 0
+    }
+  ]
+}

@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 410" role="img" aria-labelledby="title desc">
+  <title id="title">How Antigravity ACP connects to Hermes</title>
+  <desc id="desc">A user interacts with Hermes, whose provider communicates with the official Antigravity ACP server over JSON-RPC on standard input and output. The official server communicates with the Antigravity service. In the default mode, Hermes tool calls follow Hermes approval policy; native mutation is denied and native run_command is disabled.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="#68758b" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker>
+  </defs>
+  <rect width="900" height="410" rx="18" fill="#f7f8fc"/>
+  <g font-family="system-ui,-apple-system,Segoe UI,sans-serif">
+    <text x="38" y="48" font-size="22" font-weight="700" fill="#182339">From a prompt to an answer</text>
+    <text x="38" y="73" font-size="14" fill="#566278">Default single-account path · ACP v1</text>
+    <g stroke-width="1">
+      <rect x="38" y="126" width="150" height="100" rx="12" fill="#ffffff" stroke="#cdd5e2"/>
+      <rect x="224" y="126" width="175" height="100" rx="12" fill="#eeedfe" stroke="#afa9ec"/>
+      <rect x="458" y="126" width="184" height="100" rx="12" fill="#e1f5ee" stroke="#5dcaa5"/>
+      <rect x="696" y="126" width="166" height="100" rx="12" fill="#ffffff" stroke="#cdd5e2"/>
+    </g>
+    <g fill="#182339" text-anchor="middle" font-size="16" font-weight="650">
+      <text x="113" y="163">You</text><text x="311" y="158">Hermes</text><text x="550" y="158">Official ACP server</text><text x="779" y="158">Antigravity</text>
+    </g>
+    <g fill="#566278" text-anchor="middle" font-size="12">
+      <text x="113" y="187">Prompt / response</text><text x="311" y="181">ACP provider plugin</text><text x="311" y="199">Hermes tool bridge</text>
+      <text x="550" y="181">Google runtime</text><text x="550" y="199">authentication lives here</text><text x="779" y="181">Model service</text>
+    </g>
+    <g>
+      <line x1="198" y1="176" x2="214" y2="176" stroke="#68758b" stroke-width="2"/>
+      <line x1="410" y1="176" x2="447" y2="176" stroke="#68758b" stroke-width="2"/>
+      <line x1="653" y1="176" x2="685" y2="176" stroke="#68758b" stroke-width="2"/>
+      <polygon points="197,176 204,172 204,180" fill="#68758b"/><polygon points="215,176 208,172 208,180" fill="#68758b"/>
+      <polygon points="409,176 416,172 416,180" fill="#68758b"/><polygon points="448,176 441,172 441,180" fill="#68758b"/>
+      <polygon points="652,176 659,172 659,180" fill="#68758b"/><polygon points="686,176 679,172 679,180" fill="#68758b"/>
+    </g>
+    <text x="428" y="117" text-anchor="middle" font-size="12" fill="#566278">JSON-RPC</text>
+    <text x="428" y="241" text-anchor="middle" font-size="12" fill="#566278">stdio</text>
+    <rect x="38" y="285" width="824" height="86" rx="12" fill="#ffffff" stroke="#cdd5e2"/>
+    <text x="58" y="311" font-size="14" font-weight="650" fill="#182339">Default execution boundary</text>
+    <text x="58" y="335" font-size="13" fill="#44536a">Hermes tool calls follow Hermes policies and approvals. Native mutation is denied;</text>
+    <text x="58" y="355" font-size="13" fill="#44536a">native run_command is disabled. Trusted coding is a separate opt-in mode.</text>
+  </g>
+</svg>
