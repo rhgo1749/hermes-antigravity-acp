@@ -77,9 +77,11 @@ def resolve_distribution(system: str | None = None, machine: str | None = None) 
     system = (system or platform.system()).strip().lower()
     machine = (machine or platform.machine()).strip().lower()
     aliases = {
-        "x86-64": "x86_64",
-        "x64": "x86_64",
+        "x86-64": "amd64" if system == "windows" else "x86_64",
+        "x64": "amd64" if system == "windows" else "x86_64",
+        "x86_64": "amd64" if system == "windows" else "x86_64",
         "amd64": "amd64" if system == "windows" else "x86_64",
+        "aarch64": "arm64" if system in {"darwin", "windows"} else "aarch64",
         "arm64": "arm64" if system in {"darwin", "windows"} else "aarch64",
     }
     machine = aliases.get(machine, machine)

@@ -48,6 +48,7 @@ import re
 import shutil
 import sys
 import uuid
+from collections.abc import Mapping
 from pathlib import Path
 
 PROVIDER = "antigravity-acp"
@@ -100,7 +101,22 @@ PRE_MARKER_LINEAGE_SETS: dict[str, dict[str, str]] = {
     },
 }
 SOURCE = Path(__file__).resolve().parents[1] / "hermes-plugin" / PROVIDER
-DEFAULT_HERMES_HOME = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes").expanduser()
+
+
+def _default_hermes_home(platform_name: str, environ: Mapping[str, str], home: Path) -> Path:
+    """Match Hermes platform defaults without requiring Hermes in the installer Python."""
+    explicit = environ.get("HERMES_HOME", "").strip()
+    if explicit:
+        return Path(explicit).expanduser()
+    suffix = environ.get("HERMES_DATA_DIR_SUFFIX", "")
+    if platform_name == "win32":
+        local_appdata = environ.get("LOCALAPPDATA", "").strip()
+        base = Path(local_appdata) if local_appdata else home / "AppData" / "Local"
+        return base / ("hermes" + suffix)
+    return home / (".hermes" + suffix)
+
+
+DEFAULT_HERMES_HOME = _default_hermes_home(sys.platform, os.environ, Path.home())
 
 
 def digest(path: Path) -> str:

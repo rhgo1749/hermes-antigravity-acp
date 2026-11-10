@@ -24,6 +24,9 @@ def test_linux_x86_64_uses_google_registry_shape() -> None:
 def test_arm64_aliases_by_platform() -> None:
     assert resolve_distribution("Linux", "arm64").url.endswith("linux-arm64.zip")
     assert resolve_distribution("Darwin", "arm64").url.endswith("darwin-arm64.zip")
+    assert resolve_distribution("Windows", "aarch64") == resolve_distribution("Windows", "arm64")
+    assert resolve_distribution("Windows", "x86_64") == resolve_distribution("Windows", "amd64")
+    assert resolve_distribution("Windows", "x64") == resolve_distribution("Windows", "amd64")
 
 
 def test_every_distribution_carries_the_google_feed_digest() -> None:

@@ -283,8 +283,8 @@ def _managed_launcher_bodies(target: str, args: tuple[str, ...] | list[str]) -> 
     if os.name == "nt":
         joined = " ".join(args)
         return {
-            f'@echo off\r\n{_MANAGED_MARKER}\r\n"{target}" {joined} %*\r\n',
-            f'@echo off\r\n"{target}" {joined} %*\r\n',
+            f'@echo off\nREM managed by hermes-antigravity-acp\n"{target}" {joined} %*\n',
+            f'@echo off\n"{target}" {joined} %*\n',
         }
     quoted_target = target.replace("'", "'\\''")
     quoted_args = " ".join("'" + arg.replace("'", "'\\''") + "'" for arg in args)
