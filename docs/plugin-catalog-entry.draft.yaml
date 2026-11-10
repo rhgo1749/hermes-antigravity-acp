@@ -11,7 +11,7 @@ title: Antigravity ACP (official)
 repo: https://github.com/rhgo1749/hermes-antigravity-acp
 sha: "<40-HEX-AT-SUBMISSION>"
 subdir: hermes-plugin/antigravity-acp
-version: 0.7.5
+version: 0.7.6
 description: >-
   Google Antigravity through Google's official ACP server (ACP v1 JSON-RPC
   over stdio). Disclosure — registers one model provider at import and
