@@ -1841,7 +1841,10 @@ def _claimed_scratch_artifact_paths(text: str) -> tuple[Path, ...]:
     roots = _hermes_scratch_read_roots()
     found: list[Path] = []
     for match in _ABSOLUTE_PATH_RE.finditer(text):
-        raw = match.group(1).rstrip(".,;:!?)]}")
+        # Trailing shell-prompt sigils ("…/scratch/demorec$") and annotation
+        # marks are not path characters; keeping them makes every quoted
+        # prompt look like a missing artifact.
+        raw = match.group(1).rstrip(".,;:!?)]}~$#%*&")
         if not raw:
             continue
         start = max(0, match.start() - 140)
@@ -4421,7 +4424,18 @@ class AntigravityACPClient:
             # claims against the filesystem; it is an agent-interactive guard
             # skipped for opted-in llm_backend requests and byte-identical
             # for default agent mode.
-            if not tool_calls and not self._llm_backend_postprocessing:
+            #
+            # A turn that carried user-supplied image/video media is
+            # descriptive: the answer reports what the model was shown (often
+            # quoting an on-screen path such as a shell prompt), it does not
+            # claim to have produced files.  Applying the guard there destroys
+            # correct vision-analysis answers.
+            turn_carried_media = bool(replay_image_blocks)
+            if (
+                not tool_calls
+                and not turn_carried_media
+                and not self._llm_backend_postprocessing
+            ):
                 missing_artifacts = _missing_claimed_scratch_artifacts(cleaned_text)
                 for _artifact_attempt in range(_MAX_ARTIFACT_CLAIM_CORRECTIONS):
                     if not missing_artifacts:

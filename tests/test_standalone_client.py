@@ -1144,6 +1144,88 @@ def test_missing_scratch_artifact_claim_fails_closed_after_one_correction(
     assert len(calls) == 2
 
 
+def test_quoted_shell_prompt_path_is_not_a_claimed_artifact(
+    monkeypatch, tmp_path
+) -> None:
+    """A path quoted from terminal output ends in a prompt sigil, not a file.
+
+    Vision/terminal-transcript answers quote on-screen prompts such as
+    ``/…/scratch/acp-public$``.  The trailing ``$`` is not a path character;
+    treating it as one made every quoted prompt look like a missing artifact
+    and destroyed the answer.
+    """
+    _, client, client_module = _load(monkeypatch)
+    hermes_home = tmp_path / ".hermes"
+    scratch = hermes_home / "cache" / "scratch"
+    # The quoted prompt directory really exists; only the trailing "$" made
+    # it look like a missing artifact.
+    (scratch / "acp-public").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    quoted = (
+        f"The visible pane shows the prompt {scratch}/acp-public$ "
+        "with the file output above."
+    )
+    assert client_module._missing_claimed_scratch_artifacts(quoted) == ()
+
+    # A genuine artifact claim is still caught.
+    bogus = f"Evidence file saved at {scratch}/nope/report.md."
+    assert client_module._missing_claimed_scratch_artifacts(bogus) == (
+        (scratch / "nope" / "report.md").resolve(),
+    )
+
+
+def test_media_turn_skips_scratch_artifact_claim_guard(
+    monkeypatch, tmp_path
+) -> None:
+    """Descriptive media turns report what was shown; they claim no files."""
+    _, client, _ = _load(monkeypatch)
+    hermes_home = tmp_path / ".hermes"
+    scratch = hermes_home / "cache" / "scratch"
+    scratch.mkdir(parents=True)
+    missing = scratch / "frame3.png"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    calls: list[str] = []
+
+    def fake_run(prompt_text, **kwargs):
+        calls.append(prompt_text)
+        kwargs["session_result"].update(
+            session_id=f"session-{len(calls)}",
+            resumed=bool(kwargs["resume_session_id"]),
+        )
+        return f"The screenshot shows the prompt {missing}$ and a file listing.", ""
+
+    monkeypatch.setattr(client, "_run_prompt", fake_run)
+    image_part = {
+        "type": "image_url",
+        "image_url": {"url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=="},
+    }
+
+    reply = client.chat.completions.create(
+        model="gemini-test",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe this image"},
+                    image_part,
+                ],
+            }
+        ],
+    )
+    assert len(calls) == 1
+    assert "screenshot" in reply.choices[0].message.content
+
+    # Control: the same sentence on a text-only agent turn is still a claim.
+    calls.clear()
+    with pytest.raises(RuntimeError, match="still claims scratch artifacts"):
+        client.chat.completions.create(
+            model="gemini-test",
+            messages=[{"role": "user", "content": "describe this image"}],
+        )
+    assert len(calls) == 2
+
+
 def test_negative_missing_artifact_statement_is_not_treated_as_claim(
     monkeypatch, tmp_path
 ) -> None:
