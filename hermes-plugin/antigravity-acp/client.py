@@ -712,15 +712,25 @@ def _enabled_id_list(entries: Any, key: str) -> list[str]:
     return result
 
 
+def _model_config_options(session: dict[str, Any]) -> list[dict[str, Any]]:
+    """Every model-category ``configOptions`` group the server authored.
+
+    Matched on the declared ``category``/``id`` only; the values inside each
+    group come from the session itself and no model name is asserted here.
+    This is a list rather than a single ``next(...)`` because a server is free
+    to split its models across groups (a second model family is exactly the
+    case that would otherwise disappear from the picker silently).
+    """
+    return [
+        option
+        for option in (session.get("configOptions") or [])
+        if isinstance(option, dict) and "model" in (option.get("category"), option.get("id"))
+    ]
+
+
 def _model_config_option(session: dict[str, Any]) -> dict[str, Any] | None:
-    return next(
-        (
-            option
-            for option in (session.get("configOptions") or [])
-            if isinstance(option, dict) and "model" in (option.get("category"), option.get("id"))
-        ),
-        None,
-    )
+    options = _model_config_options(session)
+    return options[0] if options else None
 
 
 _THINKING_LEVEL_ENV = "HERMES_ANTIGRAVITY_ACP_THINKING_LEVEL"
@@ -814,32 +824,57 @@ def _legacy_session_model_ids(session: dict[str, Any]) -> list[str]:
 
 
 def _session_model_ids(session: dict[str, Any]) -> list[str]:
-    if option := _model_config_option(session):
-        return _enabled_id_list(option.get("options"), "value")
-    return _legacy_session_model_ids(session)
+    """Every model id this session offers, across both server surfaces.
+
+    The official 1.4.x server authors two axes with different contents: a
+    base-model ``configOptions`` group and the composite legacy
+    ``models.availableModels`` rows, each tracking its own current id.  The
+    offered set is the union of both, never one preferred over the other --
+    preferring one surface hid the other's ids from resume-time validation and
+    from ``list_models``.
+    """
+    ids: list[str] = []
+    for option in _model_config_options(session):
+        ids.extend(_enabled_id_list(option.get("options"), "value"))
+    ids.extend(_legacy_session_model_ids(session))
+    return list(dict.fromkeys(ids))
 
 
 def _model_selection_request(
     session: dict[str, Any], requested_model: str
 ) -> tuple[str, dict[str, str]] | None:
+    """The request that actually selects ``requested_model``, or ``None``.
+
+    Two server-authored axes, two methods.  A value a ``configOptions`` model
+    group offered is set through that group; an id the legacy
+    ``models.availableModels`` surface offered is set through
+    ``session/set_model``, which the official 1.4.x server accepts for exactly
+    those ids.  Routing the legacy ids through the config group instead made
+    them unselectable no-ops, so a picker could display rows that changed
+    nothing.  An id neither surface authored is refused here, never force-sent
+    and never silently substituted.  When the server authored no model surface
+    at all there is nothing to check against, so the legacy method is
+    attempted and the caller judges the server's answer.
+    """
     session_id = str(session.get("sessionId") or "").strip()
     requested_model = str(requested_model or "").strip()
     if not session_id or not requested_model or requested_model == "antigravity-acp":
         return None
-    option = _model_config_option(session)
-    if option:
-        if requested_model not in _enabled_id_list(option.get("options"), "value"):
-            return None
-        return (
-            "session/set_config_option",
-            {
-                "sessionId": session_id,
-                "configId": str(option.get("id") or "model"),
-                "value": requested_model,
-            },
-        )
+    config_options = _model_config_options(session)
+    for option in config_options:
+        if requested_model in _enabled_id_list(option.get("options"), "value"):
+            return (
+                "session/set_config_option",
+                {
+                    "sessionId": session_id,
+                    "configId": str(option.get("id") or "model"),
+                    "value": requested_model,
+                },
+            )
     available = _legacy_session_model_ids(session)
-    if available and requested_model not in available:
+    if requested_model in available:
+        return "session/set_model", {"sessionId": session_id, "modelId": requested_model}
+    if available or config_options:
         return None
     return "session/set_model", {"sessionId": session_id, "modelId": requested_model}
 
@@ -4847,9 +4882,9 @@ class AntigravityACPClient:
             with self._session(
                 timeout_seconds, allow_file_requests=False
             ) as (session, _, _activity_stats):
-                option = _model_config_option(session) or {}
                 config_entries = [
                     entry
+                    for option in _model_config_options(session)
                     for entry in (option.get("options") or [])
                     if isinstance(entry, dict)
                 ]

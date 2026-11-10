@@ -148,8 +148,14 @@ The provider declares **no curated model list**: every model id offered by
 server surfaces. Before login (or if a listing fails) the picker offers only
 the free-text model input — never a guessed or remembered id. Consequence:
 model availability follows the account and the server, and the official
-server's two model surfaces can legitimately differ; the plugin merges both
-and labels each row with its source surface.
+server's two model surfaces can legitimately differ; the plugin merges both,
+labels each row with its source surface, and routes every row through the
+method that surface owns — a `configOptions` model value through
+`session/set_config_option`, a legacy `models.availableModels` id through
+`session/set_model`. So a row the server authored is always selectable, and an
+id neither surface authored is never sent. A server that adds a model family —
+including one authored as a second `configOptions` group — widens the picker
+with no plugin change.
 
 ## Antigravity ACP MUX (optional, preview)
 
@@ -570,7 +576,9 @@ server provides no usage telemetry. The credential-free tests do not assert
 live authentication or account availability.
 
 For version-specific protocol notes, see `docs/official-server-1.3.0-delta.md`,
-`docs/official-server-1.4.0-delta.md`, and the generic recovery guidance in
+`docs/official-server-1.4.0-delta.md`,
+`docs/official-server-1.4.4-model-surface.md` (the two model selection axes),
+and the generic recovery guidance in
 `docs/1.3.0-canary-runbook.md`. These public docs do not describe live host or
 account deployment state.
 
