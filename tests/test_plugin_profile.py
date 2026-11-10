@@ -349,3 +349,72 @@ def test_rate_limit_retry_can_be_disabled(monkeypatch) -> None:
     with pytest.raises(RuntimeError, match="429"):
         client._run_prompt("hello", timeout_seconds=10)
     assert calls == 1
+
+
+def test_status_and_models_cache_server_probes(monkeypatch, tmp_path) -> None:
+    """Cold-start regression: a signed-in probe and a live model surface are
+    reused within their TTL instead of respawning the official server on
+    every status render and every ``/model`` open. On Windows each spawn
+    pays a full cold start of the official binary through a cmd.exe wrapper,
+    which stalled the CLI between commands and froze ``/model``."""
+    module = _load_plugin(monkeypatch)
+    profile = module.antigravity_acp
+    launcher = tmp_path / "antigravity-acp-official"
+    launcher.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setattr(profile, "process_command", str(launcher))
+
+    spawns = {"count": 0}
+
+    class LiveClient:
+        def __init__(self) -> None:
+            spawns["count"] += 1
+
+        def list_models(self, **_):
+            return ["server-model-a"]
+
+        def session_model_surface(self, **_):
+            return ([{"value": "server-model-a", "name": "Server Model A"}], [])
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(profile, "create_client", lambda **kw: LiveClient())
+
+    assert profile.setup_status()["logged_in"] is True
+    assert profile.setup_status()["logged_in"] is True
+    assert spawns["count"] == 1
+
+    rows = profile.discover_models()
+    assert [row["id"] for row in rows] == ["server-model-a"]
+    assert profile.fetch_models() == ["server-model-a"]
+    # One surface spawn answers discover_models and fetch_models.
+    assert spawns["count"] == 2
+
+
+def test_negative_login_probe_is_never_cached(monkeypatch, tmp_path) -> None:
+    """A not-signed-in answer must re-probe: the setup wizard re-checks
+    seconds after an interactive login and must not read a stale False."""
+    module = _load_plugin(monkeypatch)
+    profile = module.antigravity_acp
+    launcher = tmp_path / "antigravity-acp-official"
+    launcher.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setattr(profile, "process_command", str(launcher))
+
+    spawns = {"count": 0}
+
+    class BoundaryClient:
+        def __init__(self) -> None:
+            spawns["count"] += 1
+
+        def list_models(self, **_):
+            raise RuntimeError(
+                "Antigravity ACP session/new failed: code=-32000; Authentication required"
+            )
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(profile, "create_client", lambda **kw: BoundaryClient())
+    assert profile.setup_status()["logged_in"] is False
+    assert profile.setup_status()["logged_in"] is False
+    assert spawns["count"] == 2

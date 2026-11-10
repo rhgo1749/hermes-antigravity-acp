@@ -6,11 +6,23 @@ import json
 import os
 import shutil
 import sys
+import time
 from pathlib import Path
 from typing import Any, cast
 
 from providers import register_provider
 from providers.base import ProviderProfile
+
+# Every probe below spawns the official server process from scratch (the ACP
+# stdio contract is one process per session).  On Windows the spawn pays a
+# full cold start of the multi-hundred-MB official binary through a cmd.exe
+# wrapper, which stalled the CLI on every status render and every ``/model``
+# open.  A signed-in probe and a live model surface are stable within a
+# session, so cache them in-process with a TTL instead of re-spawning.
+# A negative login probe is never cached: the sign-in wizard re-checks
+# seconds after an interactive login and must re-probe immediately.
+_LOGIN_TRUE_TTL_SECONDS = 300.0
+_MODELS_TTL_SECONDS = 300.0
 
 _DEFAULT_RATE_LIMIT_RETRIES = 2
 _MAX_RATE_LIMIT_RETRIES = 8
@@ -91,6 +103,28 @@ def _rate_limit_retries() -> int:
 
 
 class AntigravityACPProfile(ProviderProfile):
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        # (monotonic_deadline, value); guarded by the GIL for the simple
+        # read/replace pattern used here.
+        self._login_probe_cache: tuple[float, bool] | None = None
+        self._models_cache: tuple[float, list[dict[str, Any]]] | None = None
+
+    def _cached_login_probe(self) -> bool | None:
+        entry = self._login_probe_cache
+        if entry is not None and time.monotonic() < entry[0]:
+            return entry[1]
+        return None
+
+    def _store_login_probe(self, logged_in: bool) -> None:
+        # Negative answers are never cached (see module comment): the sign-in
+        # wizard must re-probe the moment an interactive login completes.
+        if logged_in:
+            self._login_probe_cache = (
+                time.monotonic() + _LOGIN_TRUE_TTL_SECONDS,
+                True,
+            )
+
     def create_client(self, **client_kwargs: Any) -> Any:
         from .client import AntigravityACPClient
 
@@ -114,16 +148,12 @@ class AntigravityACPProfile(ProviderProfile):
         base_url: str | None = None,
         timeout: float = 20.0,
     ) -> list[str] | None:
-        try:
-            client = self.create_client(
-                api_key=api_key,
-                base_url=base_url or self.base_url,
-                command=self.process_command,
-                args=list(self.process_args),
-            )
-            return client.list_models(timeout_seconds=timeout) or None
-        except Exception:
+        # Derive from discover_models so one cached server surface answers
+        # both picker shapes; the ACP contract ignores api_key/base_url.
+        rows = self.discover_models()
+        if not rows:
             return None
+        return [str(row.get("id") or "").strip() for row in rows if row.get("id")] or None
 
     def _probe_login_state(self, *, timeout_seconds: float = 20.0) -> bool:
         """True when a fresh server session opens; False on the auth boundary.
@@ -131,15 +161,18 @@ class AntigravityACPProfile(ProviderProfile):
         Spawns the official server once and performs only ``initialize`` and
         ``session/new`` — never authenticate, login, or a model prompt. Any
         non-auth failure raises so callers can fail closed instead of
-        reporting a false "logged in".
+        reporting a false "logged in". A fresh cached answer (see the TTL
+        constants) is returned without spawning.
         """
+        cached = self._cached_login_probe()
+        if cached is not None:
+            return cached
         client = self.create_client(
             command=self.process_command,
             args=list(self.process_args),
         )
         try:
             client.list_models(timeout_seconds=timeout_seconds)
-            return True
         except Exception as exc:  # noqa: BLE001 — classify the boundary only
             message = str(exc)
             if (
@@ -148,6 +181,9 @@ class AntigravityACPProfile(ProviderProfile):
             ):
                 return False
             raise
+        else:
+            self._store_login_probe(True)
+            return True
         finally:
             client.close()
 
@@ -210,7 +246,11 @@ class AntigravityACPProfile(ProviderProfile):
         is intentionally empty so a picker can never offer a model the
         account does not have. ``None`` (falling through to the empty floor)
         is returned on any failure, including the not-logged-in boundary.
+        A fresh cached listing is returned without spawning the server.
         """
+        cached = self._models_cache
+        if cached is not None and time.monotonic() < cached[0]:
+            return list(cached[1])
         try:
             client = self.create_client(
                 command=self.process_command,
@@ -255,6 +295,8 @@ class AntigravityACPProfile(ProviderProfile):
             if enablement == "disabled":
                 continue
             _add(entry.get("modelId"), entry.get("name"), "surface: session models")
+        if rows:
+            self._models_cache = (time.monotonic() + _MODELS_TTL_SECONDS, list(rows))
         return rows or None
 
 
