@@ -134,10 +134,11 @@ and denial stage remain **UNVERIFIED** absent a correlated protocol trace. See
 [`docs/web-research-bridge.md`](web-research-bridge.md) for ownership,
 troubleshooting, sanitized evidence, and rollout/rollback guidance.
 
-## Trusted coding mode overrides
+## Native coding and workspace
 
-`HERMES_ANTIGRAVITY_ACP_WORKSPACE` and `HERMES_ANTIGRAVITY_ACP_EXECUTION_MODE`
-are optional operational overrides (launch workspace and execution mode).
-They change working-directory/mode policy and are off unless you set them;
-file-safety and session-scope fail-closed rules from
-`docs/hermes-compatibility.md` continue to apply.
+Native coding is the default. The provider auto-approves vetted native file
+operations and commands; native commands bypass Hermes terminal approval and
+the workspace check is not a sandbox. `HERMES_ANTIGRAVITY_ACP_WORKSPACE`
+optionally pins the launch workspace. The legacy
+`HERMES_ANTIGRAVITY_ACP_EXECUTION_MODE` variable is ignored. Existing sessions
+with a different execution-policy fingerprint start a fresh ACP session.

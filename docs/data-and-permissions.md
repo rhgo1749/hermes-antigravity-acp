@@ -107,19 +107,18 @@ ACP session may retain media already consumed in its earlier prompt
 
 ## 5. Shell and tool execution boundary
 
-- **Hermes tools stay in Hermes.** Acting as a Hermes model backend does not
-  grant the Antigravity runtime arbitrary native tool permissions; ACP-side
-  tool activity is mapped through Hermes' own policy, approval, and execution
-  path. Tool-call replay, duplicate suppression, and completed-action
-  handling are described in `docs/provider-runtime.md`.
+- **Two execution paths.** Hermes tool calls use Hermes policy and approval.
+  The ACP server can also execute native coding tools directly; the provider
+  auto-approves vetted requests, and native commands bypass Hermes terminal
+  approval. The workspace path check is not a sandbox.
+  Tool-call replay and duplicate suppression are in `docs/provider-runtime.md`.
 - The provider-mode **web research bridge** only relays function schemas
   Hermes explicitly supplies and returns calls to Hermes' policy/execution
   path; it never executes searches itself (`docs/web-research-bridge.md`).
-- Opt-in extensions carry explicit trust warnings before elevation:
-  native Telegram video (`HERMES_ANTIGRAVITY_ACP_NATIVE_VIDEO=1`, allowlist +
-  TOCTOU limits in `docs/provider-runtime.md`) and trusted coding mode
-  overrides (`HERMES_ANTIGRAVITY_ACP_WORKSPACE` /
-  `HERMES_ANTIGRAVITY_ACP_EXECUTION_MODE`). Default = off.
+- Native coding is enabled by default. `HERMES_ANTIGRAVITY_ACP_WORKSPACE`
+  optionally pins the session workspace; the former
+  `HERMES_ANTIGRAVITY_ACP_EXECUTION_MODE` setting no longer changes behavior.
+  Native Telegram video remains opt-in with its own allowlist and TOCTOU limits.
 - If you want the full Antigravity agent runtime with native tools and MCP
   clients, run the official server as an external ACP **agent** — that is the
   vendor's own product surface, not this shim.

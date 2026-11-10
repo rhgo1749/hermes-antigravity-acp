@@ -765,7 +765,7 @@ def test_unattended_mutation_permission_is_denied_immediately(
 ):
     client, _, _, workspace = _isolation(monkeypatch, tmp_path)
     _stub_file_safety(monkeypatch)
-    assert client._trusted_coding is False, "default profile must stay unattended-hardened"
+    assert client._trusted_coding is True
 
     responses, elapsed = _ask(
         client,
@@ -788,7 +788,7 @@ def test_unattended_permission_without_reject_option_fails_closed_cancelled(
     responses, elapsed = _ask(
         client,
         _permission_params(
-            "run_command",
+            "mcp__unknown__run_command",
             "execute",
             {"CommandLine": "ls", "Cwd": str(workspace)},
             [{"optionId": "always", "kind": "allow_always"}],
@@ -802,8 +802,8 @@ def test_unattended_permission_without_reject_option_fails_closed_cancelled(
     assert elapsed < 5.0
 
 
-def test_unattended_permission_never_selects_an_allow_option(monkeypatch, tmp_path):
-    """Even a benign-looking, fully-in-workspace request gets no auto-allow by default."""
+def test_default_permission_allows_in_workspace_edit(monkeypatch, tmp_path):
+    """A vetted workspace edit is auto-allowed but not executed by the permission handler."""
     client, _, _, workspace = _isolation(monkeypatch, tmp_path)
     _stub_file_safety(monkeypatch)
     inside = workspace / "notes.txt"
@@ -820,7 +820,7 @@ def test_unattended_permission_never_selects_an_allow_option(monkeypatch, tmp_pa
         str(workspace),
     )
     outcome = responses[0]["result"]["outcome"]
-    assert outcome["optionId"] == "deny"
+    assert outcome["optionId"] == "always"
     assert inside.read_text(encoding="utf-8") == "hi"
 
 
@@ -829,14 +829,14 @@ def test_unattended_permission_never_selects_an_allow_option(monkeypatch, tmp_pa
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("mode_value", ["", "trusted", "trusted_coding", "codex", "TRUSTED-X"])
-def test_trusted_coding_stays_disabled_without_exact_opt_in(monkeypatch, tmp_path, mode_value):
+def test_native_coding_is_default_regardless_of_legacy_mode(monkeypatch, tmp_path, mode_value):
     if mode_value:
         monkeypatch.setenv("HERMES_ANTIGRAVITY_ACP_EXECUTION_MODE", mode_value)
     else:
         monkeypatch.delenv("HERMES_ANTIGRAVITY_ACP_EXECUTION_MODE", raising=False)
     client, module, _, _ = _isolation(monkeypatch, tmp_path)
-    assert module._trusted_coding_mode_enabled() is False
-    assert client._trusted_coding is False
+    assert module._trusted_coding_mode_enabled() is True
+    assert client._trusted_coding is True
 
 
 def test_trusted_coding_requires_explicit_opt_in_and_becomes_active(monkeypatch, tmp_path):

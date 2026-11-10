@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 410" role="img" aria-labelledby="title desc">
   <title id="title">How Antigravity ACP connects to Hermes</title>
-  <desc id="desc">A user interacts with Hermes, whose provider communicates with the official Antigravity ACP server over JSON-RPC on standard input and output. The official server communicates with the Antigravity service. In the default mode, Hermes tool calls follow Hermes approval policy; native mutation is denied and native run_command is disabled.</desc>
+  <desc id="desc">A user interacts with Hermes, whose provider communicates with the official Antigravity ACP server over JSON-RPC on standard input and output. The official server communicates with the Antigravity service. Hermes tools follow Hermes policy; native coding tools may run directly and bypass Hermes terminal approvals.</desc>
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="#68758b" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker>
   </defs>
@@ -33,7 +33,7 @@
     <text x="428" y="241" text-anchor="middle" font-size="12" fill="#566278">stdio</text>
     <rect x="38" y="285" width="824" height="86" rx="12" fill="#ffffff" stroke="#cdd5e2"/>
     <text x="58" y="311" font-size="14" font-weight="650" fill="#182339">Default execution boundary</text>
-    <text x="58" y="335" font-size="13" fill="#44536a">Hermes tool calls follow Hermes policies and approvals. Native mutation is denied;</text>
-    <text x="58" y="355" font-size="13" fill="#44536a">native run_command is disabled. Trusted coding is a separate opt-in mode.</text>
+    <text x="58" y="335" font-size="13" fill="#44536a">Hermes tools follow Hermes policies; native coding tools may run directly.</text>
+    <text x="58" y="355" font-size="13" fill="#44536a">Native commands bypass Hermes terminal approval. Workspace checks are not a sandbox.</text>
   </g>
 </svg>

@@ -239,8 +239,8 @@ for line in sys.stdin:
             emit({"jsonrpc": "2.0", "id": 901, "method": "session/request_permission", "params": {
                 "toolCall": {
                     "toolCallId": "native-prose-write-901",
-                    "name": "run_command",
-                    "title": "Running run_command",
+                    "name": "mcp__unknown__prose_write",
+                    "title": "Running prose write",
                     "kind": "execute",
                     "rawInput": {"command": "synthetic Krafton prose write"},
                 },
@@ -852,7 +852,7 @@ def test_fake_subprocess_normal_tool_turn_and_native_resume(monkeypatch, tmp_pat
     assert "session/resume" in methods
     for row in rows:
         if row.get("method") in {"session/new", "session/resume"}:
-            assert row["params"].get("_meta") == {"agy": {"disabledTools": ["run_command"]}}
+            assert "_meta" not in row["params"]
             assert row["params"]["mcpServers"] == []
             assert row["affinity_ttl"] == "86400"
             assert row["affinity_max_entries"] == "512"
@@ -920,7 +920,7 @@ def test_fake_pre_tool_denial_is_distinguished_without_permission_response(
     assert not any(row.get("id") == 900 for row in rows)
 
 
-def test_fake_permission_request_selects_offered_reject_option(
+def test_fake_permission_request_selects_offered_native_allow_option(
     monkeypatch, tmp_path
 ) -> None:
     script, log_path = _write_fake_server(tmp_path)
@@ -940,7 +940,7 @@ def test_fake_permission_request_selects_offered_reject_option(
     rows = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
     response = next(row for row in rows if row.get("id") == 900)
     assert response["result"]["outcome"] == {
-        "outcome": "selected", "optionId": "reject-900"
+        "outcome": "selected", "optionId": "allow-900"
     }
 
 
@@ -1221,7 +1221,7 @@ def test_fake_acp_intent_drift_after_model_switch_replay_and_reject_once(
     assert len(permission_events) == 1
     assert permission_events[0]["selected_option_kind"] == "reject_once"
     assert permission_events[0]["server_outcome"] == "selected"
-    assert permission_events[0]["tool_origin"] == "native_acp"
+    assert permission_events[0]["tool_origin"] == "mcp"
     assert permission_events[0]["tool_outcome"] == "permission_denied_not_executed"
 
     # This is the discrimination oracle: a later elliptical user turn must keep

@@ -287,8 +287,8 @@ def test_missing_reject_option_fails_closed_and_reports_protocol_limitation(
         workspace,
         {
             "toolCallId": "native-run-2",
-            "name": "run_command",
-            "title": "Running run_command",
+            "name": "mcp__unknown__run_command",
+            "title": "Running unknown command",
             "kind": "execute",
             "rawInput": {"command": "SECRET_COMMAND"},
         },

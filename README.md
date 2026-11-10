@@ -19,9 +19,10 @@ of a PTY, TUI parser, or a custom `agy --input-format stream-json` bridge.
 ![How Hermes connects to the official Antigravity ACP server, and the default tool execution boundary](docs/images/how-it-works.svg)
 
 The provider communicates with the official server over ACP JSON-RPC via stdio.
-Hermes tool calls follow Hermes policies and approvals; the default mode denies
-native mutations and disables native `run_command`. Trusted coding is a separate
-opt-in mode with a different execution boundary.
+Hermes tool calls follow Hermes policies and approvals. By default, the ACP
+server can also execute native coding tools: vetted native file edits and shell
+commands are automatically authorized by the provider. Native commands bypass
+Hermes terminal approvals; a workspace path check is not a sandbox.
 
 ## Status at a glance (evidence-backed, checked 2026-11-08)
 
@@ -326,10 +327,10 @@ In brief:
   network or background behavior inside the proprietary vendor binary is
   attributed to Google's runtime and is neither observed nor speculated about
   in this repository.
-- **Shell/tool boundary.** Hermes tools stay in Hermes; acting as a Hermes
-  model backend does not grant the Antigravity runtime native tool
-  permissions. Opt-in extensions (native Telegram video; trusted coding
-  mode) carry explicit trust warnings.
+- **Shell/tool boundary.** Hermes tool calls use Hermes policy. The default
+  native coding path auto-approves vetted native operations and runs shell
+  commands outside Hermes terminal approval. Use only in a trusted environment;
+  path checks do not confine shell commands. Native Telegram video remains opt-in.
 - **Child processes.** The default topology launches one short-lived
   official server child per ACP session or attempt — concurrent sessions
   and retries can therefore yield more than one child over a Hermes process

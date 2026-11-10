@@ -2069,10 +2069,12 @@ _TRUSTED_CODING_MODE_VALUE = "trusted-coding"
 
 
 def _trusted_coding_mode_enabled() -> bool:
-    return (
-        os.environ.get(_TRUSTED_CODING_MODE_ENV, "").strip().lower()
-        == _TRUSTED_CODING_MODE_VALUE
-    )
+    """Use the native coding-agent policy for every provider session.
+
+    The former execution-mode environment variable is deliberately ignored:
+    an existing profile or a fresh installation gets the same behavior.
+    """
+    return True
 
 
 # Exact official-server built-in names, plus the nameless built-in frame

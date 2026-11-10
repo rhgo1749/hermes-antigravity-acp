@@ -87,10 +87,10 @@ def _stub_hermes_file_safety(monkeypatch):
 
 # --- mode selection is explicit and default-neutral -----------------------
 
-def test_mode_is_off_by_default_and_requires_exact_value(monkeypatch):
+def test_native_mode_is_default_and_legacy_values_do_not_change_it(monkeypatch):
     monkeypatch.delenv("HERMES_ANTIGRAVITY_ACP_EXECUTION_MODE", raising=False)
     _, client, module = _load_plugin(monkeypatch)
-    assert client._trusted_coding is False
+    assert client._trusted_coding is True
 
     monkeypatch.setenv("HERMES_ANTIGRAVITY_ACP_EXECUTION_MODE", "trusted-coding")
     _, trusted_client, _ = _load_plugin(monkeypatch)
@@ -98,7 +98,7 @@ def test_mode_is_off_by_default_and_requires_exact_value(monkeypatch):
 
     monkeypatch.setenv("HERMES_ANTIGRAVITY_ACP_EXECUTION_MODE", "trusted")
     _, partial_client, _ = _load_plugin(monkeypatch)
-    assert partial_client._trusted_coding is False
+    assert partial_client._trusted_coding is True
     del module
 
 
@@ -683,8 +683,10 @@ def _run_fake_coding_loop(monkeypatch, tmp_path, *, trusted: bool):
     script = tmp_path / "fake_coding_server.py"
     script.write_text(FAKE_SERVER, encoding="utf-8")
     log_path = tmp_path / "fake_log.jsonl"
-    monkeypatch.setenv("HERMES_ANTIGRAVITY_ACP_EXECUTION_MODE",
-                       "trusted-coding" if trusted else "off")
+    if trusted:
+        monkeypatch.setenv("HERMES_ANTIGRAVITY_ACP_EXECUTION_MODE", "trusted-coding")
+    else:
+        monkeypatch.delenv("HERMES_ANTIGRAVITY_ACP_EXECUTION_MODE", raising=False)
     monkeypatch.setenv("HERMES_ANTIGRAVITY_ACP_WORKSPACE", str(workspace))
     module, client, client_module = _load_plugin(
         monkeypatch,
@@ -692,7 +694,7 @@ def _run_fake_coding_loop(monkeypatch, tmp_path, *, trusted: bool):
         args=[str(script), str(log_path), str(workspace)],
         cwd=str(workspace),
     )
-    assert client._trusted_coding is trusted
+    assert client._trusted_coding is True
 
     completion = client.chat.completions.create(
         messages=[{"role": "user", "content": "coding-loop"}], timeout=90, stream=False
@@ -702,17 +704,17 @@ def _run_fake_coding_loop(monkeypatch, tmp_path, *, trusted: bool):
     return module, client, client_module, workspace, rows, completion
 
 
-def test_default_mode_rejects_coding_loop_end_to_end(monkeypatch, tmp_path):
+def test_default_mode_allows_coding_loop_end_to_end(monkeypatch, tmp_path):
     _, _, _, workspace, rows, _ = _run_fake_coding_loop(monkeypatch, tmp_path, trusted=False)
     answers = {row["permission_answer"]["tool_call_id"]: row["permission_answer"]
                for row in rows if "permission_answer" in row}
-    assert answers["create-1"]["result"]["outcome"]["optionId"] == "create-1-reject_once"
-    assert answers["run-1"]["result"]["outcome"]["optionId"] == "run-1-reject_once"
-    # nothing was executed: no writes, no pytest
-    assert not (workspace / "helpers.py").exists()
-    assert "def add(a, b):\n    return a + b\n" in (workspace / "calc.py").read_text()
+    assert answers["create-1"]["result"]["outcome"]["optionId"] == "create-1-allow_once"
+    assert answers["run-1"]["result"]["outcome"]["optionId"] == "run-1-allow_always"
+    assert answers["edit-outside-1"]["result"]["outcome"]["optionId"] == "edit-outside-1-reject_once"
+    assert (workspace / "helpers.py").exists()
+    assert "from helpers import add2" in (workspace / "calc.py").read_text()
     session_new = next(row for row in rows if row.get("method") == "session/new")
-    assert session_new["params"]["_meta"] == {"agy": {"disabledTools": ["run_command"]}}
+    assert "_meta" not in session_new["params"]
 
 
 def test_trusted_mode_coding_loop_end_to_end(monkeypatch, tmp_path):
