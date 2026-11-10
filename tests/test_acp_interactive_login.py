@@ -50,10 +50,18 @@ for raw in sys.stdin:
         if scenario == "duplicate_url":
             print("Open the following link to authenticate the ACP server: " + url,
                   file=sys.stderr, flush=True)
+        if scenario in ("lingering_child", "error_lingering"):
+            # A server child process inherits the stdout/stderr pipe handles
+            # and outlives the server, so the driver's reader threads stay
+            # blocked after the response — the exact Windows cleanup hang.
+            import subprocess
+            child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+            with open(os.environ["FAKE_PIDFILE"], "w", encoding="utf-8") as f:
+                f.write(str(child.pid))
         if scenario == "wait":
             import time
             time.sleep(10)
-        elif scenario == "error":
+        elif scenario in ("error", "error_lingering"):
             print(json.dumps({"jsonrpc":"2.0", "id":2,
                               "error":{"code":-32000,"message":"PRIVATE_FAKE_TOKEN"}}), flush=True)
         else:
@@ -68,6 +76,61 @@ def server(tmp_path, scenario="ok"):
     log = tmp_path / "methods.txt"
     env = dict(os.environ, FAKE_RECORD=str(log), FAKE_SCENARIO=scenario)
     return [sys.executable, str(script)], env, log
+
+
+def lingering_server(tmp_path, scenario):
+    script = tmp_path / "server.py"
+    script.write_text(FAKE_SERVER, encoding="utf-8")
+    pidfile = tmp_path / "child.pid"
+    env = dict(os.environ, FAKE_RECORD=str(tmp_path / "methods.txt"),
+               FAKE_SCENARIO=scenario, FAKE_PIDFILE=str(pidfile))
+    return [sys.executable, str(script)], env, pidfile
+
+
+def kill_lingering(pidfile):
+    if not pidfile.exists():
+        return
+    try:
+        pid = int(pidfile.read_text().strip())
+    except ValueError:
+        return
+    try:
+        if os.name == "nt":
+            import subprocess
+            subprocess.call(["taskkill", "/F", "/PID", str(pid)],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            import signal
+            os.kill(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def test_cleanup_hang_after_success_is_warning_not_failure(tmp_path):
+    login = load_login()
+    cmd, env, pidfile = lingering_server(tmp_path, "lingering_child")
+    output = io.StringIO()
+    try:
+        login.run_login(cmd, env=env, method="oauth-personal", timeout=5,
+                        output=output)
+    finally:
+        kill_lingering(pidfile)
+    assert "cleanup was incomplete" in output.getvalue()
+    assert "authentication itself completed" in output.getvalue()
+
+
+def test_failure_keeps_root_cause_when_cleanup_hangs(tmp_path):
+    login = load_login()
+    cmd, env, pidfile = lingering_server(tmp_path, "error_lingering")
+    try:
+        with pytest.raises(login.LoginError) as excinfo:
+            login.run_login(cmd, env=env, method="oauth-personal", timeout=5,
+                            output=io.StringIO())
+    finally:
+        kill_lingering(pidfile)
+    message = str(excinfo.value)
+    assert "did not complete the requested step" in message
+    assert "cleanup was also incomplete" in message
 
 
 def test_login_sends_only_initialize_and_authenticate(tmp_path):

@@ -149,6 +149,7 @@ def run_login(command: list[str], *, env: dict[str, str], method: str,
     shown_url = False
     success = False
     auth_sent = False
+    reported: LoginError | None = None
     try:
         send(1, "initialize", {
             "protocolVersion": 1,
@@ -212,10 +213,12 @@ def run_login(command: list[str], *, env: dict[str, str], method: str,
                 success = True
     except LoginError as exc:
         if auth_sent:
-            raise LoginError(
+            reported = LoginError(
                 f"{exc} Authentication may have completed; check before retrying."
-            ) from None
-        raise
+            )
+        else:
+            reported = exc
+        raise reported from None
     finally:
         cleanup_failed = False
         if proc.poll() is None:
@@ -244,10 +247,25 @@ def run_login(command: list[str], *, env: dict[str, str], method: str,
             else:
                 stream.close()
         if cleanup_failed:
-            raise LoginError(
-                "Server cleanup did not complete; authentication outcome may be unknown. "
-                "Check before retrying."
-            ) from None
+            if success:
+                # The authenticate response arrived before cleanup hung on a
+                # pipe handle still held open by a server child process
+                # (normal on Windows). The outcome is known; surfacing the
+                # same failure text as a real failure sends users into
+                # needless retries.
+                output.write(
+                    "Warning: server process cleanup was incomplete; "
+                    "authentication itself completed.\n"
+                )
+            elif reported is not None:
+                raise LoginError(
+                    f"{reported} (server cleanup was also incomplete)"
+                ) from None
+            else:
+                raise LoginError(
+                    "Server cleanup did not complete; authentication outcome "
+                    "may be unknown. Check before retrying."
+                ) from None
     # Process any stderr lines that raced the final JSON-RPC response. This is
     # important for validating a promptly exiting server, including tests.
     while not events.empty():
