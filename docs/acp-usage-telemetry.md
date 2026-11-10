@@ -4,16 +4,22 @@
 
 The standalone adapter exposes `antigravity_usage_telemetry` as a response-level
 attribute. Streaming `StreamChunks` preserve that attribute through the bridge.
-Google's official Antigravity ACP 1.4.0 `SessionPromptResult` has no per-request
-input/output/cache/reasoning token accounting. Actual billed tokens are therefore
-unavailable through the official API. Do not derive billing values from prompt
-characters, output length, or `native_tokens`.
+Google's official Antigravity ACP 1.4.0 did not expose the token breakdown in
+`SessionPromptResult`. The 1.4.4 server can include `usage` in the completed
+`session/prompt` result: the adapter uses this per-turn breakdown in
+`completion.usage` when present and valid. `inputTokens` maps to
+`prompt_tokens`; `outputTokens` plus `thoughtTokens` maps to `completion_tokens`,
+with thoughts also exposed as `completion_tokens_details.reasoning_tokens`.
+`totalTokens` is forwarded as reported, and `cachedReadTokens`, when present,
+is exposed as `prompt_tokens_details.cached_tokens`. This is server-reported
+usage, not an invoice; the server can omit it and excludes subagent usage.
+Do not derive billing values from prompt characters, output length, or
+`native_tokens`.
 
-Since **v0.7.4** (operator-approved), the OpenAI-compatible `usage` field is
-deliberately widened as a **consumption proxy** (see the next section). The
-`antigravity_usage_telemetry` contract below is unchanged: it still reports
-`status="unavailable"` with null `request_usage` buckets, because the proxy is
-not billing data.
+When the final result has no valid usage, the adapter retains the v0.7.4
+consumption proxy described below. The separate `antigravity_usage_telemetry`
+attribute still uses `status="unavailable"` and null `request_usage` buckets;
+those fields do not describe the separate `completion.usage` value.
 
 ## v0.7.4 consumption proxy in `completion.usage`
 
@@ -54,7 +60,7 @@ Every completed response uses this JSON-compatible shape:
   },
   "provenance": {
     "source": "official_acp_v1.4.0",
-    "request_usage": "SessionPromptResult has no per-request token accounting",
+    "request_usage": "not populated in this telemetry contract; see completion.usage",
     "context_occupancy": "usage_update.used is per-model-call consumption, not billing usage"
   },
   "native_session_id_hash": "sha256:<opaque>",

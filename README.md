@@ -489,21 +489,23 @@ preview that selects configured accounts and maintains session affinity; it
 is not part of the default install. Review its terms and boundaries in
 [`docs/mux-packaging.md`](docs/mux-packaging.md) before enabling it.
 
-The plugin deliberately keeps **Hermes tools in Hermes**. It does not grant
-the Antigravity runtime arbitrary native tool permissions when acting as a
-Hermes model backend. If you want the full Antigravity agent runtime with its
-native tools and MCP clients, connect the official server as an external ACP
-**agent**, not as a Hermes model-provider shim.
+The plugin keeps **Hermes tools in Hermes**. The official ACP child can also
+execute native coding tools: the provider defaults to trusted-coding behavior
+and automatically approves supported native edit and command requests when its
+checks pass. Native commands bypass Hermes terminal approval; path checks are
+not a sandbox. Review [`docs/data-and-permissions.md`](docs/data-and-permissions.md)
+before use.
 
 **Usage telemetry is explicit and truthful:** the pinned official ACP server
-does not report actual billed request tokens. Since v0.7.4, when the server
-reported `usage_update` consumption frames during a turn, completions carry
-`completion.usage` as a server-reported **consumption proxy**
+does not report actual billed request tokens. When ACP's final prompt response
+includes a valid usage breakdown, `completion.usage` carries its input, output,
+reasoning, and cache-read counts where available. Otherwise, since v0.7.4, when
+the server reported `usage_update` consumption frames during a turn,
+`completion.usage` carries a server-reported **consumption proxy**
 (`prompt_tokens` = latest call's consumption, `completion_tokens` = earlier
 same-turn calls' consumption, `total_tokens` = turn sum; it may under-report
-and has no true input/output split) so Hermes' native usage accounting shows
-provider numbers instead of a text estimate. Otherwise completions keep
-`completion.usage=None`. Every response also carries a response-level
+and has no true input/output split). With neither source available, completions
+keep `completion.usage=None`. Every response also carries a response-level
 `antigravity_usage_telemetry` attribute with `status="unavailable"` and null
 request-usage buckets: the telemetry attribute never populate request usage
 buckets, and the proxy is explicitly not vendor billing. Official

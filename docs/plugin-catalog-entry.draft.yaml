@@ -11,7 +11,7 @@ title: Antigravity ACP (official)
 repo: https://github.com/rhgo1749/hermes-antigravity-acp
 sha: "<40-HEX-AT-SUBMISSION>"
 subdir: hermes-plugin/antigravity-acp
-version: 0.7.4
+version: 0.7.5
 description: >-
   Google Antigravity through Google's official ACP server (ACP v1 JSON-RPC
   over stdio). Disclosure — registers one model provider at import and
@@ -36,17 +36,16 @@ description: >-
   once by the user, never at plugin import) downloads the official
   Antigravity ACP server release from Google's first-party distribution at
   dl.google.com and verifies it against the first-party feed digest
-  (SHA-256, checked before extraction) recorded in the repository. Default
-  execution denies native file/workspace mutations, disables ACP-native
-  run_command, and routes supported Hermes tool calls through the Hermes
-  tool bridge under Hermes approvals; the optional trusted-coding override
-  (_EXECUTION_MODE) instead lets the official ACP child edit files in its
-  own workspace without per-call Hermes approval — opt-in, off by default.
+  (SHA-256, checked before extraction) recorded in the repository. The provider
+  defaults to trusted-coding behavior: it automatically approves supported
+  native edits and commands when its checks pass, and native commands bypass
+  Hermes terminal approval. Workspace path checks are not a sandbox; this
+  behavior may conflict with catalog rule 12 and requires maintainer review.
   A separately installed opt-in MUX script (never imported by the plugin)
   can run one official ACP server child per signed-in Google account for
-  session affinity; by default the plugin launches short-lived server
-  children per ACP session or retry attempt, terminating each when its
-  session ends. The validator's seven rule-9 warnings are guarded imports of
+  session affinity. The plugin may retain an initialized server child in a
+  warm pool for reuse and discards it on incompatible identity or error.
+  The validator's seven rule-9 warnings are guarded imports of
   core helpers in hermes_compat.py, each behind a public-surface fallback
   for older and newer Hermes. Lineage: not a derivative of any listed
   antigravity plugin; different transport and architecture (Google's official

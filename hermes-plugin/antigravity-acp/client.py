@@ -2397,6 +2397,32 @@ def _capture_turn_usage(update: Any, activity_stats: dict[str, Any] | None) -> N
     activity_stats[_TURN_USAGE_LAST_KEY] = float(update["used"])
 
 
+def _turn_usage_from_prompt_result(result: Any) -> Any:
+    """Translate ACP's optional per-turn Usage into OpenAI usage fields."""
+    usage = result.get("usage") if isinstance(result, dict) else None
+    if not isinstance(usage, dict):
+        return None
+    required = ("inputTokens", "outputTokens", "totalTokens")
+    optional = ("thoughtTokens", "cachedReadTokens", "cachedWriteTokens")
+    for name in required + optional:
+        value = usage.get(name)
+        if name in required or value is not None:
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                return None
+    thoughts = usage.get("thoughtTokens") or 0
+    result_usage = SimpleNamespace(
+        prompt_tokens=usage["inputTokens"],
+        completion_tokens=usage["outputTokens"] + thoughts,
+        total_tokens=usage["totalTokens"],
+        completion_tokens_details=SimpleNamespace(reasoning_tokens=thoughts),
+    )
+    if usage.get("cachedReadTokens") is not None:
+        result_usage.prompt_tokens_details = SimpleNamespace(
+            cached_tokens=usage["cachedReadTokens"]
+        )
+    return result_usage
+
+
 def _turn_usage_from_activity(activity_stats: dict[str, Any]) -> Any:
     """OpenAI-shaped usage from this turn's observed ``usage_update`` frames.
 
@@ -2458,7 +2484,7 @@ def _build_usage_telemetry(
         "request_usage": {bucket: None for bucket in _USAGE_BUCKETS},
         "provenance": {
             "source": "official_acp_v1.4.0",
-            "request_usage": "SessionPromptResult has no per-request token accounting",
+            "request_usage": "not populated in this telemetry contract; see completion.usage",
             "context_occupancy": (
                 "usage_update.used is per-model-call consumption, not billing usage; "
                 "size is the context window"
@@ -4505,18 +4531,9 @@ class AntigravityACPClient:
                         finish_reason="tool_calls" if tool_calls else "stop",
                     )
                 ],
-                # v0.7.4 (operator-approved): when the official server reported
-                # ``usage_update`` consumption frames this turn, ``usage`` carries that
-                # server-reported proxy in the OpenAI chat shape so Hermes' native
-                # accounting (``/usage``, context %, compaction verdicts) shows provider
-                # numbers instead of falling back to the text estimate.  Mapping:
-                # prompt_tokens = latest call's consumption (newest occupancy reading),
-                # completion_tokens = earlier same-turn calls' consumption, total = turn
-                # sum.  This is a consumption proxy, not vendor billing: it may
-                # under-report (zero-delta frames omitted, subagents excluded) and has no
-                # true input/output split (docs/acp-usage-telemetry.md).  When no frames
-                # were observed ``usage`` stays ``None`` and Hermes' display-only request
-                # estimate remains in charge; a fabricated zero would suppress it.
+                # Prefer the official prompt result's per-turn breakdown. If it
+                # is absent or invalid, retain the v0.7.4 usage_update proxy;
+                # the proxy does not provide a real input/output split.
                 usage=session_result.get("turn_usage"),
                 model=session_result.get("effective_model") or model or "antigravity-acp",
             )
@@ -5199,7 +5216,10 @@ class AntigravityACPClient:
                 session_result["context_occupancy"] = (
                     dict(occupancy) if isinstance(occupancy, dict) else None
                 )
-                session_result["turn_usage"] = _turn_usage_from_activity(activity_stats)
+                session_result["turn_usage"] = (
+                    _turn_usage_from_prompt_result(prompt_result)
+                    or _turn_usage_from_activity(activity_stats)
+                )
             return answer, "".join(reasoning_parts)
 
     def _handle_server_message(

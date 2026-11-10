@@ -93,10 +93,11 @@ ACP session may retain media already consumed in its earlier prompt
   or any third-party endpoint by the plugin itself.
 - Usage reporting is a **response-level attribute**, truthful by contract:
   `antigravity_usage_telemetry` with `status="unavailable"` and null
-  request-usage buckets, because the official
-  server exposes no billed request tokens. Since v0.7.4 `completion.usage`
-  carries a server-reported consumption proxy when `usage_update` frames were
-  observed (may under-report; not billing), otherwise `completion.usage=None`.
+  request-usage buckets; that separate attribute does not expose billing.
+  `completion.usage` prefers a valid per-turn breakdown in the ACP prompt
+  result. Otherwise, since v0.7.4, it carries a server-reported consumption
+  proxy when `usage_update` frames were observed (may under-report; not
+  billing), and is `None` when neither source is available.
   `usage_update` counters are kept
   separately as non-billing `context_occupancy`
   (`docs/acp-usage-telemetry.md`). `/quota` is unavailable/unsupported — no

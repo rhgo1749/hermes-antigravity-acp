@@ -115,6 +115,16 @@ for line in sys.stdin:
                     "sessionUpdate": "usage_update", "used": used, "size": size}}})
             text_update("malformed-only")
             emit({"jsonrpc": "2.0", "id": rid, "result": {"stopReason": "end_turn"}})
+        elif mode in ("prompt-result-usage", "prompt-result-only"):
+            if mode == "prompt-result-usage":
+                emit({"jsonrpc": "2.0", "method": "session/update", "params": {"update": {
+                    "sessionUpdate": "usage_update", "used": 800, "size": 1048576}}})
+            text_update("usage-result")
+            emit({"jsonrpc": "2.0", "id": rid, "result": {
+                "stopReason": "end_turn", "usage": {
+                    "inputTokens": 100, "outputTokens": 20, "thoughtTokens": 5,
+                    "cachedReadTokens": 30, "totalTokens": 125,
+                }}})
         elif mode == "par-echo":
             import os as _os
             text_update(_os.environ.get("ACP_MUX_PAR", "<none>"))
@@ -202,6 +212,34 @@ def test_usage_update_is_non_billing_context_occupancy(monkeypatch, tmp_path, no
     assert usage_totals["hermes-session-130"]["summed_tokens"] == 650
     assert usage_totals["hermes-session-130"]["frames_observed"] == 3
     assert "s-1" not in json.dumps(usage_totals)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("mode", ["prompt-result-usage", "prompt-result-only"])
+def test_prompt_result_usage_is_exposed(monkeypatch, tmp_path, stream, mode) -> None:
+    client = _load_client(monkeypatch, args=_fake_server(tmp_path, mode), cwd=str(tmp_path))
+    reply = client.chat.completions.create(
+        model="antigravity-acp", messages=[{"role": "user", "content": "hi"}],
+        timeout=10, stream=stream,
+    )
+    usage = reply[-1].usage if stream else reply.usage
+    assert usage.prompt_tokens == 100
+    assert usage.completion_tokens == 25
+    assert usage.total_tokens == 125
+    assert usage.completion_tokens_details.reasoning_tokens == 5
+    assert usage.prompt_tokens_details.cached_tokens == 30
+
+
+@pytest.mark.parametrize("field,bad", [
+    ("inputTokens", -1), ("outputTokens", True), ("totalTokens", "10"),
+    ("thoughtTokens", -1), ("cachedReadTokens", False), ("cachedWriteTokens", 1.5),
+])
+def test_invalid_prompt_usage_is_rejected(monkeypatch, tmp_path, field, bad) -> None:
+    _load_client(monkeypatch, args=_fake_server(tmp_path, "plain"), cwd=str(tmp_path))
+    module = sys.modules["antigravity_acp_130.client"]
+    usage = {"inputTokens": 10, "outputTokens": 2, "totalTokens": 12}
+    usage[field] = bad
+    assert module._turn_usage_from_prompt_result({"usage": usage}) is None
 
 
 def test_zero_usage_update_frames_create_no_totals_entry(monkeypatch, tmp_path, no_slash_env) -> None:

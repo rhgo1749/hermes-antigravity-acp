@@ -163,6 +163,7 @@ def _isolation(monkeypatch, tmp_path):
     fake_home = tmp_path / "home"
     fake_home.mkdir(exist_ok=True)
     monkeypatch.setenv("HERMES_HOME", str(fake_home))
+    monkeypatch.setenv("HERMES_REAL_HOME", str(fake_home))
     _stub_hermes_constants(monkeypatch, fake_home)
     workspace = tmp_path / "workspace"
     workspace.mkdir(exist_ok=True)

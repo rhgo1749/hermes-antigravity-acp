@@ -153,10 +153,11 @@ fail-closed consequences).
 
 Partly expected. The official server reports no billed
 request tokens, so `antigravity_usage_telemetry.status = "unavailable"` is the
-truthful contract. Since v0.7.4, when the server reported `usage_update`
-consumption frames, `/usage` and context footers show that server-reported
-consumption proxy (may under-report; not billing); with no frames observed
-`completion.usage=None` and Hermes falls back to its display estimate.
+truthful contract for that separate attribute. `completion.usage` prefers a
+valid usage breakdown from the final ACP prompt response. If unavailable,
+`usage_update` frames can supply the v0.7.4 consumption proxy (which may
+under-report and is not billing). With neither source `completion.usage=None`
+and Hermes may fall back to its display estimate.
 Context-occupancy counters (when present) are per-call
 consumption deltas, never billing figures. `/quota` is unavailable/
 unsupported in the public product. See `docs/acp-usage-telemetry.md`.
