@@ -194,10 +194,6 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
-    env:
-      HERMES_HOME: ${{ runner.temp }}\acp-hermes
-      USERPROFILE: ${{ runner.temp }}\acp-user
-      HOME: ${{ runner.temp }}\acp-user
     steps:
       - uses: actions/checkout@v4
         with:
@@ -206,10 +202,11 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          New-Item -ItemType Directory -Force -Path $env:USERPROFILE | Out-Null
+          $hermesHome = Join-Path $env:RUNNER_TEMP 'acp-hermes'
+          "HERMES_HOME=$hermesHome" | Add-Content -Path $env:GITHUB_ENV
           $installer = Join-Path $env:RUNNER_TEMP 'hermes-install.ps1'
           Invoke-WebRequest -Uri 'https://hermes-agent.nousresearch.com/install.ps1' -OutFile $installer
-          & $installer -NonInteractive -SkipBrowser -SkipComputerUse
+          & $installer -HermesHome $hermesHome -NonInteractive -SkipBrowser -SkipComputerUse
           if ($LASTEXITCODE -ne 0) { throw "Hermes installer failed: $LASTEXITCODE" }
       - name: Run the actual Windows installer
         shell: cmd
