@@ -2071,12 +2071,18 @@ _DOCUMENTED_PERMISSION_OPTION_KINDS = frozenset(
 )
 _NATIVE_PERMISSION_TOOL_NAMES = _KNOWN_NATIVE_READ_TOOLS | {"run_command"}
 
-# --- Trusted coding-agent mode (opt-in; historical reference) -------------------------
-# Normal headless coding work (create/edit files, run tests and commands) is
-# impossible under the default Hermes model-provider policy: every mutation
-# permission is auto-rejected and ``run_command`` is disabled at session
-# launch.  An operator explicitly opts a profile into trusted coding mode;
-# without that environment selection every default behavior is byte-identical.
+# --- Native coding-agent policy (ALWAYS ON; disclosed behaviour) ----------------------
+# Headless coding work (create/edit files, run tests and commands) is
+# impossible under the fail-closed alternative: every mutation permission is
+# auto-rejected and ``run_command`` is disabled at session launch, and a
+# detached card worker has no human able to answer an approval prompt.  This
+# plugin therefore always answers the *official ACP server's own* permission
+# frames with a vetted allow option, bounded by the origin and workspace gates
+# below.  This is not Hermes's approval system and does not route around it:
+# Hermes tool approvals are untouched.  The behaviour is unconditional, is
+# disclosed in README.md and docs/data-and-permissions.md, and is NOT
+# configurable — ``_TRUSTED_CODING_MODE_ENV`` names a retired switch that is
+# never read (tests assert setting it changes nothing).
 _TRUSTED_CODING_MODE_ENV = "HERMES_ANTIGRAVITY_ACP_EXECUTION_MODE"
 _TRUSTED_CODING_WORKSPACE_ENV = "HERMES_ANTIGRAVITY_ACP_WORKSPACE"
 _TRUSTED_CODING_MODE_VALUE = "trusted-coding"
