@@ -21,6 +21,7 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TextIO
 from urllib.parse import parse_qs, urlsplit
@@ -296,6 +297,80 @@ def _managed_launcher_bodies(target: str, args: tuple[str, ...] | list[str]) -> 
     }
 
 
+@dataclass(frozen=True)
+class _DistributionPin:
+    url: str
+    executable: str
+    sha256: str
+    args: tuple[str, ...] = ()
+
+
+_PUBLISHER_VERSION = "1.4.4"
+_PUBLISHER_PINS: dict[tuple[str, str], _DistributionPin] = {
+    ("linux", "x86_64"): _DistributionPin(
+        url=(
+            "https://dl.google.com/agy-extensions/releases/linux/"
+            f"agy-acp-server-{_PUBLISHER_VERSION}-linux-x86_64.zip"
+        ),
+        executable="agy_acp_server.par",
+        sha256="baf31b7a97602dee359cf2a43f72b6e11c6bf354be874987d80660cd3526bb6a",
+        args=("--uid=",),
+    ),
+    ("linux", "aarch64"): _DistributionPin(
+        url=(
+            "https://dl.google.com/agy-extensions/releases/linux/"
+            f"agy-acp-server-{_PUBLISHER_VERSION}-linux-arm64.zip"
+        ),
+        executable="agy_acp_server.par",
+        sha256="b0273227c07cfa1ea5c1d9ff869b64c5b2b39b98862081fcd4c597ec316e0c57",
+        args=("--uid=",),
+    ),
+    ("darwin", "arm64"): _DistributionPin(
+        url=(
+            "https://dl.google.com/agy-extensions/releases/macos/"
+            f"agy-acp-server-{_PUBLISHER_VERSION}-darwin-arm64.zip"
+        ),
+        executable="agy_acp_server.par",
+        sha256="a3cf324046396380fcd8c055a4a4c83ac4ea74a38ea883ccbfce5ca1e9927ae9",
+        args=(),
+    ),
+    ("windows", "amd64"): _DistributionPin(
+        url=(
+            "https://dl.google.com/agy-extensions/releases/windows/"
+            f"agy-acp-server-{_PUBLISHER_VERSION}-windows-x86_64.zip"
+        ),
+        executable="agy_acp_server.exe",
+        sha256="4b68e5936a3d7a60b520aa1ee9479c8be58c43e015f026dc41e7ad17ec54d427",
+        args=(),
+    ),
+    ("windows", "arm64"): _DistributionPin(
+        url=(
+            "https://dl.google.com/agy-extensions/releases/windows/"
+            f"agy-acp-server-{_PUBLISHER_VERSION}-windows-arm64.zip"
+        ),
+        executable="agy_acp_server.exe",
+        sha256="655835b095e160d726ee894a10e56960a9a81b03503edbd348079336163b28de",
+        args=(),
+    ),
+}
+
+
+def _normalize_platform(system: str | None = None, machine: str | None = None) -> tuple[str, str]:
+    import platform as _platform
+
+    sys_name = (system or _platform.system()).strip().lower()
+    mach_name = (machine or _platform.machine()).strip().lower()
+    aliases = {
+        "x86-64": "amd64" if sys_name == "windows" else "x86_64",
+        "x64": "amd64" if sys_name == "windows" else "x86_64",
+        "x86_64": "amd64" if sys_name == "windows" else "x86_64",
+        "amd64": "amd64" if sys_name == "windows" else "x86_64",
+        "aarch64": "arm64" if sys_name in {"darwin", "windows"} else "aarch64",
+        "arm64": "arm64" if sys_name in {"darwin", "windows"} else "aarch64",
+    }
+    return sys_name, aliases.get(mach_name, mach_name)
+
+
 def _registry_path() -> Path:
     """The publisher-pin registry source for this driver.
 
@@ -309,28 +384,117 @@ def _registry_path() -> Path:
     return Path(__file__).resolve().parents[2] / "antigravity_acp" / "registry.py"
 
 
-def _pinned_digests() -> dict[str, dict[str, str]]:
-    """``{version: {filename: sha256}}`` from the repository registry pin.
+def _load_publisher_pins() -> dict[str, dict[tuple[str, str], _DistributionPin]]:
+    """``{version: {(system, machine): DistributionPin}}`` from registry or embedded pins.
 
-    The plugin tree ships no registry copy; the repository checkout that
-    installed the official server owns the publisher digests. A missing
-    registry means the pin cannot be checked, which fails closed.
+    When running inside an installed plugin without a repository checkout,
+    the trustworthy publisher pins embedded in this plugin are used.
+    ``HERMES_ANTIGRAVITY_ACP_REGISTRY`` may point to an explicit registry file
+    (used by offline tests and custom layouts); missing explicit registry files
+    fail closed.
     """
-    registry_path = _registry_path()
-    if not registry_path.is_file():
-        raise LoginError("Publisher pin registry is unavailable; login refused.")
+    override = os.environ.get("HERMES_ANTIGRAVITY_ACP_REGISTRY", "").strip()
+    if override:
+        registry_path = Path(override).expanduser()
+        if not registry_path.is_file():
+            raise LoginError("Publisher pin registry is unavailable; login refused.")
+    else:
+        registry_path = _registry_path()
+
+    if registry_path.is_file():
+        try:
+            source = registry_path.read_text(encoding="utf-8")
+            namespace: dict = {}
+            exec(compile(source, str(registry_path), "exec"), namespace)
+            version = str(namespace["VERSION"])
+            raw_dists = namespace["_DISTRIBUTIONS"]
+            pins: dict[tuple[str, str], _DistributionPin] = {}
+            for key, dist in raw_dists.items():
+                pins[key] = _DistributionPin(
+                    url=getattr(dist, "url", ""),
+                    executable=dist.executable,
+                    sha256=dist.sha256,
+                    args=tuple(getattr(dist, "args", ())),
+                )
+            return {version: pins}
+        except (OSError, UnicodeError, SyntaxError, KeyError, TypeError, ValueError):
+            raise LoginError("Publisher pin registry is unreadable; login refused.") from None
+
+    return {_PUBLISHER_VERSION: dict(_PUBLISHER_PINS)}
+
+
+def _pinned_digests() -> dict[str, dict[str, str]]:
+    """``{version: {executable: sha256}}`` view from the publisher pin registry."""
+    pins = _load_publisher_pins()
+    return {
+        version: {dist.executable: dist.sha256 for dist in dists.values()}
+        for version, dists in pins.items()
+    }
+
+
+def _find_or_acquire_archive(version_dir: Path, dist: _DistributionPin) -> Path | None:
+    """Find a retained, publisher-pinned archive without network access."""
+    import hashlib as _hashlib
+    import urllib.parse as _urlparse
+
+    expected_sha = dist.sha256.strip().lower()
+    if len(expected_sha) != 64 or any(c not in "0123456789abcdef" for c in expected_sha):
+        return None
+
+    candidate_names: list[str] = []
+    if dist.url:
+        parsed_name = Path(_urlparse.urlsplit(dist.url).path).name
+        if parsed_name:
+            candidate_names.append(parsed_name)
+    candidate_names.extend(["official.zip", "archive.zip"])
+
+    candidates: list[Path] = [version_dir / name for name in candidate_names]
+    if version_dir.is_dir():
+        for p in sorted(version_dir.iterdir()):
+            if p.is_file() and not p.is_symlink() and p.suffix.lower() == ".zip":
+                if p not in candidates:
+                    candidates.append(p)
+
+    for candidate in candidates:
+        if candidate.is_file() and not candidate.is_symlink():
+            try:
+                digest = _hashlib.sha256()
+                with candidate.open("rb") as stream:
+                    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                if digest.hexdigest() == expected_sha:
+                    return candidate
+            except OSError:
+                continue
+
+    # Login must never download or replace files implicitly.
+    return None
+
+
+def _verify_binary_against_archive(
+    target: Path, archive_path: Path, executable_name: str
+) -> bool:
+    """Verify that target executable bytes match the publisher archive member."""
+    import zipfile as _zipfile
+
     try:
-        source = registry_path.read_text(encoding="utf-8")
-        namespace: dict = {}
-        exec(compile(source, str(registry_path), "exec"), namespace)
-        version = str(namespace["VERSION"])
-        distributions = namespace["_DISTRIBUTIONS"]
-        digest_by_file: dict[str, str] = {}
-        for distribution in distributions.values():
-            digest_by_file[distribution.executable] = distribution.sha256
-        return {version: digest_by_file}
-    except (OSError, UnicodeError, SyntaxError, KeyError, TypeError, ValueError):
-        raise LoginError("Publisher pin registry is unreadable; login refused.") from None
+        with _zipfile.ZipFile(archive_path) as zf:
+            members = [
+                m
+                for m in zf.infolist()
+                if not m.is_dir() and Path(m.filename).name == executable_name
+            ]
+            if len(members) != 1:
+                return False
+            with zf.open(members[0]) as archived, target.open("rb") as installed:
+                while True:
+                    chunk = archived.read(1024 * 1024)
+                    if chunk != installed.read(1024 * 1024):
+                        return False
+                    if not chunk:
+                        return True
+    except (OSError, _zipfile.BadZipFile, KeyError, RuntimeError):
+        return False
 
 
 def _resolve_official_command() -> tuple[list[str], list[str]]:
@@ -338,8 +502,9 @@ def _resolve_official_command() -> tuple[list[str], list[str]]:
 
     The launcher is accepted only when its exact text is a body the official
     installer writes for a binary that (a) sits at the installer's versioned
-    path, (b) is named by the publisher registry, and (c) hashes to the
-    pinned publisher digest. Returns (spawn_command, launcher_extra_args).
+    path, (b) matches the publisher's pinned archive executable byte-for-byte,
+    and (c) whose archive matches the verified publisher SHA-256 pin. Returns
+    (spawn_command, launcher_extra_args).
     """
     command = str(Path.home() / ".local" / "bin" / _launcher_name())
     launcher = Path(command)
@@ -350,28 +515,38 @@ def _resolve_official_command() -> tuple[list[str], list[str]]:
     except (OSError, UnicodeError):
         raise LoginError("Official ACP launcher is unreadable; login refused.") from None
     texts = {raw, raw.replace("\r\n", "\n")}
-    import hashlib as _hashlib
 
-    pins = _pinned_digests()
+    pins = _load_publisher_pins()
+    missing_archive = False
+    verified_archive = False
     prefix = Path.home() / ".local" / "opt" / "antigravity-acp"
-    for version, digests in pins.items():
+    for version, dists in pins.items():
         version_dir = prefix / version
         if version_dir.is_symlink() or not version_dir.is_dir():
             continue
-        for filename, expected in digests.items():
-            target = version_dir / filename
-            if target.is_symlink() or not target.is_file():
-                continue
-            try:
-                actual = _hashlib.sha256(target.read_bytes()).hexdigest()
-            except OSError:
-                continue
-            if actual != expected:
-                continue
-            for args in _candidate_launch_args(target):
-                for body in _managed_launcher_bodies(str(target), args):
-                    if body in texts:
-                        return [command], list(args)
+        dist = dists.get(_normalize_platform())
+        if dist is None:
+            continue
+        target = version_dir / dist.executable
+        if target.is_symlink() or not target.is_file():
+            continue
+        archive_path = _find_or_acquire_archive(version_dir, dist)
+        if archive_path is None:
+            missing_archive = True
+            continue
+        verified_archive = True
+        if not _verify_binary_against_archive(target, archive_path, dist.executable):
+            continue
+        for args in _candidate_launch_args(target):
+            for body in _managed_launcher_bodies(str(target), args):
+                if body in texts:
+                    # Windows CreateProcess cannot execute a .cmd directly.
+                    # After validating it, start the pinned executable itself.
+                    if os.name == "nt":
+                        return [str(target), *args], list(args)
+                    return [command], list(args)
+    if missing_archive and not verified_archive:
+        raise LoginError("Verified official ACP archive is missing or invalid; run the project installer again.")
     raise LoginError("Official ACP launcher is not managed; login refused.")
 
 

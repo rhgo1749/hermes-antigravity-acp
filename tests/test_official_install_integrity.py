@@ -100,7 +100,37 @@ def test_matching_publisher_digest_installs(tmp_path, monkeypatch):
     assert result["version_dir"] == version_dir
     assert result["executable"].name == "agy_acp_server.par"
     assert launcher.is_file()
+    assert (version_dir / "agy-acp-server.zip").read_bytes() == ARCHIVE
     assert not [p for p in prefix.iterdir() if p.name.startswith(".antigravity-acp-install-")]
+
+
+def test_existing_install_acquires_only_pinned_archive(tmp_path, monkeypatch):
+    module = _load_official_installer("integrity_existing")
+    calls = _patched(monkeypatch, module, sha256=ARCHIVE_SHA256, serve=ARCHIVE, name="existing")
+    prefix = tmp_path / "opt" / "antigravity-acp"
+    version_dir = prefix / module.VERSION
+    version_dir.mkdir(parents=True)
+    executable = version_dir / "agy_acp_server.par"
+    executable.write_bytes(SERVER)
+    module.install(prefix, tmp_path / "bin")
+    assert (version_dir / "agy-acp-server.zip").read_bytes() == ARCHIVE
+    assert executable.read_bytes() == SERVER
+    module.install(prefix, tmp_path / "bin")
+    assert len(calls) == 1
+
+
+def test_existing_install_refuses_tampered_archive(tmp_path, monkeypatch):
+    module = _load_official_installer("integrity_existing_bad")
+    _patched(monkeypatch, module, sha256=ARCHIVE_SHA256, serve=TAMPERED, name="bad")
+    prefix = tmp_path / "opt" / "antigravity-acp"
+    version_dir = prefix / module.VERSION
+    version_dir.mkdir(parents=True)
+    executable = version_dir / "agy_acp_server.par"
+    executable.write_bytes(SERVER)
+    with pytest.raises(RuntimeError, match="SHA-256 mismatch"):
+        module.install(prefix, tmp_path / "bin")
+    assert executable.read_bytes() == SERVER
+    assert not (version_dir / "agy-acp-server.zip").exists()
 
 
 @pytest.mark.skipif(os.name == "nt", reason="fake archive body is a POSIX fixture")

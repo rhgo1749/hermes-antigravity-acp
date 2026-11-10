@@ -160,16 +160,20 @@ def test_child_environment_excludes_credentials_and_mux(monkeypatch):
 
 
 def _fake_registry(tmp_path, executable: Path) -> Path:
-    """A test pin registry whose only digest is the fake server's bytes."""
+    """A test pin registry whose only digest is the fake archive's bytes."""
     import hashlib
+    import zipfile
 
+    archive = executable.parent / "official.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr(executable.name, executable.read_bytes())
+    digest = hashlib.sha256(archive.read_bytes()).hexdigest()
     registry = tmp_path / "registry.py"
-    digest = hashlib.sha256(executable.read_bytes()).hexdigest()
     registry.write_text(
         'VERSION = "9.9.9-test"\n'
         "_DISTRIBUTIONS = {\n"
         '    ("linux", "x86_64"): type("D", (), {'
-        f'"executable": "{executable.name}", "sha256": "{digest}"'
+        f'"executable": "{executable.name}", "sha256": "{digest}", "url": "https://fake.google.invalid/agy-acp.zip", "args": ()'
         "})(),\n"
         "}\n",
         encoding="utf-8",
@@ -304,3 +308,153 @@ def test_cli_method_defaults_and_validates_against_server(tmp_path):
         login.run_login(cmd, env=env, method="oauth-nonexistent", timeout=5,
                         output=output)
     assert log.read_text().splitlines() == ["initialize"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX launcher layout")
+def test_cli_verifies_with_embedded_pins_without_repo_registry(tmp_path, monkeypatch):
+    import hashlib
+    import zipfile
+
+    login = load_login()
+    # Setup official binary under prefix for the embedded publisher pin (1.4.4)
+    version = login._PUBLISHER_VERSION
+    version_dir = tmp_path / ".local" / "opt" / "antigravity-acp" / version
+    version_dir.mkdir(parents=True)
+    executable = version_dir / "agy_acp_server.par"
+    content = b"#!/usr/bin/env python3\nimport sys; sys.exit(0)\n"
+    executable.write_bytes(content)
+    executable.chmod(0o755)
+
+    # Create archive with matching hash
+    archive = version_dir / f"agy-acp-server-{version}-linux-x86_64.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("agy_acp_server.par", content)
+
+    archive_sha = hashlib.sha256(archive.read_bytes()).hexdigest()
+    # Override linux x86_64 pin sha256 to match our fixture archive sha
+    fixture_pin = login._DistributionPin(
+        url=login._PUBLISHER_PINS[("linux", "x86_64")].url,
+        executable="agy_acp_server.par",
+        sha256=archive_sha,
+        args=("--uid=",),
+    )
+    monkeypatch.setitem(login._PUBLISHER_PINS, ("linux", "x86_64"), fixture_pin)
+    # Ensure HERMES_ANTIGRAVITY_ACP_REGISTRY is not set
+    monkeypatch.delenv("HERMES_ANTIGRAVITY_ACP_REGISTRY", raising=False)
+    # Mock _registry_path to point to non-existent file (simulating installed plugin environment)
+    monkeypatch.setattr(login, "_registry_path", lambda: tmp_path / "missing-registry.py")
+
+    launcher = tmp_path / ".local" / "bin" / "antigravity-acp-official"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text(
+        sorted(login._managed_launcher_bodies(str(executable), ("--uid=",)))[-1],
+        encoding="utf-8",
+    )
+    launcher.chmod(0o755)
+
+    monkeypatch.setattr(login.Path, "home", lambda: tmp_path)
+    cmd, extra_args = login._resolve_official_command()
+    assert cmd == [str(launcher)]
+    assert extra_args == ["--uid="]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX launcher layout")
+def test_cli_refuses_when_archive_sha256_mismatches_pin(tmp_path, monkeypatch, capsys):
+    import zipfile
+
+    login = load_login()
+    version = login._PUBLISHER_VERSION
+    version_dir = tmp_path / ".local" / "opt" / "antigravity-acp" / version
+    version_dir.mkdir(parents=True)
+    executable = version_dir / "agy_acp_server.par"
+    content = b"#!/usr/bin/env python3\nimport sys; sys.exit(0)\n"
+    executable.write_bytes(content)
+    executable.chmod(0o755)
+
+    # Archive does NOT match the expected sha256
+    archive = version_dir / f"agy-acp-server-{version}-linux-x86_64.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("agy_acp_server.par", content)
+
+    # Do not override pin; real pin expects Google hash
+    monkeypatch.delenv("HERMES_ANTIGRAVITY_ACP_REGISTRY", raising=False)
+    monkeypatch.setattr(login, "_registry_path", lambda: tmp_path / "missing-registry.py")
+
+    launcher = tmp_path / ".local" / "bin" / "antigravity-acp-official"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text(
+        sorted(login._managed_launcher_bodies(str(executable), ("--uid=",)))[-1],
+        encoding="utf-8",
+    )
+    launcher.chmod(0o755)
+
+    monkeypatch.setattr(login.Path, "home", lambda: tmp_path)
+    with pytest.raises(login.LoginError, match="archive is missing or invalid"):
+        login._resolve_official_command()
+
+
+def test_windows_launcher_resolves_to_executable_without_shell(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    login = load_login()
+    executable = tmp_path / ".local" / "opt" / "antigravity-acp" / "9.9.9-test" / "agy_acp_server.exe"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"fake executable")
+    registry = _fake_registry(tmp_path, executable)
+    launcher = tmp_path / ".local" / "bin" / "antigravity-acp-official.cmd"
+    launcher.parent.mkdir(parents=True)
+    monkeypatch.setattr(login, "os", SimpleNamespace(name="nt", environ=os.environ))
+    monkeypatch.setattr(login, "_normalize_platform", lambda: ("linux", "x86_64"))
+    launcher.write_text(next(iter(login._managed_launcher_bodies(str(executable), ()))), encoding="utf-8")
+    monkeypatch.setenv("HERMES_ANTIGRAVITY_ACP_REGISTRY", str(registry))
+    monkeypatch.setattr(login.Path, "home", lambda: tmp_path)
+    command, args = login._resolve_official_command()
+    assert command == [str(executable)]
+    assert args == []
+
+
+def test_installed_plugin_uses_embedded_pins_without_registry(tmp_path, monkeypatch):
+    import importlib.util
+    import shutil
+
+    installed = tmp_path / "plugins" / "model-providers" / "antigravity-acp" / "login.py"
+    installed.parent.mkdir(parents=True)
+    shutil.copyfile(SCRIPT, installed)
+    spec = importlib.util.spec_from_file_location("installed_login_test", installed)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    monkeypatch.delenv("HERMES_ANTIGRAVITY_ACP_REGISTRY", raising=False)
+    assert not module._registry_path().exists()
+    assert module._load_publisher_pins()[module._PUBLISHER_VERSION] == module._PUBLISHER_PINS
+
+
+def test_missing_archive_never_causes_network_or_writes(tmp_path, monkeypatch):
+    import urllib.request
+
+    login = load_login()
+    monkeypatch.setattr(urllib.request, "urlretrieve", lambda *a, **k: pytest.fail("network"))
+    assert login._find_or_acquire_archive(tmp_path, login._PUBLISHER_PINS[("windows", "arm64")]) is None
+    assert not list(tmp_path.iterdir())
+
+
+def test_embedded_publisher_pins_match_installer_registry():
+    from antigravity_acp.registry import VERSION, _DISTRIBUTIONS
+
+    login = load_login()
+    assert login._PUBLISHER_VERSION == VERSION
+    assert set(login._PUBLISHER_PINS) == set(_DISTRIBUTIONS)
+    for key, expected in _DISTRIBUTIONS.items():
+        actual = login._PUBLISHER_PINS[key]
+        assert (actual.url, actual.executable, actual.sha256, actual.args) == (
+            expected.url, expected.executable, expected.sha256, expected.args
+        )
+
+
+def test_platform_normalization():
+    login = load_login()
+    assert login._normalize_platform("Windows", "x86_64") == ("windows", "amd64")
+    assert login._normalize_platform("Windows", "aarch64") == ("windows", "arm64")
+    assert login._normalize_platform("Linux", "arm64") == ("linux", "aarch64")
+    assert login._normalize_platform("Darwin", "aarch64") == ("darwin", "arm64")

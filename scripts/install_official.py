@@ -9,6 +9,7 @@ import stat
 import sys
 import tempfile
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -141,6 +142,19 @@ def install(
         if not version_dir.is_dir():
             raise RuntimeError("Refusing an unsafe pinned official ACP installation path")
         executable = _find_executable(version_dir, dist.executable)
+        archive_name = Path(urllib.parse.urlsplit(dist.url).path).name or "official.zip"
+        retained = version_dir / archive_name
+        if retained.is_symlink():
+            raise RuntimeError("Refusing a symlinked official ACP archive")
+        if retained.exists():
+            _verify_archive_digest(retained, dist.sha256)
+        else:
+            with tempfile.TemporaryDirectory(prefix=".antigravity-acp-archive-", dir=version_dir.parent) as tmp:
+                archive = Path(tmp) / "official.zip"
+                urllib.request.urlretrieve(dist.url, archive)
+                _verify_archive_digest(archive, dist.sha256)
+                # Do not replace an existing file if another writer raced us.
+                os.link(archive, retained)
     else:
         version_dir.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(
@@ -178,6 +192,10 @@ def install(
                 archive_file.extractall(stage)
             staged_executable = _find_executable(stage, dist.executable)
             _ensure_runtime_executables(stage, staged_executable)
+            archive_name = Path(urllib.parse.urlsplit(dist.url).path).name or "official.zip"
+            if not archive_name.endswith(".zip"):
+                archive_name = "official.zip"
+            shutil.copy2(archive, stage / archive_name)
             stage.rename(version_dir)
         executable = _find_executable(version_dir, dist.executable)
 
