@@ -244,22 +244,39 @@ jobs:
           command, _ = module['_resolve_official_command']()
           child_env = module['_child_env']()
           probe = Path('scripts/acp_probe.py').resolve()
-          try:
-              result = subprocess.run(
-                  [sys.executable, str(probe), '--timeout', '30', '--', *command],
-                  env=child_env, capture_output=True, text=True, timeout=40,
-              )
-          except subprocess.TimeoutExpired:
-              raise SystemExit('Login-path initialization exceeded its hard limit') from None
-          if result.returncode:
-              raise SystemExit('Login-path initialization failed; server output suppressed')
-          try:
-              summary = json.loads(result.stdout)
-          except (ValueError, TypeError):
-              raise SystemExit('Login-path initialization returned malformed output') from None
-          if summary.get('protocolVersion') != 1:
-              raise SystemExit('Login-path initialization returned an unsupported protocol version')
-          print('Verified official login executable and restricted-environment ACP initialization; no login attempted')
+
+          def run(label, env):
+              try:
+                  result = subprocess.run(
+                      [sys.executable, str(probe), '--timeout', '60', '--', *command],
+                      env=env, capture_output=True, text=True, timeout=75,
+                  )
+              except subprocess.TimeoutExpired:
+                  print(f'{label}: FAIL hard-limit exceeded', file=sys.stderr)
+                  return None
+              if result.returncode:
+                  print(f'{label}: FAIL exit={result.returncode}', file=sys.stderr)
+                  tail = (result.stderr or '').splitlines()[-30:]
+                  for line in tail:
+                      print(f'{label}: server-stderr: {line}', file=sys.stderr)
+                  return None
+              try:
+                  summary = json.loads(result.stdout)
+              except (ValueError, TypeError):
+                  print(f'{label}: FAIL malformed probe output', file=sys.stderr)
+                  return None
+              if summary.get('protocolVersion') != 1:
+                  print(f'{label}: FAIL protocolVersion={summary.get("protocolVersion")!r}', file=sys.stderr)
+                  return None
+              print(f'{label}: OK')
+              return summary
+
+          full_env = dict(os.environ)
+          if run('direct-exe-full-env', full_env) is None:
+              raise SystemExit('Direct official executable failed even with the full environment')
+          if run('direct-exe-login-env', child_env) is None:
+              raise SystemExit('Login-path restricted environment failed; see server stderr above')
+          print('Verified official login executable under full and restricted environments; no login attempted')
           '@
           $check | & $python -
           if ($LASTEXITCODE -ne 0) { throw 'Login helper initialization failed' }
