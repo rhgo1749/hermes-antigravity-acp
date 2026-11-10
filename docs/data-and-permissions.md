@@ -125,11 +125,15 @@ ACP session may retain media already consumed in its earlier prompt
 
 ## 6. Child and background processes, permissions
 
-- The default topology launches one short-lived official ACP server child
+- The default topology launches one official ACP server child
   process **per ACP session or attempt** (including retries; concurrent
   sessions can therefore yield more than one child process over a Hermes
-  process lifetime). Each child is terminated when its session context
-  exits, and closing the provider client terminates any active children —
+  process lifetime). A healthy child is parked after its session context
+  exits and reused by the next session with the same launch identity
+  (command, args, cwd, conversation affinity) until an idle TTL of 120
+  seconds expires; a child that failed or timed out is never parked. Active
+  children are terminated when the provider client closes, parked children
+  are terminated at interpreter exit (atexit) or TTL expiry —
   they are plugin-managed foreground processes, not a daemonized service.
   Each runs as the same OS user, with the narrowed environment from
   section 2. No daemonization, no self-updating process, no background

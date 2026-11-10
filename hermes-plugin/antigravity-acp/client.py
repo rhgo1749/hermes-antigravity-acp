@@ -20,6 +20,7 @@ import atexit
 import base64
 import contextlib
 import hashlib
+import itertools
 from importlib import import_module
 import json
 import logging
@@ -3723,6 +3724,62 @@ POSTPROCESSING_POLICY_LLM_BACKEND = "llm_backend"
 POSTPROCESSING_POLICIES = (POSTPROCESSING_POLICY_AGENT, POSTPROCESSING_POLICY_LLM_BACKEND)
 
 
+# --- Warm process pool ---------------------------------------------------
+# The ACP protocol's intended topology is a persistent server: one
+# ``initialize`` handshake followed by many ``session/new`` round-trips on
+# the same stdio connection (verified against the official 1.4.4 server:
+# three distinct sessionIds on one process, 0.55-1.48s each).  The
+# historical default spawned one short-lived child per session, paying a
+# full cold start of the official binary inside every TTFT — seconds on
+# warm Linux, 10s+ on a cold Windows ARM64 laptop.  A finished session's
+# process is parked here and reused by the next session with the same
+# launch identity until an idle TTL expires.  Parked processes are outside
+# ``_active_processes`` so ``close()`` never kills them; ``atexit``, the
+# idle TTL and the per-key pool cap bound their lifetime instead.
+_WARM_IDLE_TTL_SECONDS = float(
+    os.environ.get("HERMES_ANTIGRAVITY_ACP_WARM_TTL_SECONDS", "120")
+)
+_WARM_POOL_MAX_PER_KEY = 4
+_warm_pool_lock = threading.Lock()
+# key: (command, args tuple, cwd, affinity key) -> list of parked entries.
+# entry: {proc, inbox, stderr_tail, stderr_reader, next_id, idle_since, key}
+_warm_pool: dict[tuple[str, tuple[str, ...], str, str], list[dict[str, Any]]] = {}
+_warm_pool_atexit_armed = False
+
+
+def _terminate_parked(proc: subprocess.Popen[str]) -> None:
+    try:
+        proc.terminate()
+        proc.wait(timeout=2)
+    except Exception:
+        with contextlib.suppress(Exception):
+            proc.kill()
+
+
+def _shutdown_warm_pool() -> None:
+    with _warm_pool_lock:
+        pools = list(_warm_pool.values())
+        _warm_pool.clear()
+    for entries in pools:
+        for entry in entries:
+            _terminate_parked(entry["proc"])
+
+
+def _drain_parked_inbox(inbox: queue.Queue) -> None:
+    """Discard late lines from the previous session on this connection.
+
+    A parked server may still emit trailing notifications/responses after a
+    session ends; they must never reach the next session's request loop.
+    Drain until the pipe is quiet for 200ms (bounded to 1s total).
+    """
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        try:
+            inbox.get(timeout=0.2)
+        except queue.Empty:
+            return
+
+
 class AntigravityACPClient:
     """OpenAI-client-compatible facade backed by Google's official ACP process.
 
@@ -3812,9 +3869,79 @@ class AntigravityACPClient:
     def _release_process(self, proc: subprocess.Popen[str]) -> None:
         with self._active_process_lock:
             self._active_processes.discard(proc)
-        # A child process is intentionally short-lived. The facade itself must
-        # remain open so Hermes can reuse its durable ACP continuation state.
+        # A poisoned or failed child is terminated here; a healthy session's
+        # child is parked for reuse by ``_session``'s warm-pool release path
+        # instead. The facade itself must remain open so Hermes can reuse its
+        # durable ACP continuation state.
         self._terminate_process(proc)
+
+    def _warm_acquire(
+        self, affinity_key: str, resume_session_id: str
+    ) -> dict[str, Any] | None:
+        """Pop a live parked process with this launch identity, if any.
+
+        A resume request is never served by a parked process: the resume
+        session id is pinned through the spawn environment
+        (``ACP_MUX_SESSION_ID``) and a parked child was spawned without it.
+        """
+        if resume_session_id:
+            return None
+        key = (self._acp_command, tuple(self._acp_args), self._acp_cwd, affinity_key)
+        now = time.monotonic()
+        chosen: dict[str, Any] | None = None
+        victims: list[dict[str, Any]] = []
+        with _warm_pool_lock:
+            kept: list[dict[str, Any]] = []
+            for entry in _warm_pool.get(key, []):
+                dead = entry["proc"].poll() is not None
+                expired = now - entry["idle_since"] > _WARM_IDLE_TTL_SECONDS
+                if chosen is None and not dead and not expired:
+                    chosen = entry
+                elif dead or expired:
+                    victims.append(entry)
+                else:
+                    kept.append(entry)
+            if kept:
+                _warm_pool[key] = kept
+            else:
+                _warm_pool.pop(key, None)
+        for victim in victims:
+            _terminate_parked(victim["proc"])
+        if chosen is None:
+            return None
+        with self._active_process_lock:
+            self._active_processes.add(chosen["proc"])
+            self.is_closed = False
+        _drain_parked_inbox(chosen["inbox"])
+        return chosen
+
+    def _warm_park(self, entry: dict[str, Any]) -> None:
+        global _warm_pool_atexit_armed
+        if entry["proc"].poll() is not None:
+            # The child died between the last request and release; never
+            # park a corpse.
+            self._release_process(entry["proc"])
+            return
+        entry["idle_since"] = time.monotonic()
+        with self._active_process_lock:
+            self._active_processes.discard(entry["proc"])
+        victims: list[dict[str, Any]] = []
+        with _warm_pool_lock:
+            bucket: list[dict[str, Any]] = []
+            for parked in _warm_pool.get(entry["key"], []):
+                if parked["proc"].poll() is None:
+                    bucket.append(parked)
+                else:
+                    victims.append(parked)
+            bucket.append(entry)
+            while len(bucket) > _WARM_POOL_MAX_PER_KEY:
+                victims.append(bucket.pop(0))
+            _warm_pool[entry["key"]] = bucket
+            if not _warm_pool_atexit_armed:
+                atexit.register(_shutdown_warm_pool)
+                _warm_pool_atexit_armed = True
+        for victim in victims:
+            _terminate_parked(victim["proc"])
 
     def close(self) -> None:
         with self._active_process_lock:
@@ -4381,36 +4508,60 @@ class AntigravityACPClient:
         activity_stats_out: dict[str, Any] | None = None,
     ) -> Iterator[tuple[dict[str, Any], Callable[..., Any], dict[str, Any]]]:
         resume_session_id = str(resume_session_id or "").strip()
-        proc = self._spawn(
-            affinity_key=affinity_key,
-            pin_affinity=bool(resume_session_id),
-            session_id=resume_session_id,
-        )
-        inbox: queue.Queue[dict[str, Any]] = queue.Queue()
-        stderr_tail: deque[str] = deque(maxlen=40)
+        entry = self._warm_acquire(affinity_key, resume_session_id)
+        fresh = entry is None
+        if fresh:
+            proc = self._spawn(
+                affinity_key=affinity_key,
+                pin_affinity=bool(resume_session_id),
+                session_id=resume_session_id,
+            )
+            inbox = queue.Queue()
+            stderr_tail = deque(maxlen=40)
 
-        def decode(line: str) -> dict[str, Any]:
-            try:
-                return json.loads(line)
-            except Exception:
-                return {"raw": line.rstrip("\n")}
+            def decode(line: str) -> dict[str, Any]:
+                try:
+                    return json.loads(line)
+                except Exception:
+                    return {"raw": line.rstrip("\n")}
 
-        def pump(stream: Any, sink: Callable[[str], Any]) -> None:
-            for line in stream or ():
-                sink(line)
+            def pump(stream: Any, sink: Callable[[str], Any]) -> None:
+                for line in stream or ():
+                    sink(line)
 
-        threading.Thread(
-            target=pump,
-            args=(proc.stdout, lambda line: inbox.put(decode(line))),
-            daemon=True,
-        ).start()
-        stderr_reader = threading.Thread(
-            target=pump,
-            args=(proc.stderr, lambda line: stderr_tail.append(line.rstrip("\n"))),
-            daemon=True,
-        )
-        stderr_reader.start()
-        request_ids = iter(range(1, 1 << 62))
+            threading.Thread(
+                target=pump,
+                args=(proc.stdout, lambda line: inbox.put(decode(line))),
+                daemon=True,
+            ).start()
+            stderr_reader = threading.Thread(
+                target=pump,
+                args=(proc.stderr, lambda line: stderr_tail.append(line.rstrip("\n"))),
+                daemon=True,
+            )
+            stderr_reader.start()
+            entry = {
+                "proc": proc,
+                "inbox": inbox,
+                "stderr_tail": stderr_tail,
+                "stderr_reader": stderr_reader,
+                "next_id": 1,
+                "idle_since": 0.0,
+                "key": (
+                    self._acp_command,
+                    tuple(self._acp_args),
+                    self._acp_cwd,
+                    affinity_key,
+                ),
+            }
+        proc = entry["proc"]
+        inbox = entry["inbox"]
+        stderr_tail = entry["stderr_tail"]
+        stderr_reader = entry["stderr_reader"]
+        # JSON-RPC ids must stay unique for the lifetime of one stdio
+        # connection, so the counter continues across parked sessions.
+        id_state = {"last": entry["next_id"] - 1}
+        request_ids = itertools.count(entry["next_id"])
         session_deadline = time.monotonic() + timeout_seconds
         activity_stats: dict[str, Any] = (
             activity_stats_out if activity_stats_out is not None else {}
@@ -4436,6 +4587,7 @@ class AntigravityACPClient:
         ) -> Any:
             assert proc.stdin is not None
             request_id = next(request_ids)
+            id_state["last"] = request_id
             if method == "session/prompt":
                 session_id = str(params.get("sessionId") or "").strip()
                 activity_stats["session_id_hash"] = _opaque_permission_id(
@@ -4511,8 +4663,10 @@ class AntigravityACPClient:
                 f"Timed out waiting for Antigravity ACP response to {method}."
             )
 
+        poisoned = False
         try:
-            request("initialize", _INITIALIZE_PARAMS)
+            if fresh:
+                request("initialize", _INITIALIZE_PARAMS)
             # The default Hermes model-provider mode disables the native
             # run_command built-in at launch; trusted coding mode omits the
             # override so the server keeps its normal built-in tool set.
@@ -4544,8 +4698,17 @@ class AntigravityACPClient:
             if not str(session.get("sessionId") or "").strip():
                 raise RuntimeError("Antigravity ACP did not return a sessionId.")
             yield session, request, activity_stats
+        except (TimeoutError, _AcpEarlyExitError, BrokenPipeError, OSError):
+            # Transport-level failure: the connection's state is unknown and
+            # the child must never be parked for the next session.
+            poisoned = True
+            raise
         finally:
-            self._release_process(proc)
+            entry["next_id"] = id_state["last"] + 1
+            if poisoned or proc.poll() is not None:
+                self._release_process(proc)
+            else:
+                self._warm_park(entry)
 
     def list_models(self, *, timeout_seconds: float = 15.0) -> list[str]:
         try:

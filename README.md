@@ -38,7 +38,8 @@ Hermes terminal approvals; a workspace path check is not a sandbox.
 ## 5-minute Quick Start (single account, credential-free)
 
 Supported topology: one Hermes user, one Hermes home, one official server
-target (short-lived children, one per ACP session). Requirements: Hermes
+target (one child per ACP session; healthy children are parked up to 120s
+idle for reuse by the next session of the same conversation). Requirements: Hermes
 `>=0.21.6`, `python3`, a checkout of this
 repository, and a system in one of the OS tiers above. No Docker, no sudo, no
 account mux, no Hermes Core patch is assumed or required.
@@ -331,11 +332,15 @@ In brief:
   native coding path auto-approves vetted native operations and runs shell
   commands outside Hermes terminal approval. Use only in a trusted environment;
   path checks do not confine shell commands. Native Telegram video remains opt-in.
-- **Child processes.** The default topology launches one short-lived
-  official server child per ACP session or attempt — concurrent sessions
+- **Child processes.** The default topology launches one official server
+  child per ACP session or attempt — concurrent sessions
   and retries can therefore yield more than one child over a Hermes process
-  lifetime; each is terminated when its session ends and any stragglers are
-  closed with the client. Not daemonized services: no daemons, no
+  lifetime. A healthy child is parked after its session ends and reused by
+  the next session with the same command, arguments, working directory and
+  conversation affinity (idle TTL 120s, cap 4 per identity); a failed or
+  timed-out child is terminated immediately, active children are closed
+  with the client, and parked children are terminated at process exit or
+  TTL expiry. Not daemonized services: no daemons, no
   self-updaters, no background services, no sudo.
 
 ## Use with an ACP client
@@ -469,8 +474,9 @@ trust warning), and the provider-mode web research bridge
 The public provider resolves one official Antigravity ACP server target —
 the launcher installed by `scripts/install_official.py` (or an explicit
 `HERMES_ANTIGRAVITY_ACP_COMMAND` override) — under the single Hermes
-home/profile the user chose at install time, and launches a short-lived
-server child from it for each ACP session or attempt. The plugin and default
+home/profile the user chose at install time, and launches an official
+server child from it for each ACP session or attempt (healthy children are
+parked briefly for reuse, see "Child processes" above). The plugin and default
 installer do not use an account registry or MUX routing. CI also tests the
 optional MUX separately with synthetic fixtures.
 
