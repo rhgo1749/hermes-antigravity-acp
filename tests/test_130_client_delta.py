@@ -162,10 +162,17 @@ def test_usage_update_is_non_billing_context_occupancy(monkeypatch, tmp_path, no
     )
     if stream:
         content = reply[0].choices[0].delta.content
-        assert reply[-1].usage is None
+        usage = reply[-1].usage
     else:
         content = reply.choices[0].message.content
-        assert reply.usage is None
+        usage = reply.usage
+    # v0.7.4: completion.usage carries the server-reported consumption proxy.
+    # Valid frames here are 100+250+300 (the trailing -1/True frames are
+    # rejected whole): prompt = latest call, completion = earlier calls.
+    assert usage is not None
+    assert usage.prompt_tokens == 300
+    assert usage.completion_tokens == 350
+    assert usage.total_tokens == 650
     assert content == "ok-130"
     assert "usage" not in content and "1048576" not in content
     telemetry = reply.antigravity_usage_telemetry

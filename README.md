@@ -33,7 +33,7 @@ Hermes terminal approvals; a workspace path check is not a sandbox.
 | Public plugin catalog | **Not registered yet.** `hermes plugins install antigravity-acp-provider` does not resolve today (upstream `plugin-catalog/` contains no entry for this provider as of 2026-11-08). Catalog submission is a separate, separately approved task. The only currently reproducible install path is the standalone installer below. |
 | Official server binary | Pinned `1.4.4`, fetched **only during an explicit install command** over HTTPS from `dl.google.com`; the publisher-pinned SHA-256 digest is verified **before** the archive is opened, extracted, or installed. No self-update; no redistribution. |
 | Authentication & first model call | Credential-free CI does not validate authentication or real inference. A supervised one-prompt canary produced a real response on an earlier client version; the current release has not been verified end-to-end in that same way. This observation does not establish terms compliance for other uses. |
-| `/quota` | Unavailable / unsupported: completions carry `completion.usage=None` with `antigravity_usage_telemetry.status="unavailable"`; no quota command ships in the plugin. Usage, context occupancy, and billed tokens are different things — see `docs/acp-usage-telemetry.md`. |
+| `/quota` | Unavailable / unsupported: the official server reports no billed request tokens; completions carry `completion.usage` only as a server-reported consumption proxy from `usage_update` frames (may under-report; see `docs/acp-usage-telemetry.md`) and otherwise `completion.usage=None`, with `antigravity_usage_telemetry.status="unavailable"`; no quota command ships in the plugin. Usage, context occupancy, and billed tokens are different things — see `docs/acp-usage-telemetry.md`. |
 
 ## 5-minute Quick Start (single account, credential-free)
 
@@ -324,7 +324,9 @@ In brief:
   state under `~/.local/opt`, `~/.local/bin`, and the plugin tree. Google
   sign-in state is managed by Google's runtime in your user environment.
 - **Telemetry.** This plugin sends no telemetry of its own; usage reporting is
-  truthful (`completion.usage=None`, `status="unavailable"`). Any independent
+  truthful (server-reported consumption proxy in `completion.usage` when the
+  server reported `usage_update` frames, otherwise `completion.usage=None`,
+  `status="unavailable"`). Any independent
   network or background behavior inside the proprietary vendor binary is
   attributed to Google's runtime and is neither observed nor speculated about
   in this repository.
@@ -336,8 +338,9 @@ In brief:
   child per ACP session or attempt — concurrent sessions
   and retries can therefore yield more than one child over a Hermes process
   lifetime. A healthy child is parked after its session ends and reused by
-  the next session with the same command, arguments, working directory and
-  conversation affinity (idle TTL 120s, cap 4 per identity); a failed or
+  the next session with the same command, arguments, working directory,
+  conversation affinity and publisher pin (idle TTL 120s, cap 4 per
+  identity); a failed or
   timed-out child is terminated immediately, active children are closed
   with the client, and parked children are terminated at process exit or
   TTL expiry. Not daemonized services: no daemons, no
@@ -493,12 +496,19 @@ native tools and MCP clients, connect the official server as an external ACP
 **agent**, not as a Hermes model-provider shim.
 
 **Usage telemetry is explicit and truthful:** the pinned official ACP server
-does not report actual billed request tokens, so completions keep
-`completion.usage=None` and carry a response-level
+does not report actual billed request tokens. Since v0.7.4, when the server
+reported `usage_update` consumption frames during a turn, completions carry
+`completion.usage` as a server-reported **consumption proxy**
+(`prompt_tokens` = latest call's consumption, `completion_tokens` = earlier
+same-turn calls' consumption, `total_tokens` = turn sum; it may under-report
+and has no true input/output split) so Hermes' native usage accounting shows
+provider numbers instead of a text estimate. Otherwise completions keep
+`completion.usage=None`. Every response also carries a response-level
 `antigravity_usage_telemetry` attribute with `status="unavailable"` and null
-request-usage buckets. Official `usage_update` counters are retained
-separately as non-billing `context_occupancy`; they never populate request
-usage or `completion.usage`. See `docs/acp-usage-telemetry.md` for the
+request-usage buckets: the telemetry attribute never populate request usage
+buckets, and the proxy is explicitly not vendor billing. Official
+`usage_update` counters are additionally retained as non-billing
+`context_occupancy`. See `docs/acp-usage-telemetry.md` for the
 contract and credential-free tests. **Quota visibility (`/quota`) is
 unavailable/unsupported in this public product:** the official ACP server
 exposes no permitted quota data source or supported extension point, so no

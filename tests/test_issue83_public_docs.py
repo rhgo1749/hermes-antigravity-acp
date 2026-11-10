@@ -1555,18 +1555,24 @@ def test_public_docs_make_no_singleton_server_child_claim(
 def test_child_process_disclosure_is_per_session_attempt() -> None:
     readme = _collapsed("README.md")
     assert (
-        "launches one short-lived official server child per ACP session "
+        "launches one official server child per ACP session "
         "or attempt" in readme
     )
     assert "more than one child over a Hermes process lifetime" in readme
-    assert "each is terminated when its session ends" in readme
+    assert (
+        "healthy child is parked after its session ends and reused "
+        "by the next session" in readme
+    )
     assert "Not daemonized services" in readme
     dp = _collapsed("docs/data-and-permissions.md")
     assert (
-        "one short-lived official ACP server child process "
+        "one official ACP server child process "
         "**per ACP session or attempt**" in dp
     )
-    assert "Each child is terminated when its session context exits" in dp
+    assert (
+        "healthy child is parked after its session context exits "
+        "and reused" in dp
+    )
     assert "not a daemonized service" in dp
     # The global-singleton scope phrase must not survive anywhere in the
     # two disclosure docs; per-session wording carries the guarantee now.
@@ -1581,14 +1587,14 @@ def test_child_process_disclosure_is_per_session_attempt() -> None:
         # per-Hermes-process singleton promise must trip.
         (
             "README.md",
-            "launches one short-lived official server child per ACP "
+            "launches one official server child per ACP "
             "session or attempt",
             "launches exactly one official server child per Hermes process",
         ),
         # Reverting the data-and-permissions topology bullet likewise.
         (
             "docs/data-and-permissions.md",
-            "launches one short-lived official ACP server child process "
+            "launches one official ACP server child process "
             "**per ACP session or attempt**",
             "launches **exactly one** official ACP server child process "
             "per Hermes process",
@@ -1597,7 +1603,7 @@ def test_child_process_disclosure_is_per_session_attempt() -> None:
         # restoring the exactly-one count must trip.
         (
             "README.md",
-            "and launches a short-lived server child from it for each ACP "
+            "and launches an official server child from it for each ACP "
             "session or attempt",
             "and launches exactly one official Antigravity ACP server "
             "child process",

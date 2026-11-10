@@ -151,9 +151,13 @@ fail-closed consequences).
 
 ## Quota / usage reporting looks empty
 
-Expected. `completion.usage=None` with `antigravity_usage_telemetry.status =
-"unavailable"` is the truthful contract: the official server reports no billed
-request tokens. Context-occupancy counters (when present) are per-call
+Partly expected. The official server reports no billed
+request tokens, so `antigravity_usage_telemetry.status = "unavailable"` is the
+truthful contract. Since v0.7.4, when the server reported `usage_update`
+consumption frames, `/usage` and context footers show that server-reported
+consumption proxy (may under-report; not billing); with no frames observed
+`completion.usage=None` and Hermes falls back to its display estimate.
+Context-occupancy counters (when present) are per-call
 consumption deltas, never billing figures. `/quota` is unavailable/
 unsupported in the public product. See `docs/acp-usage-telemetry.md`.
 

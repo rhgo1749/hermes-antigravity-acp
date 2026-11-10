@@ -647,7 +647,14 @@ def test_public_session_context_persists_model_deltas_and_rejects_bad_frames(
             clear_session_vars(tokens)
 
         telemetry = response.antigravity_usage_telemetry
-        assert response.usage is None
+        # v0.7.4: completion.usage carries the server-reported consumption
+        # proxy for the turn's single call (docs/acp-usage-telemetry.md);
+        # the telemetry attribute still reports null request_usage (not
+        # billing).
+        assert response.usage is not None
+        assert response.usage.prompt_tokens == used
+        assert response.usage.completion_tokens == 0
+        assert response.usage.total_tokens == used
         assert "cost" not in telemetry and "currency" not in telemetry
         assert all(value is None for value in telemetry["request_usage"].values())
         assert telemetry["context_occupancy"] == {
@@ -687,7 +694,11 @@ def test_public_session_context_persists_model_deltas_and_rejects_bad_frames(
     finally:
         clear_session_vars(tokens)
 
-    assert response.usage is None
+    # v0.7.4: even with no Hermes session id (no usage-store row), the turn's
+    # consumption proxy is still surfaced on the completion.
+    assert response.usage is not None
+    assert response.usage.prompt_tokens == 77
+    assert response.usage.total_tokens == 77
     assert response.antigravity_usage_telemetry["context_occupancy"]["used"] == 77
     updated = json.loads(state_path.read_text(encoding="utf-8"))
     assert set(updated["usage_totals"]) == {hermes_session_id}

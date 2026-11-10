@@ -2360,6 +2360,72 @@ def _capture_context_occupancy(
     }
 
 
+_TURN_USAGE_CALLS_KEY = "turn_usage_calls_observed"
+_TURN_USAGE_SUM_KEY = "turn_usage_tokens_sum"
+_TURN_USAGE_LAST_KEY = "turn_usage_last_call_tokens"
+
+
+def _capture_turn_usage(update: Any, activity_stats: dict[str, Any] | None) -> None:
+    """Accumulate one prompt turn's server-reported per-call consumption.
+
+    ``usage_update.used`` is the official server's consumption delta for the
+    latest model call (docs/acp-usage-telemetry.md), not cumulative session
+    occupancy.  Summing the frames observed inside one turn gives the
+    provider's own view of the turn's token consumption.  It may under-report
+    (the server omits zero-delta frames and excludes subagent calls) and
+    carries no input/output split; the mapping into the OpenAI usage shape is
+    documented at the completion site.
+    """
+    if (
+        not isinstance(update, dict)
+        or str(update.get("sessionUpdate") or "").strip() != "usage_update"
+        or not isinstance(activity_stats, dict)
+    ):
+        return
+    # Whole-frame validity mirrors _capture_context_occupancy: a frame with a
+    # present-but-invalid used/size contributes nothing, even when its other
+    # field is well-formed.
+    present = [field for field in ("used", "size") if field in update]
+    if "used" not in present or not all(
+        _nonnegative_json_number(update[field]) for field in present
+    ):
+        return
+    activity_stats[_TURN_USAGE_CALLS_KEY] = int(activity_stats.get(_TURN_USAGE_CALLS_KEY) or 0) + 1
+    activity_stats[_TURN_USAGE_SUM_KEY] = float(
+        activity_stats.get(_TURN_USAGE_SUM_KEY) or 0.0
+    ) + float(update["used"])
+    activity_stats[_TURN_USAGE_LAST_KEY] = float(update["used"])
+
+
+def _turn_usage_from_activity(activity_stats: dict[str, Any]) -> Any:
+    """OpenAI-shaped usage from this turn's observed ``usage_update`` frames.
+
+    Returns ``None`` when the server reported no consumption this turn, which
+    keeps Hermes' display-only estimate fallback in charge.  The mapping is
+    the best faithful reading of a per-call consumption stream that has no
+    input/output split: ``prompt_tokens`` = the latest call's consumption (the
+    newest context-occupancy reading, which is what drives context % and the
+    compaction verdict), ``completion_tokens`` = the earlier calls' consumption
+    within the same turn, ``total_tokens`` = the turn sum.
+    """
+    calls = int(activity_stats.get(_TURN_USAGE_CALLS_KEY) or 0)
+    tokens_sum = activity_stats.get(_TURN_USAGE_SUM_KEY)
+    last_call = activity_stats.get(_TURN_USAGE_LAST_KEY)
+    if calls <= 0 or tokens_sum is None or last_call is None:
+        return None
+    if (
+        not _nonnegative_json_number(tokens_sum)
+        or not _nonnegative_json_number(last_call)
+        or tokens_sum <= 0
+    ):
+        return None
+    return SimpleNamespace(
+        prompt_tokens=int(last_call),
+        completion_tokens=int(max(0.0, tokens_sum - float(last_call))),
+        total_tokens=int(tokens_sum),
+    )
+
+
 def _build_usage_telemetry(
     *,
     model: str | None,
@@ -3890,17 +3956,22 @@ class AntigravityACPClient:
         now = time.monotonic()
         chosen: dict[str, Any] | None = None
         victims: list[dict[str, Any]] = []
+        current_pin: str | None = None
         with _warm_pool_lock:
             kept: list[dict[str, Any]] = []
             for entry in _warm_pool.get(key, []):
                 dead = entry["proc"].poll() is not None
                 expired = now - entry["idle_since"] > _WARM_IDLE_TTL_SECONDS
-                if chosen is None and not dead and not expired:
-                    chosen = entry
-                elif dead or expired:
+                if dead or expired:
                     victims.append(entry)
-                else:
-                    kept.append(entry)
+                    continue
+                if chosen is None:
+                    if current_pin is None:
+                        current_pin = _read_par_pin() or ""
+                    if str(entry.get("par_pin") or "") == current_pin:
+                        chosen = entry
+                        continue
+                kept.append(entry)
             if kept:
                 _warm_pool[key] = kept
             else:
@@ -4434,11 +4505,19 @@ class AntigravityACPClient:
                         finish_reason="tool_calls" if tool_calls else "stop",
                     )
                 ],
-                # ACP v1 session/prompt does not report token usage.  ``None`` is deliberate:
-                # Hermes treats missing usage as unknown and computes a display-only request-size
-                # estimate for context occupancy.  Fabricating zero tokens suppresses that fallback
-                # and makes runtime footers/status incorrectly report 0%.
-                usage=None,
+                # v0.7.4 (operator-approved): when the official server reported
+                # ``usage_update`` consumption frames this turn, ``usage`` carries that
+                # server-reported proxy in the OpenAI chat shape so Hermes' native
+                # accounting (``/usage``, context %, compaction verdicts) shows provider
+                # numbers instead of falling back to the text estimate.  Mapping:
+                # prompt_tokens = latest call's consumption (newest occupancy reading),
+                # completion_tokens = earlier same-turn calls' consumption, total = turn
+                # sum.  This is a consumption proxy, not vendor billing: it may
+                # under-report (zero-delta frames omitted, subagents excluded) and has no
+                # true input/output split (docs/acp-usage-telemetry.md).  When no frames
+                # were observed ``usage`` stays ``None`` and Hermes' display-only request
+                # estimate remains in charge; a fabricated zero would suppress it.
+                usage=session_result.get("turn_usage"),
                 model=session_result.get("effective_model") or model or "antigravity-acp",
             )
             result = completion_to_stream_chunks(completion) if stream else completion
@@ -4547,6 +4626,9 @@ class AntigravityACPClient:
                 "stderr_reader": stderr_reader,
                 "next_id": 1,
                 "idle_since": 0.0,
+                # The publisher pin is read at spawn time and baked into the
+                # child's environment; reuse must not cross a pin change.
+                "par_pin": _read_par_pin() or "",
                 "key": (
                     self._acp_command,
                     tuple(self._acp_args),
@@ -4701,6 +4783,14 @@ class AntigravityACPClient:
         except (TimeoutError, _AcpEarlyExitError, BrokenPipeError, OSError):
             # Transport-level failure: the connection's state is unknown and
             # the child must never be parked for the next session.
+            poisoned = True
+            raise
+        except Exception:
+            # Protocol-level failure (e.g. a JSON-RPC quota/resource_exhausted
+            # error from session/prompt): the native session may be poisoned.
+            # Failover safety (S4) requires retrying on a fresh process with a
+            # fresh native session, so a child whose session raised is never
+            # parked for reuse.
             poisoned = True
             raise
         finally:
@@ -5109,6 +5199,7 @@ class AntigravityACPClient:
                 session_result["context_occupancy"] = (
                     dict(occupancy) if isinstance(occupancy, dict) else None
                 )
+                session_result["turn_usage"] = _turn_usage_from_activity(activity_stats)
             return answer, "".join(reasoning_parts)
 
     def _handle_server_message(
@@ -5138,6 +5229,7 @@ class AntigravityACPClient:
                 kinds = activity_stats.setdefault("update_kinds", {})
                 kinds[update_kind] = int(kinds.get(update_kind) or 0) + 1
             _capture_usage_delta(update, activity_stats)
+            _capture_turn_usage(update, activity_stats)
             _capture_context_occupancy(update, activity_stats)
             _capture_native_tool_activity(update, activity_stats)
             _log_server_pre_tool_denial(update, activity_stats)

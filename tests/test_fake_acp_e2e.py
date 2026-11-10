@@ -831,7 +831,13 @@ def test_fake_subprocess_normal_tool_turn_and_native_resume(monkeypatch, tmp_pat
         tools=tools,
     )
     assert second.choices[0].message.content == "done after tool result"
-    assert second.usage is None
+    # v0.7.4: this turn observed usage_update frames (11840+12000);
+    # completion.usage carries the consumption proxy — latest call as
+    # prompt_tokens, earlier same-turn calls as completion_tokens.
+    assert second.usage is not None
+    assert second.usage.prompt_tokens == 12000
+    assert second.usage.completion_tokens == 11840
+    assert second.usage.total_tokens == 23840
     assert second.antigravity_usage_telemetry["request_usage"] == first.antigravity_usage_telemetry["request_usage"]
     assert second.antigravity_usage_telemetry["context_occupancy"] == {
         "source": "acp.session/update:usage_update",

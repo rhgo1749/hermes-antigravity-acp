@@ -3,15 +3,39 @@
 ## Provider boundary
 
 The standalone adapter exposes `antigravity_usage_telemetry` as a response-level
-attribute. Streaming `StreamChunks` preserve that attribute through the bridge;
-the OpenAI-compatible `usage` field is not widened. `completion.usage` remains
-`None` for the current ACP protocol, including when `session/update` carries a
-`usage_update`.
-
+attribute. Streaming `StreamChunks` preserve that attribute through the bridge.
 Google's official Antigravity ACP 1.4.0 `SessionPromptResult` has no per-request
 input/output/cache/reasoning token accounting. Actual billed tokens are therefore
 unavailable through the official API. Do not derive billing values from prompt
-characters, output length, `native_tokens`, or ACP `usage_update`.
+characters, output length, or `native_tokens`.
+
+Since **v0.7.4** (operator-approved), the OpenAI-compatible `usage` field is
+deliberately widened as a **consumption proxy** (see the next section). The
+`antigravity_usage_telemetry` contract below is unchanged: it still reports
+`status="unavailable"` with null `request_usage` buckets, because the proxy is
+not billing data.
+
+## v0.7.4 consumption proxy in `completion.usage`
+
+The official server streams `usage_update` frames whose `used` is the
+consumption of the latest model call (per-call, not cumulative; see below).
+When one or more valid frames are observed during a turn, the completion's
+`usage` carries them in the OpenAI chat shape so Hermes' native accounting
+(`/usage`, context-occupancy footers, compaction verdicts) uses provider
+numbers instead of its display-only text estimate:
+
+- `prompt_tokens` = the latest call's consumption (newest occupancy reading),
+- `completion_tokens` = the earlier same-turn calls' consumption (turn sum
+  minus the latest),
+- `total_tokens` = the turn sum.
+
+Known limits, stated so nobody re-reads these numbers as invoices: the server
+omits zero-delta frames and excludes subagent calls, so the sum may
+under-report; there is no true input/output split; failover-replayed attempts'
+frames are not merged into the surfaced turn (the plugin's own usage store
+still records them). When no valid frames are observed, `usage` stays `None`
+and Hermes' estimate fallback remains in charge — a fabricated zero would
+suppress it.
 
 Every completed response uses this JSON-compatible shape:
 

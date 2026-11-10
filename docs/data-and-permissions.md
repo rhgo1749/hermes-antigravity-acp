@@ -92,9 +92,12 @@ ACP session may retain media already consumed in its earlier prompt
 - **This plugin sends no telemetry.** Nothing is reported to this repository
   or any third-party endpoint by the plugin itself.
 - Usage reporting is a **response-level attribute**, truthful by contract:
-  `completion.usage=None` plus `antigravity_usage_telemetry` with
-  `status="unavailable"` and null request-usage buckets, because the official
-  server exposes no billed request tokens. `usage_update` counters are kept
+  `antigravity_usage_telemetry` with `status="unavailable"` and null
+  request-usage buckets, because the official
+  server exposes no billed request tokens. Since v0.7.4 `completion.usage`
+  carries a server-reported consumption proxy when `usage_update` frames were
+  observed (may under-report; not billing), otherwise `completion.usage=None`.
+  `usage_update` counters are kept
   separately as non-billing `context_occupancy`
   (`docs/acp-usage-telemetry.md`). `/quota` is unavailable/unsupported — no
   quota command ships here.
@@ -130,7 +133,8 @@ ACP session may retain media already consumed in its earlier prompt
   sessions can therefore yield more than one child process over a Hermes
   process lifetime). A healthy child is parked after its session context
   exits and reused by the next session with the same launch identity
-  (command, args, cwd, conversation affinity) until an idle TTL of 120
+  (command, args, cwd, conversation affinity, publisher pin) until an idle
+  TTL of 120
   seconds expires; a child that failed or timed out is never parked. Active
   children are terminated when the provider client closes, parked children
   are terminated at interpreter exit (atexit) or TTL expiry —
