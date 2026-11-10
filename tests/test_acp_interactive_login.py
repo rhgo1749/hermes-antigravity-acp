@@ -153,8 +153,14 @@ def test_child_environment_excludes_credentials_and_mux(monkeypatch):
     monkeypatch.setenv("GOOGLE_API_KEY", "DUMMY_ENV_SECRET")
     monkeypatch.setenv("ACP_MUX_ACCOUNTS", "/private/registry")
     monkeypatch.setenv("HOME", "/isolated/home")
+    monkeypatch.setenv("USERPROFILE", "C:\\Users\\isolated")
+    monkeypatch.setenv("LOCALAPPDATA", "C:\\Users\\isolated\\AppData\\Local")
     env = login._child_env()
     assert env["HOME"] == "/isolated/home"
+    # Windows profile roots must survive the filter: the official server has
+    # no home directory without them on Windows and dies before initialize.
+    assert env["USERPROFILE"] == "C:\\Users\\isolated"
+    assert env["LOCALAPPDATA"] == "C:\\Users\\isolated\\AppData\\Local"
     assert "GOOGLE_API_KEY" not in env
     assert "ACP_MUX_ACCOUNTS" not in env
 

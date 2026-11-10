@@ -41,6 +41,11 @@ _ENV_KEYS = frozenset({
     "TMPDIR", "TEMP", "TMP", "PYTHONUTF8", "HERMES_REAL_HOME", "HERMES_HOME",
     "GEMINI_HOME", "LC_ALL", "LC_CTYPE", "LC_MESSAGES", "LC_COLLATE",
     "LC_MONETARY", "LC_NUMERIC", "LC_TIME", "SYSTEMROOT", "WINDIR",
+    # Windows profile roots: HOME is usually unset in Windows shells, so
+    # without these the official server has no home directory at all and
+    # dies at startup before answering initialize (verified on hosted
+    # windows-2022/windows-11-arm: full env OK, filtered env silent-timeout).
+    "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA",
 })
 
 

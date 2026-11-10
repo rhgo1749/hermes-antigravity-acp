@@ -140,7 +140,10 @@ narrows either base through `_acp_child_env_filter` to an explicit enumerated
 allowlist — `PATH`, `HOME`, `USER`/`LOGNAME`, `SHELL`, `LANG`/`TERM`,
 `TMPDIR`/`TEMP`/`TMP`, `PYTHONUTF8`, `HERMES_REAL_HOME`, `HERMES_HOME`,
 `GEMINI_HOME`, the POSIX locale categories `LC_ALL`/`LC_CTYPE`/`LC_MESSAGES`/
-`LC_COLLATE`/`LC_MONETARY`/`LC_NUMERIC`/`LC_TIME`, and the four per-user XDG
+`LC_COLLATE`/`LC_MONETARY`/`LC_NUMERIC`/`LC_TIME`, the Windows OS/profile
+roots `SYSTEMROOT`/`WINDIR`/`USERPROFILE`/`HOMEDRIVE`/`HOMEPATH`/`APPDATA`/
+`LOCALAPPDATA` (Windows shells usually leave `HOME` unset, and without these
+the official server has no home directory), and the four per-user XDG
 Base Directory variables `XDG_CONFIG_HOME`/`XDG_DATA_HOME`/`XDG_CACHE_HOME`/
 `XDG_STATE_HOME` — before adding the profile-resolved `HERMES_HOME`
 (active Hermes runtime only), the resolved `HOME`, and Hermes' own

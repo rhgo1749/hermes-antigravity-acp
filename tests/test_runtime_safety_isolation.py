@@ -81,6 +81,15 @@ ALLOWED_XDG_HOME_VARS = (
     "XDG_DATA_HOME",
     "XDG_STATE_HOME",
 )
+ALLOWED_WINDOWS_OS_VARS = (
+    "SYSTEMROOT",
+    "WINDIR",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "APPDATA",
+    "LOCALAPPDATA",
+)
 
 
 def _assert_no_lc_xdg_wildcards(env):
@@ -411,7 +420,7 @@ def test_child_env_admission_is_explicit_enumeration_without_wildcards(monkeypat
     )
     for name in unapproved:
         assert module._is_acp_child_env_key(name) is False, name
-    for name in ALLOWED_LOCALE_NAMES + ALLOWED_XDG_HOME_VARS:
+    for name in ALLOWED_LOCALE_NAMES + ALLOWED_XDG_HOME_VARS + ALLOWED_WINDOWS_OS_VARS:
         assert module._is_acp_child_env_key(name) is True, name
         assert module._is_acp_child_env_key(name.lower()) is True, name
     narrowed = module._acp_child_env_filter(

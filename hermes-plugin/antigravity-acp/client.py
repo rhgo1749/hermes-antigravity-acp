@@ -570,6 +570,19 @@ _ACP_CHILD_ENV_ALLOW_EXACT = {
     "LC_MONETARY",
     "LC_NUMERIC",
     "LC_TIME",
+    # Windows OS and profile roots.  HOME is usually unset in Windows shells,
+    # and a child process without SYSTEMROOT cannot even start; without the
+    # profile roots the official server has no home directory and dies at
+    # startup before answering initialize (verified on hosted
+    # windows-2022/windows-11-arm: full env OK, filtered env silent-timeout).
+    # These are OS/path basics, never credential material.
+    "SYSTEMROOT",
+    "WINDIR",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "APPDATA",
+    "LOCALAPPDATA",
 }
 # The four XDG Base Directory variables the specification roots under $HOME
 # ($HOME/.config, $HOME/.local/share, $HOME/.cache, $HOME/.local/state).  Like
