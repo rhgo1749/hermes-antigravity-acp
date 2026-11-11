@@ -227,7 +227,9 @@ def main() -> int:
     bound_home = ""
     bound_label = ""
     session_gc_run = False
+    owner_prune_run = False
     pump_threads: list[threading.Thread] = []
+    owner_relay = base._SessionOwnerRelay()
 
     prompt_lock = threading.Lock()
     pending_prompt_id: object | None = None
@@ -357,6 +359,7 @@ def main() -> int:
                         _flush_held_locked()
                         turn_hold_open = False
 
+                line = owner_relay.after(line, bound_home, bound_label)
                 sys.stdout.write(line)
                 sys.stdout.flush()
 
@@ -429,8 +432,19 @@ def main() -> int:
                 if not session_gc_run:
                     if os.environ.get("ACP_MUX_SESSION_GC") == "1":
                         base.prune_session_stores()
+                    else:
+                        base._log("native session GC disabled (opt in: ACP_MUX_SESSION_GC=1)")
                     session_gc_run = True
-                home, label, reason = _pick_account_from_env()
+                if not owner_prune_run:
+                    base.prune_session_owners()
+                    owner_prune_run = True
+                resume_id = os.environ.get("ACP_MUX_SESSION_ID", "")
+                owner = base._resolve_session_owner(resume_id) if resume_id else None
+                if owner is not None:
+                    home, label = owner
+                    reason = "session-owner"
+                else:
+                    home, label, reason = _pick_account_from_env()
                 if reason == "registry-invalid":
                     sys.stderr.write(base._REGISTRY_INVALID_MESSAGE)
                     return 2
@@ -485,6 +499,12 @@ def main() -> int:
                     sys.stdout.write(_mcp_guard_error(request_id, violation))
                     sys.stdout.flush()
                     continue
+
+            owner_error = owner_relay.before(payload, bound_home, bound_label)
+            if owner_error is not None:
+                sys.stdout.write(owner_error)
+                sys.stdout.flush()
+                continue
 
             assert upstream is not None and upstream.stdin is not None
             if upstream.poll() not in (None, 0):

@@ -4610,7 +4610,15 @@ class AntigravityACPClient:
             child_env["ACP_MUX_AFFINITY"] = affinity_key
         if session_id:
             child_env["ACP_MUX_SESSION_ID"] = session_id
-        child_env["ACP_MUX_SESSION_GC"] = "1"
+        # The native session-store GC deletes bundles that no continuation
+        # checkpoint protects; until the full native session lifetime contract
+        # lands (issue #3 follow-up) it is opt-in only.  Ownership-record
+        # cleanup inside the mux stays always-on and is metadata-only.
+        child_env["ACP_MUX_SESSION_GC"] = (
+            "1"
+            if os.environ.get("HERMES_ANTIGRAVITY_ACP_NATIVE_GC", "").strip() == "1"
+            else "0"
+        )
         child_env["ACP_MUX_AFFINITY_PIN"] = "1" if pin_affinity else "0"
         child_env["ACP_MUX_AFFINITY_TTL_SECONDS"] = os.environ.get(
             "HERMES_ANTIGRAVITY_ACP_STATE_TTL_SECONDS", "86400"

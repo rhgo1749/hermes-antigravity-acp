@@ -41,6 +41,14 @@ Environment:
                           ACP continuation-state TTL (24 hours)
   ACP_MUX_AFFINITY_MAX_ENTRIES  affinity assignment cap; defaults to the ACP
                           continuation-state cap (512)
+  ACP_MUX_SESSION_GC      set to 1 to run the destructive native session-store
+                          GC once at bind time.  The Hermes provider only sets
+                          this when HERMES_ANTIGRAVITY_ACP_NATIVE_GC=1; the GC
+                          is opt-in until the native session lifetime contract
+                          is finished (issue #3 follow-up).
+  ACP_MUX_OWNER_GRACE_SECONDS  minimum age before an ownership record whose
+                          native bundle and checkpoint are both gone may be
+                          retired; defaults to the affinity retention TTL
   ACP_MUX_AUTH_COOLDOWN   auth failure cooldown seconds (default 300)
   ACP_MUX_QUOTA_COOLDOWN  quota/rate-limit cooldown seconds (default 900)
   ACP_MUX_CRASH_COOLDOWN  unexpected process failure cooldown seconds (default 60)
@@ -70,6 +78,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -239,6 +248,11 @@ AFFINITY_MAX_ENTRIES = _configured_positive_int(
     "ACP_MUX_AFFINITY_MAX_ENTRIES",
     "HERMES_ANTIGRAVITY_ACP_STATE_MAX_ENTRIES",
     _DEFAULT_AFFINITY_MAX_ENTRIES,
+)
+OWNER_GRACE_SECONDS = _configured_positive_int(
+    "ACP_MUX_OWNER_GRACE_SECONDS",
+    "HERMES_ANTIGRAVITY_ACP_OWNER_GRACE_SECONDS",
+    _DEFAULT_AFFINITY_TTL_SECONDS,
 )
 
 _QUOTA_RE = re.compile(
@@ -652,6 +666,235 @@ def _session_gc_lock() -> Iterator[bool]:
         lock.close()
 
 
+def _ownership_accounts() -> list[tuple[str, str, str]] | None:
+    """Return distinct registered lanes, refusing aliases or invalid registry entries."""
+    entries, meta, problem = _load_registry_data()
+    if problem == "missing":
+        entries, meta = [{"home": DEFAULT_HOME, "label": "default"}], {}
+    elif problem or entries is None or len(entries) != len(meta.get("accounts", [])):
+        return None
+    default, explicit = _effective_default_home(meta)
+    seen: set[tuple[int, int]] = set()
+    lanes = []
+    for entry in entries:
+        raw = entry.get("home")
+        if not raw and isinstance(meta.get("schema_version"), int) and not explicit:
+            return None
+        home, label, _, key = _account(entry, default)
+        if not os.path.isabs(home) or os.path.realpath(home) != os.path.abspath(home):
+            return None
+        try:
+            info = os.stat(home, follow_symlinks=False)
+        except OSError:
+            return None
+        identity = (info.st_dev, info.st_ino)
+        if not stat.S_ISDIR(info.st_mode) or identity in seen:
+            return None
+        seen.add(identity)
+        lanes.append((home, label, key))
+    return lanes or None
+
+
+def _read_session_owners() -> dict[str, dict] | None:
+    """Return ownership entries keyed by hashed session id.
+
+    Version 2 stores ``{"lane": hash, "at": epoch}`` per entry so record
+    cleanup can apply a grace period.  Version 1 (hash -> hash) is accepted
+    read-only and back-dated to the file mtime; the next write upgrades the
+    file in place.
+    """
+    path = STATE_PATH + ".owners.json"
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return {}
+    except OSError:
+        return None
+    try:
+        with os.fdopen(fd, encoding="utf-8") as handle:
+            info = os.fstat(handle.fileno())
+            if not stat.S_ISREG(info.st_mode):
+                return None
+            mtime = info.st_mtime
+            data = json.load(handle)
+        if not isinstance(data, dict) or data.get("version") not in (1, 2):
+            return None
+        owners = data.get("owners")
+        if not isinstance(owners, dict):
+            return None
+        entries: dict[str, dict] = {}
+        for key, value in owners.items():
+            if not isinstance(key, str) or not re.fullmatch(r"[0-9a-f]{64}", key):
+                return None
+            if data["version"] == 1:
+                if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+                    return None
+                entries[key] = {"lane": value, "at": mtime}
+                continue
+            if (
+                not isinstance(value, dict)
+                or not isinstance(value.get("lane"), str)
+                or not re.fullmatch(r"[0-9a-f]{64}", value["lane"])
+                or isinstance(value.get("at"), bool)
+                or not isinstance(value.get("at"), (int, float))
+                or not math.isfinite(value["at"])
+            ):
+                return None
+            entries[key] = {"lane": value["lane"], "at": float(value["at"])}
+        return entries
+    except (OSError, ValueError, UnicodeError):
+        return None
+
+
+def _owner_hash(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8", errors="surrogatepass")).hexdigest()
+
+
+def _record_session_owner(session_id: str, home: str, label: str) -> bool:
+    if not isinstance(session_id, str) or not session_id or len(session_id) > 512:
+        return False
+    with _session_gc_lock() as locked:
+        if not locked:
+            return False
+        lanes = _ownership_accounts()
+        owners = _read_session_owners()
+        if lanes is None or owners is None:
+            return False
+        key = f"{label}\t{home}"
+        if not any(row[2] == key for row in lanes):
+            return False
+        digest, lane = _owner_hash(session_id), _owner_hash(key)
+        existing = owners.get(digest)
+        if existing is not None:
+            if existing["lane"] != lane:
+                return False
+        else:
+            owners[digest] = {"lane": lane, "at": time.time()}
+        path = STATE_PATH + ".owners.json"
+        tmp = ""
+        try:
+            fd, tmp = tempfile.mkstemp(prefix=".acp-owners-", dir=os.path.dirname(path) or ".")
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump({"version": 2, "owners": owners}, handle, sort_keys=True)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, path)
+            return True
+        except OSError:
+            if tmp:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+            return False
+
+
+def _resolve_session_owner(session_id: str) -> tuple[str, str] | None:
+    if not isinstance(session_id, str) or not session_id or len(session_id) > 512:
+        return None
+    with _session_gc_lock() as locked:
+        if not locked:
+            return None
+        lanes = _ownership_accounts()
+        owners = _read_session_owners()
+        if lanes is None or owners is None:
+            return None
+        digest = _owner_hash(session_id)
+        if digest in owners:
+            lane = owners[digest]["lane"]
+            found = [(home, label) for home, label, key in lanes if _owner_hash(key) == lane]
+            return found[0] if len(found) == 1 else None
+        if not _is_store_session_id(session_id):
+            return None
+        matches = []
+        store_ids: set[tuple[int, int]] = set()
+        for home, label, _ in lanes:
+            current = Path(home)
+            try:
+                missing = False
+                for component in (".gemini", "antigravity-acp", "conversations"):
+                    current = current / component
+                    try:
+                        info = current.lstat()
+                    except FileNotFoundError:
+                        missing = True
+                        break
+                    if not stat.S_ISDIR(info.st_mode):
+                        return None
+                if missing:
+                    continue
+                current_info = current.lstat()
+                identity = (current_info.st_dev, current_info.st_ino)
+                if identity in store_ids:
+                    return None
+                store_ids.add(identity)
+                # Establish directory readability before interpreting absence.
+                with os.scandir(current):
+                    pass
+                try:
+                    target = (current / f"{session_id}.db").lstat()
+                except FileNotFoundError:
+                    continue
+                if not stat.S_ISREG(target.st_mode):
+                    return None
+                matches.append((home, label))
+            except OSError:
+                return None
+        return matches[0] if len(matches) == 1 else None
+
+
+class _SessionOwnerRelay:
+    """Correlate session/new replies and reject resume on the wrong lane."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._new_requests: set = set()
+
+    @staticmethod
+    def _error(request_id: object, message: str) -> str:
+        return json.dumps({"jsonrpc": "2.0", "id": request_id,
+                           "error": {"code": -32000, "message": message}}) + "\n"
+
+    def before(self, payload: object, home: str, label: str) -> str | None:
+        if not isinstance(payload, dict) or "id" not in payload:
+            return None
+        request_id = payload["id"]
+        if not isinstance(request_id, (int, str)) or isinstance(request_id, bool):
+            return self._error(request_id, "Invalid request id")
+        method = payload.get("method")
+        if method in ("session/resume", "session/load"):
+            params = payload.get("params")
+            session_id = params.get("sessionId") if isinstance(params, dict) else None
+            if not isinstance(session_id, str) or _resolve_session_owner(session_id) != (home, label):
+                return self._error(request_id, "Session not found: owner unavailable on this lane")
+        if method == "session/new":
+            with self._lock:
+                if request_id in self._new_requests:
+                    return self._error(request_id, "Duplicate session/new request id")
+                self._new_requests.add(request_id)
+        return None
+
+    def after(self, line: str, home: str, label: str) -> str:
+        try:
+            payload = json.loads(line)
+        except (ValueError, TypeError):
+            return line
+        if not isinstance(payload, dict) or "method" in payload:
+            return line
+        request_id = payload.get("id")
+        if not isinstance(request_id, (int, str)) or isinstance(request_id, bool):
+            return line
+        with self._lock:
+            if request_id not in self._new_requests:
+                return line
+            self._new_requests.remove(request_id)
+        result = payload.get("result")
+        session_id = result.get("sessionId") if isinstance(result, dict) else None
+        if session_id is not None and not _record_session_owner(session_id, home, label):
+            return self._error(request_id, "Session ownership could not be persisted")
+        return line
+
+
 def _session_store_root(home: str) -> Path | None:
     """Return only the official server's ACP conversation store for one HOME."""
     account_home = Path(os.path.expanduser(str(home)))
@@ -910,6 +1153,112 @@ def _prune_session_store(
     return result
 
 
+def _session_store_bundle_bytes(records: dict[str, dict]) -> int | None:
+    total = 0
+    for record in records.values():
+        for path in record["files"]:
+            try:
+                total += path.lstat().st_size
+            except OSError:
+                return None
+    return total
+
+
+def prune_session_owners(*, now: float | None = None) -> dict[str, int] | None:
+    """Retire ownership records whose native bundle and checkpoint are gone.
+
+    Metadata-only: this never deletes a session bundle file.  An entry is
+    removed only when every guard passes — it is older than the grace period,
+    no registered lane's conversation store still contains that session id,
+    no unexpired Hermes continuation checkpoint references it, and its lane
+    is still registered (an unresolvable lane keeps its entry).  Any
+    unreadable registry, ownership file, checkpoint inventory, or session
+    store aborts the pass and keeps every entry (fail closed).
+    """
+    now = time.time() if now is None else now
+    with _session_gc_lock() as locked:
+        if not locked:
+            _log("owner-records skipped: cross-process lock unavailable")
+            return None
+        lanes = _ownership_accounts()
+        owners = _read_session_owners()
+        if lanes is None or owners is None:
+            _log("owner-records skipped: registry or ownership records unreadable")
+            return None
+        if not owners:
+            return {"removed": 0, "kept": 0, "bundles": 0, "bytes": 0}
+        active = _active_hermes_session_ids(now=now)
+        if active is None:
+            _log("owner-records skipped: continuation checkpoint inventory unavailable")
+            return None
+        live = {_owner_hash(session_id) for session_id in active}
+        bundles = 0
+        total_bytes: int | None = 0
+        for home, _label, _key in lanes:
+            try:
+                (Path(home) / ".gemini" / "antigravity-acp").lstat()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                _log("owner-records skipped: session store probe failed")
+                return None
+            store = _session_store_root(home)
+            if store is None:
+                _log("owner-records skipped: session store layout refused")
+                return None
+            records = _session_store_records(store)
+            if records is None:
+                _log("owner-records skipped: session store inventory failed")
+                return None
+            bundles += len(records)
+            for session_id in records:
+                live.add(_owner_hash(session_id))
+            if total_bytes is not None:
+                measured = _session_store_bundle_bytes(records)
+                total_bytes = None if measured is None else total_bytes + measured
+        lane_keys = {_owner_hash(key) for _home, _label, key in lanes}
+        kept: dict[str, dict] = {}
+        removed = 0
+        for digest, entry in owners.items():
+            if (
+                entry["at"] + OWNER_GRACE_SECONDS > now
+                or digest in live
+                or entry["lane"] not in lane_keys
+            ):
+                kept[digest] = entry
+            else:
+                removed += 1
+        if removed:
+            path = STATE_PATH + ".owners.json"
+            tmp = ""
+            try:
+                fd, tmp = tempfile.mkstemp(prefix=".acp-owners-", dir=os.path.dirname(path) or ".")
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    json.dump({"version": 2, "owners": kept}, handle, sort_keys=True)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(tmp, path)
+            except OSError:
+                if tmp:
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
+                _log("owner-records skipped: ownership write failed")
+                return None
+        reported_bytes = -1 if total_bytes is None else total_bytes
+        _log(
+            f"owner-records kept={len(kept)} removed={removed} "
+            f"bundles={bundles} bytes={reported_bytes}"
+        )
+        return {
+            "removed": removed,
+            "kept": len(kept),
+            "bundles": bundles,
+            "bytes": reported_bytes,
+        }
+
+
 def prune_session_stores(*, now: float | None = None) -> dict[str, int] | None:
     """Prune expired, unreferenced official ACP session bundles across accounts.
 
@@ -918,11 +1267,6 @@ def prune_session_stores(*, now: float | None = None) -> dict[str, int] | None:
     readable. It touches only ``.gemini/antigravity-acp`` conversation stores.
     """
     now = time.time() if now is None else now
-    active = _active_hermes_session_ids(now=now)
-    if active is None:
-        _log("session-gc skipped: continuation checkpoint inventory unavailable")
-        return None
-
     entries, meta, _problem = _load_registry_data()
     default_home, _explicit = _effective_default_home(meta)
     homes = {os.path.abspath(os.path.expanduser(default_home))}
@@ -935,6 +1279,10 @@ def prune_session_stores(*, now: float | None = None) -> dict[str, int] | None:
     with _session_gc_lock() as locked:
         if not locked:
             _log("session-gc skipped: cross-process lock unavailable")
+            return None
+        active = _active_hermes_session_ids(now=now)
+        if active is None:
+            _log("session-gc skipped: continuation checkpoint inventory unavailable")
             return None
         for home in sorted(homes):
             result = _prune_session_store(home, active, now=now)
@@ -1562,7 +1910,9 @@ def main() -> int:
     bound_home = ""
     bound_label = ""
     session_gc_run = False
+    owner_prune_run = False
     pump_threads: list[threading.Thread] = []
+    owner_relay = _SessionOwnerRelay()
 
     def pump_upstream_out() -> None:
         assert upstream is not None
@@ -1570,7 +1920,7 @@ def main() -> int:
             failure = _classify_json_error(line)
             if failure:
                 _mark_failure(bound_home, bound_label, failure[0], failure[1])
-            sys.stdout.write(line)
+            sys.stdout.write(owner_relay.after(line, bound_home, bound_label))
             sys.stdout.flush()
 
     def pump_upstream_err() -> None:
@@ -1624,21 +1974,33 @@ def main() -> int:
 
     try:
         for line in sys.stdin:
+            method = ""
+            payload: object = None
+            try:
+                payload = json.loads(line)
+                method = str(payload.get("method") or "") if isinstance(payload, dict) else ""
+            except (json.JSONDecodeError, ValueError):
+                pass
             if upstream is None:
-                method = ""
-                try:
-                    payload = json.loads(line)
-                    method = str(payload.get("method") or "") if isinstance(payload, dict) else ""
-                except (json.JSONDecodeError, ValueError):
-                    pass
                 if not session_gc_run:
                     if os.environ.get("ACP_MUX_SESSION_GC") == "1":
                         prune_session_stores()
+                    else:
+                        _log("native session GC disabled (opt in: ACP_MUX_SESSION_GC=1)")
                     session_gc_run = True
-                home, label, reason = _pick_account(
-                    affinity=os.environ.get("ACP_MUX_AFFINITY", ""),
-                    pin_affinity=os.environ.get("ACP_MUX_AFFINITY_PIN") == "1",
-                )
+                if not owner_prune_run:
+                    prune_session_owners()
+                    owner_prune_run = True
+                resume_id = os.environ.get("ACP_MUX_SESSION_ID", "")
+                owner = _resolve_session_owner(resume_id) if resume_id else None
+                if owner is not None:
+                    home, label = owner
+                    reason = "session-owner"
+                else:
+                    home, label, reason = _pick_account(
+                        affinity=os.environ.get("ACP_MUX_AFFINITY", ""),
+                        pin_affinity=os.environ.get("ACP_MUX_AFFINITY_PIN") == "1",
+                    )
                 if reason == "registry-invalid":
                     sys.stderr.write(_REGISTRY_INVALID_MESSAGE)
                     return 2
@@ -1653,6 +2015,11 @@ def main() -> int:
                     return 2
                 _log(f"selected {bound_label} via {reason} for {method or 'unknown'}")
 
+            owner_error = owner_relay.before(payload, bound_home, bound_label)
+            if owner_error is not None:
+                sys.stdout.write(owner_error)
+                sys.stdout.flush()
+                continue
             assert upstream is not None and upstream.stdin is not None
             if upstream.poll() not in (None, 0):
                 _mark_failure(bound_home, bound_label, "crash", f"exit={upstream.returncode}")
