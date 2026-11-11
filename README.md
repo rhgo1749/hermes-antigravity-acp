@@ -349,9 +349,10 @@ In brief:
   state under `~/.local/opt`, `~/.local/bin`, and the plugin tree. Google
   sign-in state is managed by Google's runtime in your user environment.
 - **Telemetry.** This plugin sends no telemetry of its own; usage reporting is
-  truthful (server-reported consumption proxy in `completion.usage` when the
-  server reported `usage_update` frames, otherwise `completion.usage=None`,
-  `status="unavailable"`). Any independent
+  truthful (`completion.usage` is populated only when the server itself
+  supplies a valid per-turn usage payload — currently it never does, so
+  `completion.usage=None` and `status="unavailable"`; no counts are ever
+  synthesized). Any independent
   network or background behavior inside the proprietary vendor binary is
   attributed to Google's runtime and is neither observed nor speculated about
   in this repository.
@@ -533,18 +534,22 @@ before use.
 **Usage telemetry is explicit and truthful:** the pinned official ACP server
 does not report actual billed request tokens. When ACP's final prompt response
 includes a valid usage breakdown, `completion.usage` carries its input, output,
-reasoning, and cache-read counts where available. Otherwise, since v0.7.4, when
-the server reported `usage_update` consumption frames during a turn,
-`completion.usage` carries a server-reported **consumption proxy**
-(`prompt_tokens` = latest call's consumption, `completion_tokens` = earlier
-same-turn calls' consumption, `total_tokens` = turn sum; it may under-report
-and has no true input/output split). With neither source available, completions
-keep `completion.usage=None`. Every response also carries a response-level
+reasoning, and cache-read counts where available. The official server currently
+never supplies such a breakdown, and since v0.7.9 the adapter no longer
+synthesizes any prompt/completion split from `usage_update` frames (the
+pre-v0.7.9 consumption-proxy split was removed as fabricated; see issue #6 and
+`docs/acp-usage-telemetry.md`). With no valid server-provided per-turn usage,
+completions keep `completion.usage=None` and Hermes applies its designed
+estimation fallback for context management, while `/usage` reports token
+records as unavailable rather than fabricated numbers. Every response also
+carries a response-level
 `antigravity_usage_telemetry` attribute with `status="unavailable"` and null
 request-usage buckets: the telemetry attribute never populate request usage
-buckets, and the proxy is explicitly not vendor billing. Official
-`usage_update` counters are additionally retained as non-billing
-`context_occupancy`. See `docs/acp-usage-telemetry.md` for the
+buckets. Official
+`usage_update` counters are retained only as non-billing
+`context_occupancy` readings, and durable session totals accumulate only
+source-verified per-call consumption deltas from verified server identities.
+See `docs/acp-usage-telemetry.md` for the
 contract and credential-free tests. **Quota visibility (`/quota`) is
 unavailable/unsupported in this public product:** the official ACP server
 exposes no permitted quota data source or supported extension point, so no
