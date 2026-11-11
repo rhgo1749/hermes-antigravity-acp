@@ -48,8 +48,13 @@ each with its own drop counter:
 1. **Verified server semantics** — the `initialize` result's `agentInfo`
    `(name, title, version)` must match a source-verified identity whose
    per-call delta semantics were confirmed against server source
-   (`server_consumption_semantics: "verified"`). Spec-compliant or unknown
-   servers are never summed.
+   (`server_consumption_semantics: "verified"`). Pinned identities:
+   `("antigravity-acp", "Google Antigravity", "1.4.0")` (stage-3 canary
+   frames) and `("antigravity-acp", "Google Antigravity", "1.4.4")`
+   (credential-free `initialize` against the official binary, enforced by
+   `EXPECTED_AGENT_INFO` in `scripts/hosted_clean_room_ci.py`). The server
+   reports its own binary version, so each verified release must be pinned
+   explicitly; spec-compliant or unknown servers are never summed.
 2. **Prompt-turn window** — frames are counted only between sending
    `session/prompt` and receiving its response. This is event-order
    correlation against the adapter's own request, NOT value equality: two
@@ -57,7 +62,9 @@ each with its own drop counter:
    re-report of `last_reported_used` (emitted outside the window with zero
    consumption) is excluded.
 3. **Nonzero** — the server's own `_maybe_send_usage_update` never reports a
-   zero delta; a zero frame can only be the new-session placeholder.
+   zero delta; a zero frame can only be the new-session placeholder. Zero is
+   classified by value before the identity and window gates, so a
+   placeholder is always `dropped_zero` regardless of server identity.
 
 Known limits, stated so nobody re-reads these numbers as invoices: the server
 omits zero-delta frames and excludes subagent calls, so the sum may
@@ -107,8 +114,12 @@ The official server's `usage_update.used` is the consumption delta for the
 latest model call, not cumulative native-session context occupancy. `size` is
 the context window. The response keeps the existing latest-valid observation
 under `context_occupancy`, with
-`source="acp.session/update:usage_update"`,
-`scope="per_model_call_consumption_delta"`, and `is_billing_usage=false`.
+`source="acp.session/update:usage_update"` and `is_billing_usage=false`.
+The `scope` label states the reading's MEANING, which depends on the server's
+semantics: `per_model_call_consumption_delta` only for a source-verified
+identity; `unverified_server_semantics` for everything else (the value is
+retained as an opaque observation whose meaning this adapter has not
+verified).
 Only numeric, finite, nonnegative `used`/`size` values are retained for this
 response field; booleans, strings, negative values, NaN, and infinities are
 invalid. A frame carrying any present-but-invalid field is rejected as a whole

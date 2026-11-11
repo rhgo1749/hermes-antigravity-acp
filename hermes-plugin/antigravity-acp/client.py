@@ -2305,6 +2305,7 @@ _USAGE_BUCKETS = (
 )
 _CONTEXT_OCCUPANCY_SOURCE = "acp.session/update:usage_update"
 _USAGE_DELTA_SCOPE = "per_model_call_consumption_delta"
+_USAGE_SCOPE_UNVERIFIED = "unverified_server_semantics"
 
 # Server identities whose ``usage_update.used`` semantics are SOURCE-VERIFIED
 # as per-model-call consumption deltas (NOT the ACP v1 occupancy snapshot):
@@ -2320,7 +2321,16 @@ _USAGE_DELTA_SCOPE = "per_model_call_consumption_delta"
 #     (issue #6 AC4-3).  Residual risk: a future server that keeps this exact
 #     triple while changing the semantics would pass the gate.
 _VERIFIED_CONSUMPTION_IDENTITIES = frozenset(
-    {("antigravity-acp", "Google Antigravity", "1.4.0")}
+    {
+        # 1.4.0: observed identity in the stage-3 canary frames.
+        ("antigravity-acp", "Google Antigravity", "1.4.0"),
+        # 1.4.4: identity verified credential-free against the official
+        # binary by the hosted clean room (`EXPECTED_AGENT_INFO` in
+        # scripts/hosted_clean_room_ci.py; per-call delta semantics source-
+        # verified in the 1.4.4 PAR). The server reports its own binary
+        # version here, so every verified release must be pinned explicitly.
+        ("antigravity-acp", "Google Antigravity", "1.4.4"),
+    }
 )
 _USAGE_SEMANTICS_VERIFIED = "verified"
 _USAGE_SEMANTICS_UNVERIFIED = "unverified"
@@ -2384,6 +2394,14 @@ def _capture_usage_delta(
     if not isinstance(activity_stats, dict) or not _nonnegative_json_number(update["used"]):
         conversation_registry.note_usage_frame("dropped_invalid")
         return
+    # The server never reports a zero delta from `_maybe_send_usage_update`
+    # (`if not used: return`); a zero frame can only be the new-session
+    # placeholder. It is not consumption under ANY identity or lifecycle
+    # position, so it is classified by value first and must not create
+    # totals entries.
+    if update["used"] == 0:
+        conversation_registry.note_usage_frame("dropped_zero")
+        return
     # Issue #6 AC4-3: accumulate only for a server identity whose per-call
     # delta semantics are source-verified (see _VERIFIED_CONSUMPTION_IDENTITIES).
     if activity_stats.get(_SERVER_CONSUMPTION_SEMANTICS_KEY) != _USAGE_SEMANTICS_VERIFIED:
@@ -2392,18 +2410,12 @@ def _capture_usage_delta(
     # Issue #6 AC4-2: the official 1.4.x server emits consumption deltas ONLY
     # while a prompt turn is in flight (`_maybe_send_usage_update` is reached
     # exclusively from `prompt()`/`_stream_live_step`).  Frames outside the
-    # window are re-reports of `last_reported_used` (model switch) or the
-    # new-session `used=0` frame — never new consumption.  This is event-order
-    # correlation against the adapter's own `session/prompt` request, NOT
-    # value equality: two real calls with identical `used` both accumulate.
+    # window are re-reports of `last_reported_used` (model switch) — never new
+    # consumption.  This is event-order correlation against the adapter's own
+    # `session/prompt` request, NOT value equality: two real calls with
+    # identical `used` both accumulate.
     if not activity_stats.get(_PROMPT_TURN_ACTIVE_KEY):
         conversation_registry.note_usage_frame("dropped_outside_prompt_turn")
-        return
-    # The server never reports a zero delta from `_maybe_send_usage_update`
-    # (`if not used: return`); a zero frame can only be the new-session
-    # placeholder. It is not consumption and must not create totals entries.
-    if update["used"] == 0:
-        conversation_registry.note_usage_frame("dropped_zero")
         return
     try:
         hermes_session_id, _session_key = get_runtime_session_env()
@@ -2462,9 +2474,16 @@ def _capture_context_occupancy(
             if field in previous and _nonnegative_json_number(previous[field])
         }
     merged.update({field: update[field] for field in present})
+    # The reading's MEANING depends on the server's semantics.  Only a
+    # source-verified identity gets the per-call-consumption-delta label;
+    # for anything else the meaning is honestly unverified (issue #6 review).
+    verified = (
+        activity_stats.get(_SERVER_CONSUMPTION_SEMANTICS_KEY)
+        == _USAGE_SEMANTICS_VERIFIED
+    )
     activity_stats["context_occupancy"] = {
         "source": _CONTEXT_OCCUPANCY_SOURCE,
-        "scope": _USAGE_DELTA_SCOPE,
+        "scope": _USAGE_DELTA_SCOPE if verified else _USAGE_SCOPE_UNVERIFIED,
         "is_billing_usage": False,
         **merged,
     }
@@ -2554,6 +2573,7 @@ def _build_usage_telemetry(
     server_consumption_semantics: str = _USAGE_SEMANTICS_UNVERIFIED,
 ) -> dict[str, Any]:
     """Build JSON-compatible metadata without inferring billable token counts."""
+    semantics_verified = server_consumption_semantics == _USAGE_SEMANTICS_VERIFIED
     occupancy: dict[str, Any] | None = None
     if isinstance(context_occupancy, dict):
         values = {
@@ -2563,15 +2583,37 @@ def _build_usage_telemetry(
             and _nonnegative_json_number(context_occupancy[field])
         }
         if values:
+            # The capture site already labeled the reading's meaning against
+            # the pinned server semantics; carry that label, never relabel it
+            # as a delta here (issue #6 review).
+            captured_scope = context_occupancy.get("scope")
             occupancy = {
                 "source": _CONTEXT_OCCUPANCY_SOURCE,
-                "scope": _USAGE_DELTA_SCOPE,
+                "scope": (
+                    captured_scope
+                    if isinstance(captured_scope, str) and captured_scope
+                    else (
+                        _USAGE_DELTA_SCOPE
+                        if semantics_verified
+                        else _USAGE_SCOPE_UNVERIFIED
+                    )
+                ),
                 "is_billing_usage": False,
                 **values,
             }
 
     consumption: dict[str, Any] | None = (
         dict(turn_consumption) if isinstance(turn_consumption, dict) else None
+    )
+    occupancy_provenance = (
+        "usage_update.used is per-model-call consumption, not billing usage; "
+        "size is the context window"
+        if semantics_verified
+        else (
+            "this server's usage_update.used semantics are not source-verified; "
+            "the reading is retained as an opaque observation, not billing "
+            "usage, consumption deltas, or context occupancy"
+        )
     )
 
     return {
@@ -2588,10 +2630,7 @@ def _build_usage_telemetry(
                 "session/prompt result usage breakdown; never synthesized from "
                 "usage_update frames (issue #6 AC4-1)"
             ),
-            "context_occupancy": (
-                "usage_update.used is per-model-call consumption, not billing usage; "
-                "size is the context window"
-            ),
+            "context_occupancy": occupancy_provenance,
             "turn_consumption": (
                 "sum of gated per-model-call consumption deltas observed this turn "
                 "(main-agent-only, may under-report); observed processing, not "

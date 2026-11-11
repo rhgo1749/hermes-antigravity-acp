@@ -142,7 +142,7 @@ def test_context_occupancy_captures_latest_valid_observation(monkeypatch, tmp_pa
         client._capture_context_occupancy(update, stats)
     assert stats["context_occupancy"] == {
         "source": "acp.session/update:usage_update",
-        "scope": "per_model_call_consumption_delta",
+        "scope": "unverified_server_semantics",
         "is_billing_usage": False,
         "used": 12000,
         "size": 1048576,
@@ -392,14 +392,18 @@ def test_usage_frame_drop_counters_cover_every_gate(monkeypatch, tmp_path) -> No
             client._PROMPT_TURN_ACTIVE_KEY: True,
         },
     )
+    client._capture_usage_delta(  # zero from an UNVERIFIED server: still zero
+        {"sessionUpdate": "usage_update", "used": 0},
+        {"native_session_id": "native-a", "model": "model-a"},
+    )
     counters = json.loads(state_path.read_text())["usage_drop_counters"]
     assert counters == {
-        "frames_seen": 6,
+        "frames_seen": 7,
         "dropped_invalid": 1,
         "dropped_no_native_session": 1,
         "dropped_semantics_unverified": 1,
         "dropped_outside_prompt_turn": 1,
-        "dropped_zero": 1,
+        "dropped_zero": 2,
     }
     # The gated frames changed nothing in the totals.
     assert payload["usage_totals"]["session-c"]["summed_tokens"] == 42

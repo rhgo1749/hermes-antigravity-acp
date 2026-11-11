@@ -295,7 +295,7 @@ def test_failover_replay_still_recovers_without_tool_activity(monkeypatch, tmp_p
     assert telemetry["turn_consumption"] is None
     assert telemetry["context_occupancy"] == {
         "source": "acp.session/update:usage_update",
-        "scope": "per_model_call_consumption_delta",
+        "scope": "unverified_server_semantics",
         "is_billing_usage": False,
         "used": 30,
         "size": 1048576,

@@ -842,7 +842,7 @@ def test_fake_subprocess_normal_tool_turn_and_native_resume(monkeypatch, tmp_pat
     assert second.antigravity_usage_telemetry["turn_consumption"] is None
     assert second.antigravity_usage_telemetry["context_occupancy"] == {
         "source": "acp.session/update:usage_update",
-        "scope": "per_model_call_consumption_delta",
+        "scope": "unverified_server_semantics",
         "is_billing_usage": False,
         "used": 12000,
         "size": 1048576,
