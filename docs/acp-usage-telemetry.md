@@ -226,7 +226,9 @@ query production databases, or run the canary now.
 Every `usage_update` frame that carries a `used` value is a usage-delta
 candidate. Each candidate increments `usage_drop_counters.frames_seen`; a
 candidate rejected before `add_usage_delta` increments exactly one reason
-counter: `dropped_invalid` (malformed value or missing activity stats),
+counter: `dropped_invalid` (whole-frame validity failure — a present-but
+invalid `used` or `size`, or missing activity stats; identical to the
+occupancy and turn-sum validity contract),
 `dropped_semantics_unverified` (server identity not in the source-verified
 set), `dropped_outside_prompt_turn` (frame observed outside the adapter's own
 in-flight `session/prompt` window — model-switch re-reports, session-init

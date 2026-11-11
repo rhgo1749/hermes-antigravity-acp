@@ -454,6 +454,60 @@ def test_identical_used_values_in_window_both_accumulate_while_rerports_do_not(
     assert payload["usage_drop_counters"]["dropped_outside_prompt_turn"] == 1
 
 
+def test_valid_used_with_invalid_size_is_rejected_by_every_consumer(
+    monkeypatch, tmp_path
+) -> None:
+    """Issue #6 review: one validity contract for all three consumers.
+
+    A frame whose `used` is valid but whose `size` is corrupt must be
+    rejected identically by the durable sum (_capture_usage_delta), the turn
+    sum (_capture_turn_usage) and occupancy (_capture_context_occupancy) —
+    the surfaces can never disagree about which frames were real.  A frame
+    carrying only `used` stays valid (partial frames are legal).
+    """
+    client, _ = _load_client_module(monkeypatch, tmp_path)
+    import os
+
+    monkeypatch.setattr(client, "get_runtime_session_env", lambda: ("split-frame-session", ""))
+    state_path = Path(os.environ["HERMES_ANTIGRAVITY_ACP_STATE_FILE"])
+
+    def stats() -> dict:
+        return {
+            "native_session_id": "native-split",
+            "model": "model-a",
+            "turn_id_hash": "sha256:turn",
+            client._SERVER_CONSUMPTION_SEMANTICS_KEY: client._USAGE_SEMANTICS_VERIFIED,
+            client._PROMPT_TURN_ACTIVE_KEY: True,
+        }
+
+    corrupt = {"sessionUpdate": "usage_update", "used": 500, "size": "unknown"}
+    partial = {"sessionUpdate": "usage_update", "used": 250}
+
+    delta_stats = stats()
+    turn_stats = stats()
+    occupancy_stats = stats()
+    for frame in (corrupt, partial):
+        client._capture_usage_delta(frame, delta_stats)
+        client._capture_turn_usage(frame, turn_stats)
+        client._capture_context_occupancy(frame, occupancy_stats)
+
+    # Durable sum: only the partial frame accumulated.
+    payload = json.loads(state_path.read_text())
+    entry = payload["usage_totals"]["split-frame-session"]
+    assert entry["summed_tokens"] == 250
+    assert entry["frames_observed"] == 1
+    assert payload["usage_drop_counters"]["dropped_invalid"] == 1
+
+    # Turn sum: same verdict.
+    assert turn_stats[client._TURN_USAGE_SUM_KEY] == 250
+    assert turn_stats[client._TURN_USAGE_CALLS_KEY] == 1
+
+    # Occupancy: the corrupt frame contributed nothing; the partial frame
+    # updated only `used` and never carried a bogus size.
+    assert occupancy_stats["context_occupancy"]["used"] == 250
+    assert "size" not in occupancy_stats["context_occupancy"]
+
+
 def test_state_save_preserves_usage_drop_counters_and_totals(monkeypatch, tmp_path) -> None:
     # Live regression 2026-11-04: a counter write (frames_seen:3) was erased by
     # the very next state-save because _write_file rebuilt the document from

@@ -2311,15 +2311,18 @@ _USAGE_SCOPE_UNVERIFIED = "unverified_server_semantics"
 # as per-model-call consumption deltas (NOT the ACP v1 occupancy snapshot):
 #   * ``agy_acp_server.par`` 1.4.0 ``server.py`` (``_maybe_send_usage_update``,
 #     ``_extract_tokens_used``) — verified 2026-11-02 (antigravity-acp-harness
-#     issue #68 evidence).
+#     issue #68 evidence); its ``initialize`` self-reports
+#     ``agentInfo.version == "1.4.0"`` (stage-3 canary frames).
 #   * ``agy_acp_server.par`` 1.4.4 ``server.py`` — re-verified 2026-11-11 from
-#     the installed par.  Its ``initialize`` result still self-reports
-#     ``agentInfo.version == "1.4.0"`` (the ``useragent`` constant lags the par
-#     version), so this pin is an OBSERVED IDENTITY triple, not a trustworthy
-#     version comparison: any deviation (absent, unknown, changed, malformed
-#     ``agentInfo``) disables consumption accumulation instead of guessing
-#     (issue #6 AC4-3).  Residual risk: a future server that keeps this exact
-#     triple while changing the semantics would pass the gate.
+#     the installed par; its credential-free ``initialize`` self-reports
+#     ``agentInfo.version == "1.4.4"``, enforced by ``EXPECTED_AGENT_INFO`` in
+#     ``scripts/hosted_clean_room_ci.py`` and recorded in
+#     ``docs/official-server-1.4.4-clean-room-e2e-2026-11-07.md``.
+# These pins are OBSERVED IDENTITY triples, not trustworthy version
+# comparisons: any deviation (absent, unknown, changed, malformed
+# ``agentInfo``) disables consumption accumulation instead of guessing
+# (issue #6 AC4-3).  Residual risk: a future server that keeps one of these
+# exact triples while changing the semantics would pass the gate.
 _VERIFIED_CONSUMPTION_IDENTITIES = frozenset(
     {
         # 1.4.0: observed identity in the stage-3 canary frames.
@@ -2391,7 +2394,18 @@ def _capture_usage_delta(
     # marks where a rejected candidate died, so seen minus reasons equals the
     # deltas that reached add_usage_delta.
     conversation_registry.note_usage_frame("frames_seen")
-    if not isinstance(activity_stats, dict) or not _nonnegative_json_number(update["used"]):
+    # Whole-frame validity, identical to _capture_context_occupancy and
+    # _capture_turn_usage: a frame carrying any present-but-invalid
+    # used/size value contributes nothing to ANY consumer, so the durable
+    # sum, the turn sum and the occupancy reading can never disagree about
+    # which frames were real (issue #6 review).
+    if not isinstance(activity_stats, dict):
+        conversation_registry.note_usage_frame("dropped_invalid")
+        return
+    present = [field for field in ("used", "size") if field in update]
+    if "used" not in present or not all(
+        _nonnegative_json_number(update[field]) for field in present
+    ):
         conversation_registry.note_usage_frame("dropped_invalid")
         return
     # The server never reports a zero delta from `_maybe_send_usage_update`
