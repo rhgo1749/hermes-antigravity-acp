@@ -120,6 +120,14 @@ def install_hermes_session_fakes(monkeypatch) -> SessionFakes:
 
 
 def _load_plugin(monkeypatch, tmp_path: Path, module_name: str):
+    # The fake session modules make hermes_runtime_present() true, so the
+    # provider's obligation-evidence check demands a resolvable active home.
+    # Bind an explicit, isolated, empty Hermes home per test: no policy
+    # obligation record exists there, which is the verified-clean public
+    # install path — the fail-closed check itself stays fully armed.
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     monkeypatch.setenv(
         "HERMES_ANTIGRAVITY_ACP_STATE_FILE", str(tmp_path / "acp-state.json")
     )
@@ -446,3 +454,108 @@ def test_ambiguous_child_never_resumes_the_parents_session(
             client_module.conversation_registry.get(parent_affinity).session_id
             == parent_session
         ), "the parent's continuation must be untouched"
+
+
+# ---------------------------------------------------------------------------
+# Provenance counterexamples: the child ContextVar id was inherited from the
+# parent while os.environ HERMES_SESSION_ID is absent or belongs to another
+# profile, so the env-var guard alone cannot see the inheritance.  The
+# in-process tripwire (last observed non-delegated id per route key) must fail
+# these closed, and even where it cannot fire the delegated-child namespace
+# must keep the parent's continuation unreachable.
+# ---------------------------------------------------------------------------
+
+
+def test_inherited_parent_id_without_env_fails_closed(
+    monkeypatch, tmp_path
+) -> None:
+    fakes = install_hermes_session_fakes(monkeypatch)
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    _, client_module = _load_plugin(
+        monkeypatch, tmp_path, "acp_issue2_inherit_noenv"
+    )
+
+    with fakes.bind_parent("parent-row", "parent-route-key"):
+        parent_affinity = _affinity(client_module, tmp_path)  # parent observed
+        with fakes.delegated_child_context("parent-row"):  # inherited id
+            assert _affinity(client_module, tmp_path) == ""
+        assert _affinity(client_module, tmp_path) == parent_affinity
+
+
+def test_inherited_parent_id_with_foreign_env_value_fails_closed(
+    monkeypatch, tmp_path
+) -> None:
+    fakes = install_hermes_session_fakes(monkeypatch)
+    monkeypatch.setenv("HERMES_SESSION_ID", "other-profile-session")
+    _, client_module = _load_plugin(
+        monkeypatch, tmp_path, "acp_issue2_inherit_foreignenv"
+    )
+
+    with fakes.bind_parent("parent-row", "parent-route-key"):
+        parent_affinity = _affinity(client_module, tmp_path)
+        with fakes.delegated_child_context("parent-row"):  # inherited id
+            assert _affinity(client_module, tmp_path) == ""
+        assert _affinity(client_module, tmp_path) == parent_affinity
+
+
+def test_inherited_id_child_never_resumes_or_touches_parent_state(
+    monkeypatch, tmp_path
+) -> None:
+    fakes = install_hermes_session_fakes(monkeypatch)
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    module, client_module = _load_plugin(
+        monkeypatch, tmp_path, "acp_issue2_inherit_client"
+    )
+    client = _client(module, tmp_path)
+    calls: list[tuple[str, str]] = []
+    _fake_run(client, calls)
+
+    with fakes.bind_parent("parent-row", "parent-route-key"):
+        client.chat.completions.create(
+            model="gemini-test",
+            messages=[{"role": "user", "content": "shared fan-out goal"}],
+        )
+        parent_affinity = client_module._conversation_affinity(
+            [{"role": "user", "content": "shared fan-out goal"}], str(tmp_path)
+        )
+        parent_state = client_module.conversation_registry.get(parent_affinity)
+        assert parent_state is not None
+        parent_session = parent_state.session_id
+
+        run_fake = client._run_prompt
+        run_fake.current_child = ""
+        with fakes.delegated_child_context("parent-row"):  # inherited id
+            client.chat.completions.create(
+                model="gemini-test",
+                messages=[{"role": "user", "content": "shared fan-out goal"}],
+            )
+
+        assert calls[-1] == ("", ""), "inherited-id child must not resume"
+        assert client_module.conversation_registry.get("") is None
+        assert (
+            client_module.conversation_registry.get(parent_affinity).session_id
+            == parent_session
+        ), "the parent's continuation must be untouched"
+
+
+def test_inherited_id_before_parent_observed_still_cannot_reach_parent(
+    monkeypatch, tmp_path
+) -> None:
+    """Residual-gap boundary: if the parent was never observed in this
+    process the tripwire cannot fire, but the delegated-child namespace must
+    still make the parent's continuation unreachable (no misidentification)."""
+    fakes = install_hermes_session_fakes(monkeypatch)
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    _, client_module = _load_plugin(
+        monkeypatch, tmp_path, "acp_issue2_inherit_unobserved"
+    )
+
+    with fakes.bind_parent("parent-row", "parent-route-key"):
+        with fakes.delegated_child_context("parent-row"):  # inherited id
+            child_affinity = _affinity(client_module, tmp_path)
+        parent_affinity = _affinity(client_module, tmp_path)
+
+    assert child_affinity != "", "tripwire had no observation to fire on"
+    assert child_affinity != parent_affinity, (
+        "a delegated turn must never resolve to the parent's affinity"
+    )

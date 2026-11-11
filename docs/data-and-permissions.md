@@ -110,7 +110,14 @@ scoped id is missing or provably equal to the process-pinned
 `HERMES_SESSION_ID` (Core never rewrites that env for children, so equality
 proves the id was never scoped) is treated as ambiguous and gets a fresh
 native session with full replay instead of ever resuming a parent's or
-sibling's continuation.
+sibling's continuation. When that env var is absent or belongs to another
+profile, a second tripwire applies: the plugin records the last non-delegated
+session id seen per route key in-process (bounded LRU, 256 entries), and a
+delegated turn whose id equals that recorded parent id is likewise failed
+closed. A correctly scoped child id is unique per child and can never match,
+so legitimate children are never affected; if the parent was never observed in
+this process the tripwire cannot fire, and the `delegated-child` namespace
+alone still keeps the parent's continuation unreachable.
 
 ## 4. Telemetry
 

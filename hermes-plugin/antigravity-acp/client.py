@@ -35,7 +35,7 @@ import tempfile
 import threading
 import time
 import uuid
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -1733,6 +1733,40 @@ def _tool_bridge_activity(
     }
 
 
+# Issue #2 provenance tripwire: a delegated child must present Core's own
+# scoped session id.  The env-var guard in ``hermes_compat`` catches ids that
+# equal the process-level ``HERMES_SESSION_ID``, but a child whose id was
+# inherited from the parent while that env var is absent or belongs to another
+# profile is only detectable from inside this process: the parent's turn under
+# the same route key ran here first.  Recording the last non-delegated session
+# id per route key lets a delegated turn whose id equals that recorded parent
+# id fail closed (fresh native session) instead of sharing the parent's or a
+# sibling's continuation.  A correctly scoped child id is unique per child and
+# can never match, so legitimate children are never affected.  Bounded LRU;
+# a child that appears before its parent was ever observed in this process
+# falls back to namespace isolation alone (parent state stays unreachable).
+_OBSERVED_SESSION_IDS_BY_KEY: "OrderedDict[str, str]" = OrderedDict()
+_OBSERVED_SESSION_IDS_LIMIT = 256
+_OBSERVED_SESSION_IDS_LOCK = threading.Lock()
+
+
+def _note_observed_session_id(session_key: str, session_id: str) -> None:
+    if not session_key or not session_id:
+        return
+    with _OBSERVED_SESSION_IDS_LOCK:
+        _OBSERVED_SESSION_IDS_BY_KEY[session_key] = session_id
+        _OBSERVED_SESSION_IDS_BY_KEY.move_to_end(session_key)
+        while len(_OBSERVED_SESSION_IDS_BY_KEY) > _OBSERVED_SESSION_IDS_LIMIT:
+            _OBSERVED_SESSION_IDS_BY_KEY.popitem(last=False)
+
+
+def _child_id_is_inherited_parent_id(session_key: str, child_id: str) -> bool:
+    if not session_key or not child_id:
+        return False
+    with _OBSERVED_SESSION_IDS_LOCK:
+        return _OBSERVED_SESSION_IDS_BY_KEY.get(session_key) == child_id
+
+
 def _runtime_conversation_identity() -> tuple[str, bool]:
     """Stable Hermes conversation identity when running inside Hermes.
 
@@ -1760,8 +1794,11 @@ def _runtime_conversation_identity() -> tuple[str, bool]:
     if delegated:
         if not child_id:
             return "", True
+        if _child_id_is_inherited_parent_id(session_key, child_id):
+            return "", True
         identity = f"delegated-child\0{child_id}"
     else:
+        _note_observed_session_id(session_key, session_id)
         identity = session_key or session_id
     if not identity:
         return "", False
