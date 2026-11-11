@@ -38,17 +38,18 @@ Hermes terminal approvals; a workspace path check is not a sandbox.
 ## Known concurrency limitation: delegated children
 
 Issue [#2](https://github.com/rhgo1749/hermes-antigravity-acp/issues/2) —
-candidate fix shipped in v0.7.9; the issue stays open until real-server
-verification closes it. Previously, `delegate_task` children inherited the
-parent Hermes route key (by core design: it is the async-completion routing
-address) and the plugin keyed ACP continuation affinity with it, so a parent
-and all of its children fought over one native ACP continuation and overwrote
-each other's frontier state. Affinity now keys a delegated child with the
-child's own durable session id; a child without one runs stateless (empty
-affinity, fresh native session, resume nothing) — never the parent's key.
-Unit tests cover parent/child/sibling keying and the fail-closed
-delegation-context gate; real-server concurrent-resume behavior across
-sibling children has not yet been executed-verified.
+candidate fix proposed in PR #7, not yet released; the issue stays open until
+real-server verification closes it. Previously, `delegate_task` children
+inherited the parent Hermes route key (by core design: it is the
+async-completion routing address) and the plugin keyed ACP continuation
+affinity with it, so a parent and all of its children fought over one native
+ACP continuation and overwrote each other's frontier state. Affinity now keys
+a delegated child with the child's own durable session id; a child without one
+runs stateless (empty affinity, fresh native session, resume nothing) — never
+the parent's key. Unit tests cover parent/child/sibling keying and the
+fail-closed delegation-context gate; a real-core-context E2E (fake ACP server)
+covers concurrent same-prompt siblings; real-server concurrent-resume behavior
+across sibling children has not yet been executed-verified.
 
 ## 5-minute Quick Start (single account, credential-free)
 

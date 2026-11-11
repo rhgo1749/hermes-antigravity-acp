@@ -325,3 +325,196 @@ def test_parent_and_sibling_children_keep_disjoint_native_continuations(
     # Each keyed affinity resumed exactly its own session: the resume ledger
     # consumed each keyed session id exactly once and no affinity moved.
     assert sorted(resumed) == sorted(keyed_sessions)
+
+
+def _captured_child_context(child_id: str):
+    """Snapshot the REAL core context a delegate child runs in.
+
+    Mirrors how core scopes each child (``delegated_child_context`` around the
+    child run) and how the parent dispatches it (``contextvars.copy_context``),
+    so threads execute with exactly the child's ContextVars — parent session
+    key inherited, own durable id bound.
+    """
+    import contextvars
+
+    with delegated_child_context(child_id):
+        return contextvars.copy_context()
+
+
+def test_concurrent_same_prompt_siblings_never_share_affinity_or_frontier(
+    monkeypatch, tmp_path
+) -> None:
+    """Issue #2's core repro condition, executed concurrently.
+
+    Three siblings share cwd, prompt bytes, and the parent session key — the
+    exact collision shape measured in production — and run their requests in
+    overlapping windows forced by barriers. A fourth ambiguous child (no
+    durable id) runs concurrently and must stay stateless. Follow-ups then
+    complete in reverse order with a freshly regenerated client per request:
+    every conversation must still resume only its own native session.
+    """
+    _require_real_core()
+    script, log_path = _write_unique_session_fake_server(tmp_path)
+    par = tmp_path / "par.py"
+    par.write_text(
+        "#!/usr/bin/env python3\n"
+        f"import sys\n"
+        f"sys.argv = [{str(script)!r}, {str(log_path)!r}]\n"
+        f"exec(compile(open({str(script)!r}).read(), {str(script)!r}, 'exec'))\n"
+    )
+    par.chmod(0o755)
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_REAL_HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    for pin in (
+        "ACP_MUX_SESSION_ID",
+        "ACP_MUX_AFFINITY",
+        "ACP_MUX_ACCOUNTS",
+        "ACP_MUX_STATE",
+        "ACP_MUX_LOG",
+        "ACP_MUX_PAR",
+    ):
+        monkeypatch.delenv(pin, raising=False)
+
+    accounts = []
+    for name in ("lane-a", "lane-b"):
+        home = tmp_path / name
+        (home / ".gemini" / "antigravity-acp" / "conversations").mkdir(parents=True)
+        accounts.append({"home": str(home), "label": name})
+    registry = tmp_path / ".hermes" / "acp-accounts.json"
+    registry.parent.mkdir(parents=True, exist_ok=True)
+    registry.write_text(json.dumps({"accounts": accounts}))
+
+    module = _load_client(monkeypatch, tmp_path)
+    client_mod = importlib.import_module(f"{module.__name__}.client")
+    monkeypatch.setattr(client_mod, "_read_par_pin", lambda: str(par))
+
+    def fresh_client():
+        return module.antigravity_acp.create_client(
+            command=sys.executable,
+            args=[str(PLUGIN_DIR.parents[1] / "scripts" / "antigravity-acp-mux.py")],
+            acp_cwd=str(tmp_path),
+            rate_limit_retries=0,
+        )
+
+    # One shared client for the concurrent phase, exactly as the gateway
+    # serves concurrent sessions through one registered provider client.
+    client = fresh_client()
+    lane = client_mod.get_current_write_origin()
+
+    keyed_ids = ["child-a-1", "child-b-1", "child-c-1"]
+    contexts = {cid: _captured_child_context(cid) for cid in keyed_ids + [""]}
+    identical_prompt = [{"role": "user", "content": "identical sibling task"}]
+    histories: dict[str, list] = {cid: list(identical_prompt) for cid in contexts}
+    failures: list[BaseException] = []
+
+    def run_turn(cid: str, extra: str | None, actor) -> None:
+        messages = histories[cid] + (
+            [{"role": "user", "content": extra}] if extra else []
+        )
+        response = actor.chat.completions.create(
+            model="gemini-3.1-pro", messages=messages
+        )
+        content = response.choices[0].message.content
+        assert isinstance(content, str) and content, cid
+        histories[cid] = messages + [{"role": "assistant", "content": content}]
+
+    def guarded(cid: str, extra: str | None, actor) -> None:
+        try:
+            run_turn(cid, extra, actor)
+        except BaseException as exc:  # noqa: BLE001 - surfaced via failures
+            failures.append(exc)
+
+    tokens = set_session_vars(
+        platform="telegram",
+        source="telegram",
+        chat_id="1",
+        session_key="agent:main:telegram:dm:1:2",
+        session_id="parent-durable-1",
+    )
+    try:
+        import threading
+
+        # Phase 1: all four children enter create() simultaneously with the
+        # SAME prompt bytes and cwd; keyed children differ only by durable id.
+        barrier = threading.Barrier(len(contexts), timeout=120)
+
+        def phase1(cid: str) -> None:
+            barrier.wait()
+            guarded(cid, None, client)
+
+        threads = [
+            threading.Thread(target=contexts[cid].run, args=(phase1, cid), name=cid)
+            for cid in contexts
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=180)
+        assert not failures, failures
+
+        # Phase 2: concurrent follow-ups — each conversation must resume only
+        # its own session while siblings are mid-request.
+        def phase2(cid: str) -> None:
+            barrier.wait()
+            guarded(cid, f"follow-up {cid}", client)
+
+        threads = [
+            threading.Thread(target=contexts[cid].run, args=(phase2, cid), name=cid)
+            for cid in contexts
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=180)
+        assert not failures, failures
+
+        # Phase 3: reverse-order completion with a freshly regenerated client
+        # per request — affinity must survive client lifetime entirely.
+        for cid in reversed(keyed_ids):
+            contexts[cid].run(guarded, cid, f"late turn {cid}", fresh_client())
+        assert not failures, failures
+    finally:
+        clear_session_vars(tokens)
+
+    rows = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    created = [
+        row["sessionId"]
+        for row in rows
+        if row["method"] == "session/new" and row["sessionId"]
+    ]
+    resumed = [row["sessionId"] for row in rows if row["method"] == "session/resume"]
+
+    state = json.loads(
+        (tmp_path / "acp-conversation-state.json").read_text(encoding="utf-8")
+    )
+    states = state["states"]
+
+    # Exact attribution: each keyed child's affinity is the hash of its OWN
+    # durable id + lane — not the shared parent key, not the identical prompt.
+    import hashlib
+
+    expected_affinities = {
+        "sha256:"
+        + hashlib.sha256(
+            f"hermes-session\0{cid}\0{lane}".encode("utf-8", errors="surrogatepass")
+        ).hexdigest()
+        for cid in keyed_ids
+    }
+    assert set(states) == expected_affinities, set(states)
+
+    keyed_sessions = {entry["session_id"] for entry in states.values()}
+    assert len(keyed_sessions) == 3, keyed_sessions
+
+    # Ambiguous child: two stateless turns, two fresh sessions, zero state.
+    unkeyed = [sid for sid in created if sid not in keyed_sessions]
+    assert len(unkeyed) == 2, unkeyed
+
+    # Resume ledger: 3 keyed conversations x 2 follow-up phases = 6 resumes,
+    # every one targeting its own keyed session; the ambiguous child's fresh
+    # sessions were never resumed, and no frontier was ever overwritten by a
+    # sibling (each keyed session id is stable across all three phases).
+    assert len(resumed) == 6, resumed
+    assert set(resumed) == keyed_sessions, (resumed, keyed_sessions)
+    assert not set(resumed) & set(unkeyed)
