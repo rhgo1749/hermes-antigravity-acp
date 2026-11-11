@@ -35,6 +35,17 @@ Hermes terminal approvals; a workspace path check is not a sandbox.
 | Authentication & first model call | Credential-free CI does not validate authentication or real inference. A supervised one-prompt canary produced a real response on an earlier client version; the current release has not been verified end-to-end in that same way. This observation does not establish terms compliance for other uses. |
 | `/quota` | Unavailable / unsupported: the official server reports no billed request tokens; completions carry `completion.usage` only as a server-reported consumption proxy from `usage_update` frames (may under-report; see `docs/acp-usage-telemetry.md`) and otherwise `completion.usage=None`, with `antigravity_usage_telemetry.status="unavailable"`; no quota command ships in the plugin. Usage, context occupancy, and billed tokens are different things — see `docs/acp-usage-telemetry.md`. |
 
+## Known concurrency limitation: delegated children
+
+Issue [#2](https://github.com/rhgo1749/hermes-antigravity-acp/issues/2)
+remains open and is **not fixed in v0.7.8**. Parallel `delegate_task` children
+can inherit the same Hermes route key and therefore share an ACP continuation
+affinity. Concurrent resume/frontier ownership is not established to be safe;
+avoid concurrent ACP-backed delegated children sharing a parent conversation
+until this limitation is resolved. Sequential use is a mitigation, not a proof
+of isolation or an exactly-once side-effect guarantee. Isolated tests reproduced
+contention; real-server concurrent-resume behavior remains unverified.
+
 ## 5-minute Quick Start (single account, credential-free)
 
 Supported topology: one Hermes user, one Hermes home, one official server

@@ -21,6 +21,7 @@ def _load_client(monkeypatch, *, command: str, args: list[str], cwd: str):
         "HERMES_ANTIGRAVITY_ACP_STATE_FILE",
         str(Path(cwd) / "acp-conversation-state.json"),
     )
+    monkeypatch.delenv("HERMES_ANTIGRAVITY_ACP_NATIVE_GC", raising=False)
     registered = []
 
     class FakeProviderProfile:
@@ -868,7 +869,7 @@ def test_fake_subprocess_normal_tool_turn_and_native_resume(monkeypatch, tmp_pat
             assert row["mux_session_id"] == (
                 "session-1" if row["method"] == "session/resume" else ""
             )
-            assert row["mux_session_gc"] == "1"
+            assert row["mux_session_gc"] == "0"
     resumed = next(row for row in rows if row["method"] == "session/resume")
     assert resumed["params"]["sessionId"] == "session-1"
 
@@ -1752,3 +1753,145 @@ def test_google_native_web_pre_tool_denial_is_separate_from_hermes_fallback(
     assert event["tool_origin"] == "native_acp"
     assert event["server_outcome"] == "denied"
     assert "PRIVATE_QUERY_MUST_NOT_BE_LOGGED" not in caplog.text
+
+
+def test_native_store_gc_defaults_off_for_acp_child(monkeypatch, tmp_path) -> None:
+    script, log_path = _write_fake_server(tmp_path)
+    client = _load_client(
+        monkeypatch,
+        command=sys.executable,
+        args=[str(script), str(log_path)],
+        cwd=str(tmp_path),
+    )
+    client.chat.completions.create(
+        model="gemini-3.1-pro",
+        messages=[{"role": "user", "content": "hello"}],
+        timeout=10,
+    )
+    rows = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    assert any(
+        row["method"] == "session/new" and row["mux_session_gc"] == "0" for row in rows
+    )
+
+
+def test_native_store_gc_opt_in_env_forwards_to_acp_child(monkeypatch, tmp_path) -> None:
+    script, log_path = _write_fake_server(tmp_path)
+    client = _load_client(
+        monkeypatch,
+        command=sys.executable,
+        args=[str(script), str(log_path)],
+        cwd=str(tmp_path),
+    )
+    monkeypatch.setenv("HERMES_ANTIGRAVITY_ACP_NATIVE_GC", "1")
+    client.chat.completions.create(
+        model="gemini-3.1-pro",
+        messages=[{"role": "user", "content": "hello"}],
+        timeout=10,
+    )
+    rows = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    assert any(
+        row["method"] == "session/new" and row["mux_session_gc"] == "1" for row in rows
+    )
+
+
+def test_provider_through_mux_to_fake_server_owner_routing(monkeypatch, tmp_path) -> None:
+    """Full chain: provider client -> mux entrypoint -> fake ACP server.
+
+    The native session id must be bound to the account that created it, even
+    after the mux affinity table is wiped between turns, and the native
+    session-store GC must stay disabled without the opt-in.  The child
+    environment is the narrowed production allowlist, so the mux resolves its
+    registry/state/log paths from the child HOME defaults exactly as deployed.
+    """
+    script, log_path = _write_fake_server(tmp_path)
+    par = tmp_path / "par.py"
+    par.write_text(
+        "#!/usr/bin/env python3\n"
+        f"import sys\n"
+        f"sys.argv = [{str(script)!r}, {str(log_path)!r}]\n"
+        f"exec(compile(open({str(script)!r}).read(), {str(script)!r}, 'exec'))\n"
+    )
+    par.chmod(0o755)
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_REAL_HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.delenv("ACP_MUX_SESSION_ID", raising=False)
+    monkeypatch.delenv("ACP_MUX_AFFINITY", raising=False)
+    monkeypatch.delenv("ACP_MUX_ACCOUNTS", raising=False)
+    monkeypatch.delenv("ACP_MUX_STATE", raising=False)
+    monkeypatch.delenv("ACP_MUX_LOG", raising=False)
+    monkeypatch.delenv("ACP_MUX_PAR", raising=False)
+
+    accounts = []
+    for name in ("lane-a", "lane-b"):
+        home = tmp_path / name
+        (home / ".gemini" / "antigravity-acp" / "conversations").mkdir(parents=True)
+        accounts.append({"home": str(home), "label": name})
+    registry = tmp_path / ".hermes" / "acp-accounts.json"
+    registry.parent.mkdir(parents=True, exist_ok=True)
+    registry.write_text(json.dumps({"accounts": accounts}))
+    mux_state = tmp_path / ".hermes" / "cache" / "acp-mux-state.json"
+    mux_log = tmp_path / ".hermes" / "logs" / "acp-mux.log"
+
+    client = _load_client(
+        monkeypatch,
+        command=sys.executable,
+        args=[str(PLUGIN_DIR.parent.parent / "scripts" / "antigravity-acp-mux.py")],
+        cwd=str(tmp_path),
+    )
+    client_mod = importlib.import_module("antigravity_acp_fake_e2e.client")
+    monkeypatch.setattr(client_mod, "_read_par_pin", lambda: str(par))
+    tools = [_tool_schema()]
+    first_messages = [{"role": "user", "content": "inspect"}]
+    first = client.chat.completions.create(
+        model="gemini-3.1-pro", messages=first_messages, tools=tools
+    )
+    call = first.choices[0].message.tool_calls[0]
+
+    # Simulate long-running-worker affinity eviction between turns.
+    state = json.loads(mux_state.read_text())
+    assert state["affinities"]
+    state["affinities"] = {}
+    mux_state.write_text(json.dumps(state))
+
+    second_messages = [
+        *first_messages,
+        {
+            "role": "assistant",
+            "content": first.choices[0].message.content,
+            "tool_calls": [{
+                "id": call.id,
+                "type": call.type,
+                "function": {"name": call.function.name,
+                             "arguments": call.function.arguments},
+            }],
+        },
+        {"role": "tool", "tool_call_id": call.id, "name": call.function.name,
+         "content": '{"value":1}'},
+    ]
+    second = client.chat.completions.create(
+        model="gemini-3.1-pro", messages=second_messages, tools=tools
+    )
+    assert second.choices[0].message.content == "done after tool result"
+
+    owners = json.loads(Path(str(mux_state) + ".owners.json").read_text(encoding="utf-8"))
+    assert owners["version"] == 2
+    assert len(owners["owners"]) == 1
+
+    rows = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    resumed = next(row for row in rows if row["method"] == "session/resume")
+    assert resumed["params"]["sessionId"] == "session-1"
+    # The mux deliberately strips ACP_MUX_SESSION_ID/SESSION_GC before
+    # spawning the official server child; routing proof lives in the mux log.
+
+    selection = mux_log.read_text(encoding="utf-8")
+    binds = [line for line in selection.splitlines() if "bound account" in line]
+    assert len(binds) == 2
+    lane_first = binds[0].split("bound account ")[1].split(" ")[0]
+    lane_second = binds[1].split("bound account ")[1].split(" ")[0]
+    assert lane_first == lane_second
+    assert "(session-owner)" in binds[1]
+    assert "native session GC disabled" in selection
+    assert "session-gc expired" not in selection
+    assert "owner-records" in selection

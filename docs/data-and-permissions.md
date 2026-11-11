@@ -87,6 +87,20 @@ under your user account — managed by the vendor, not by this plugin. A resumed
 ACP session may retain media already consumed in its earlier prompt
 (`docs/provider-runtime.md`).
 
+The official server's native session bundles (the `conversations`/`brain`
+stores under each account's `.gemini/antigravity-acp/`) are never deleted
+automatically by the mux: the destructive native session-store GC is opt-in
+(`HERMES_ANTIGRAVITY_ACP_NATIVE_GC=1` in the Hermes home, which sets
+`ACP_MUX_SESSION_GC=1` for the mux child) until the native session lifetime
+contract is finished. The mux's session-ownership ledger (a `.owners.json`
+sidecar next to the mux routing-state file under the shared mux control home:
+hashed session id → hashed account lane, no plaintext ids) is metadata-only:
+an entry is retired only after a grace period
+(`ACP_MUX_OWNER_GRACE_SECONDS`, default 24 h) once both
+the native bundle and any Hermes continuation checkpoint reference are gone;
+any unreadable registry, ledger, checkpoint inventory, or session store keeps
+every entry.
+
 ## 4. Telemetry
 
 - **This plugin sends no telemetry.** Nothing is reported to this repository
