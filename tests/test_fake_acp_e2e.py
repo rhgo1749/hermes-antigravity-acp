@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
+import contextvars
 import importlib.util
+import hashlib
 import json
 import logging
+import os
 import sys
+import threading
 import types
 from pathlib import Path
 
 import pytest
+
+from test_issue2_delegated_child_affinity import install_hermes_session_fakes
 
 PLUGIN_DIR = (
     Path(__file__).resolve().parent.parent / "hermes-plugin" / "antigravity-acp"
@@ -78,6 +84,7 @@ def _write_fake_server(
         f"SESSION_RESULT = {session_result!r}\n"
         + f"SESSION_RESUME_RESULT = {resume_result!r}\n"
         + r'''
+import hashlib
 import json
 import os
 import sys
@@ -96,10 +103,22 @@ def log(payload):
         "affinity_max_entries": os.environ.get("ACP_MUX_AFFINITY_MAX_ENTRIES", ""),
         "mux_session_id": os.environ.get("ACP_MUX_SESSION_ID", ""),
         "mux_session_gc": os.environ.get("ACP_MUX_SESSION_GC", ""),
+        "home": os.environ.get("HOME", ""),
         **payload,
     }
     with open(log_path, "a", encoding="utf-8") as fh:
         fh.write(json.dumps(row) + "\n")
+
+
+def _next_session_id():
+    # The current session/new request is already logged, so the count of
+    # logged session/new rows is this session's ordinal (first = session-1).
+    count = 0
+    with open(log_path, encoding="utf-8") as fh:
+        for line in fh:
+            if '"method": "session/new"' in line:
+                count += 1
+    return f"session-{count}"
 
 def await_permission_response(expected_id):
     line = sys.stdin.readline()
@@ -127,7 +146,7 @@ for line in sys.stdin:
             emit({"jsonrpc": "2.0", "id": msg["id"], "error": SESSION_ERROR})
             continue
         session_result = SESSION_RESULT or {
-            "sessionId": "session-1",
+            "sessionId": _next_session_id(),
             "configOptions": [{
                 "id": "model",
                 "category": "model",
@@ -867,11 +886,13 @@ def test_fake_subprocess_normal_tool_turn_and_native_resume(monkeypatch, tmp_pat
                 "1" if row["method"] == "session/resume" else "0"
             )
             assert row["mux_session_id"] == (
-                "session-1" if row["method"] == "session/resume" else ""
+                "session-3" if row["method"] == "session/resume" else ""
             )
             assert row["mux_session_gc"] == "0"
     resumed = next(row for row in rows if row["method"] == "session/resume")
-    assert resumed["params"]["sessionId"] == "session-1"
+    # Three distinct opening prefixes created session-1/2/3; only the third
+    # ("inspect") gets a second turn, so the resume must carry session-3.
+    assert resumed["params"]["sessionId"] == "session-3"
 
     inspect_prompts = [
         row for row in rows
@@ -1895,3 +1916,199 @@ def test_provider_through_mux_to_fake_server_owner_routing(monkeypatch, tmp_path
     assert "native session GC disabled" in selection
     assert "session-gc expired" not in selection
     assert "owner-records" in selection
+
+
+def test_two_delegated_children_own_distinct_sessions_and_owners(
+    monkeypatch, tmp_path
+) -> None:
+    """Issue #2 + Issue #3 through the full chain, two siblings at once.
+
+    Two delegate_task children of one parent run the SAME prompt concurrently
+    provider -> mux -> fake ACP server.  Each must create its own native
+    session on its own affinity, and after the mux affinity table is wiped,
+    each resume must return to the lane that CREATED that child's session
+    (owner ledger), never the sibling's.  Native GC stays disabled.
+    """
+    script, log_path = _write_fake_server(tmp_path)
+    par = tmp_path / "par.py"
+    par.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        f"sys.argv = [{str(script)!r}, {str(log_path)!r}]\n"
+        f"exec(compile(open({str(script)!r}).read(), {str(script)!r}, 'exec'))\n"
+    )
+    par.chmod(0o755)
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_REAL_HOME", str(tmp_path))
+    # With the session fakes installed the runtime looks "present", so the
+    # active home must be explicit; it points at the same tmp root as HOME.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    for name in (
+        "ACP_MUX_SESSION_ID", "ACP_MUX_AFFINITY", "ACP_MUX_ACCOUNTS",
+        "ACP_MUX_STATE", "ACP_MUX_LOG", "ACP_MUX_PAR",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    lane_homes = {}
+    accounts = []
+    for name in ("lane-a", "lane-b"):
+        home = tmp_path / name
+        (home / ".gemini" / "antigravity-acp" / "conversations").mkdir(parents=True)
+        accounts.append({"home": str(home), "label": name})
+        lane_homes[name] = str(home)
+    registry = tmp_path / ".hermes" / "acp-accounts.json"
+    registry.parent.mkdir(parents=True, exist_ok=True)
+    registry.write_text(json.dumps({"accounts": accounts}))
+    mux_state = tmp_path / ".hermes" / "cache" / "acp-mux-state.json"
+    mux_log = tmp_path / ".hermes" / "logs" / "acp-mux.log"
+
+    client = _load_client(
+        monkeypatch,
+        command=sys.executable,
+        args=[str(PLUGIN_DIR.parent.parent / "scripts" / "antigravity-acp-mux.py")],
+        cwd=str(tmp_path),
+    )
+    client_mod = importlib.import_module("antigravity_acp_fake_e2e.client")
+    monkeypatch.setattr(client_mod, "_read_par_pin", lambda: str(par))
+    # Install AFTER the plugin tree has loaded: the identity helpers import
+    # these modules per call, while import-time obligation checks must stay
+    # on the standalone path this harness uses.
+    fakes = install_hermes_session_fakes(monkeypatch)
+    # The session fakes make the runtime look present, so the HOME policy the
+    # compat layer fail-closes on must resolve inside the tmp root as well.
+    hermes_constants = types.ModuleType("hermes_constants")
+
+    def _resolve_home() -> Path:
+        return Path(os.environ.get("HERMES_HOME") or os.environ["HOME"])
+
+    def _apply_home(env) -> None:
+        env["HERMES_REAL_HOME"] = str(_resolve_home())
+        env["HOME"] = str(_resolve_home())
+
+    hermes_constants.get_hermes_home = _resolve_home
+    hermes_constants.apply_subprocess_home_env = _apply_home
+    monkeypatch.setitem(sys.modules, "hermes_constants", hermes_constants)
+    tools = [_tool_schema()]
+    first_messages = [{"role": "user", "content": "inspect"}]
+
+    completions: dict[str, object] = {}
+    affinities: dict[str, str] = {}
+    errors: list[BaseException] = []
+    barrier = threading.Barrier(2)
+
+    def child_first_turn(child_id: str) -> None:
+        try:
+            with fakes.delegated_child_context(child_id):
+                affinities[child_id] = client_mod._conversation_affinity(
+                    first_messages, str(tmp_path)
+                )
+                barrier.wait()  # genuine concurrent session/new fan-out
+                completions[child_id] = client.chat.completions.create(
+                    model="gemini-3.1-pro", messages=first_messages, tools=tools
+                )
+        except BaseException as exc:  # noqa: BLE001 — re-raised on the main thread
+            errors.append(exc)
+
+    with fakes.bind_parent("parent-row", "parent-route-key"):
+        parent_affinity = client_mod._conversation_affinity(
+            first_messages, str(tmp_path)
+        )
+        threads = [
+            threading.Thread(
+                target=contextvars.copy_context().run,
+                args=(child_first_turn, child_id),
+            )
+            for child_id in ("child-row-a", "child-row-b")
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        if errors:
+            raise errors[0]
+
+        aff_a, aff_b = affinities["child-row-a"], affinities["child-row-b"]
+        assert aff_a and aff_b and aff_a != aff_b != parent_affinity
+
+        state = json.loads(mux_state.read_text())
+        creator_home: dict[str, str] = {}
+        for affinity in (aff_a, aff_b):
+            digest = hashlib.sha256(affinity.encode("utf-8")).hexdigest()
+            entry = state["affinities"].get(digest)
+            assert entry is not None
+            # account_key is the mux lane key "<label>\t<home>".
+            creator_home[affinity] = entry["account_key"].split("\t", 1)[1]
+        assert set(creator_home.values()) <= set(lane_homes.values())
+
+        # Wipe the affinity table exactly like 512-entry LRU eviction would.
+        state["affinities"] = {}
+        mux_state.write_text(json.dumps(state))
+
+        def child_second_turn(child_id: str) -> None:
+            first = completions[child_id]
+            call = first.choices[0].message.tool_calls[0]
+            second_messages = [
+                *first_messages,
+                {
+                    "role": "assistant",
+                    "content": first.choices[0].message.content,
+                    "tool_calls": [{
+                        "id": call.id,
+                        "type": call.type,
+                        "function": {"name": call.function.name,
+                                     "arguments": call.function.arguments},
+                    }],
+                },
+                {"role": "tool", "tool_call_id": call.id,
+                 "name": call.function.name, "content": '{"value":1}'},
+            ]
+            with fakes.delegated_child_context(child_id):
+                client.chat.completions.create(
+                    model="gemini-3.1-pro", messages=second_messages, tools=tools
+                )
+
+        child_second_turn("child-row-a")
+        child_second_turn("child-row-b")
+
+    rows = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    news = [row for row in rows if row["method"] == "session/new"]
+    resumes = [row for row in rows if row["method"] == "session/resume"]
+    assert len(news) == 2 and len(resumes) == 2
+    assert {row["home"] for row in news} <= set(lane_homes.values())
+    # The second turns ran sequentially, so log order maps resume -> child.
+    ordered = (("child-row-a", aff_a), ("child-row-b", aff_b))
+    session_ids = set()
+    for (child_id, affinity), resume_row in zip(ordered, resumes):
+        session_id = resume_row["params"]["sessionId"]
+        session_ids.add(session_id)
+        registry_state = client_mod.conversation_registry.get(affinity)
+        assert registry_state is not None
+        assert registry_state.session_id == session_id, (
+            f"{child_id} resumed a session it never created"
+        )
+        assert resume_row["home"] == creator_home[affinity], (
+            f"{child_id} resume left its creator lane"
+        )
+        label = next(
+            name for name, home in lane_homes.items() if home == resume_row["home"]
+        )
+        lane_key = f"{label}\t{resume_row['home']}"
+        owners = json.loads(
+            Path(str(mux_state) + ".owners.json").read_text(encoding="utf-8")
+        )
+        assert owners["version"] == 2
+        entry = owners["owners"][
+            hashlib.sha256(session_id.encode("utf-8", errors="surrogatepass")).hexdigest()
+        ]
+        assert entry["lane"] == hashlib.sha256(
+            lane_key.encode("utf-8", errors="surrogatepass")
+        ).hexdigest(), f"{child_id} owner ledger points at the wrong lane"
+    assert len(session_ids) == 2, "siblings must not share a native session"
+
+    selection = mux_log.read_text(encoding="utf-8")
+    binds = [line for line in selection.splitlines() if "bound account" in line]
+    assert len(binds) == 4
+    assert all("(session-owner)" in line for line in binds[2:])
+    assert "native session GC disabled" in selection
+    assert "session-gc expired" not in selection

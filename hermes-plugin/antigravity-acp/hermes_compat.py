@@ -154,6 +154,48 @@ def get_runtime_session_env() -> tuple[str, str]:
     return session_id, session_key
 
 
+def get_delegated_child_identity() -> tuple[bool, str]:
+    """Return ``(running_for_delegate_child, scoped_child_session_id)``.
+
+    Hermes Core wraps every delegate_task child execution in
+    ``agent.delegation_context.delegated_child_context(child_session_id)``,
+    which marks the execution and task-locally scopes ``HERMES_SESSION_ID`` to
+    the child's own reserved row id while ``HERMES_SESSION_KEY`` stays the
+    parent's route key.  That scoped id is the only sibling-unique,
+    same-child-stable identity the plugin may key a native ACP continuation on
+    (issue #2).  The in-process ContextVar marker is used deliberately: the
+    subprocess env marker would also fire for a standalone CLI launched from a
+    child's terminal, which is its own foreground session.
+
+    Outside Hermes (or on a Core predating the module) the answer is
+    ``(False, "")`` so standalone use and the declared floor keep the legacy
+    route.  A present-but-broken marker raises: guessing here would silently
+    share one native session between siblings.
+    """
+    try:
+        from agent.delegation_context import is_delegated_child_context
+    except ModuleNotFoundError as exc:
+        if exc.name in {"agent", "agent.delegation_context"}:
+            return False, ""
+        raise
+    try:
+        delegated = bool(is_delegated_child_context())
+    except Exception as exc:
+        raise RuntimeError(
+            "Hermes delegated-child context is unavailable; refusing to guess "
+            "whether this request belongs to a sibling fan-out."
+        ) from exc
+    if not delegated:
+        return False, ""
+    child_id, _session_key = get_runtime_session_env()
+    if child_id and child_id == (os.environ.get("HERMES_SESSION_ID", "") or "").strip():
+        # Core never writes os.environ for a delegated child (it would clobber
+        # the parent's id), so an id equal to the process-level id was never
+        # scoped to this child: provenance is inherited, not the child's own.
+        return True, ""
+    return True, child_id
+
+
 def get_current_write_origin() -> str:
     """Return the Hermes lane; unknown origin is unsafe when a session identity exists."""
     try:

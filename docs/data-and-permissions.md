@@ -101,6 +101,17 @@ the native bundle and any Hermes continuation checkpoint reference are gone;
 any unreadable registry, ledger, checkpoint inventory, or session store keeps
 every entry.
 
+Continuation ownership for `delegate_task` children (issue #2): inside a
+delegated-child execution the plugin keys its native ACP continuation on the
+child's own Core-scoped session id (namespaced `delegated-child` identity),
+never the parent's inherited route key — sibling fan-out children each own a
+distinct native session and resume only their own. A delegated execution whose
+scoped id is missing or provably equal to the process-pinned
+`HERMES_SESSION_ID` (Core never rewrites that env for children, so equality
+proves the id was never scoped) is treated as ambiguous and gets a fresh
+native session with full replay instead of ever resuming a parent's or
+sibling's continuation.
+
 ## 4. Telemetry
 
 - **This plugin sends no telemetry.** Nothing is reported to this repository

@@ -570,7 +570,10 @@ def test_real_upstream_lane_provenance_separates_affinity_and_fails_closed(
         async_delivery=False,
     )
     try:
-        foreground_identity = client._runtime_conversation_identity()
+        foreground_identity, foreground_ambiguous = (
+            client._runtime_conversation_identity()
+        )
+        assert not foreground_ambiguous
         assert foreground_identity == (
             f"lane-conversation\0{skill_provenance.get_current_write_origin()}"
         )
@@ -585,7 +588,10 @@ def test_real_upstream_lane_provenance_separates_affinity_and_fails_closed(
             skill_provenance.BACKGROUND_REVIEW
         )
         try:
-            background_identity = client._runtime_conversation_identity()
+            background_identity, background_ambiguous = (
+                client._runtime_conversation_identity()
+            )
+            assert not background_ambiguous
             background_affinity = client._conversation_affinity(messages, str(tmp_path))
         finally:
             skill_provenance.reset_current_write_origin(origin_token)
@@ -601,6 +607,55 @@ def test_real_upstream_lane_provenance_separates_affinity_and_fails_closed(
             failing.setattr(skill_provenance, "get_current_write_origin", raise_origin)
             with pytest.raises(RuntimeError, match="write-origin lookup failed"):
                 client._runtime_conversation_identity()
+    finally:
+        clear_session_vars(tokens)
+
+
+def test_real_upstream_delegated_children_own_distinct_affinities(
+    monkeypatch, tmp_path
+):
+    """Issue #2 against the REAL Core delegation contract.
+
+    ``agent.delegation_context.delegated_child_context(child_id)`` is how
+    delegate_task wraps every child execution.  Inside it the plugin must key
+    the native ACP continuation on the child's own scoped session id: siblings
+    and the parent get three distinct affinities, one child's later turns keep
+    theirs, and a child context entered without an id (ambiguous provenance)
+    fails closed to the empty affinity instead of resuming an inherited
+    continuation.
+    """
+    from agent.delegation_context import delegated_child_context
+
+    client = _load_client(monkeypatch, tmp_path)
+    monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
+    # A dispatched worker process pins HERMES_SESSION_ID in os.environ to its
+    # own row; Core never overwrites it for children.  That pin is what lets
+    # the plugin recognise an id that was never scoped to the child.
+    monkeypatch.setenv("HERMES_SESSION_ID", "parent-row-id")
+    messages = [{"role": "user", "content": "fan-out goal"}]
+
+    tokens = set_session_vars(
+        session_id="parent-row-id",
+        session_key="parent-route-key",
+        cwd=str(tmp_path),
+        async_delivery=False,
+    )
+    try:
+        parent_affinity = client._conversation_affinity(messages, str(tmp_path))
+
+        def child_affinity(child_id: str | None) -> str:
+            with delegated_child_context(child_id):
+                first = client._conversation_affinity(messages, str(tmp_path))
+                later_turn = client._conversation_affinity(messages, str(tmp_path))
+            assert first == later_turn, "same child must keep its affinity"
+            return first
+
+        child_a = child_affinity("child-row-a")
+        child_b = child_affinity("child-row-b")
+        ambiguous = child_affinity(None)
+
+        assert len({parent_affinity, child_a, child_b}) == 3
+        assert ambiguous == ""
     finally:
         clear_session_vars(tokens)
 

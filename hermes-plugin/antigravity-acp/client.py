@@ -47,6 +47,7 @@ from .hermes_compat import (
     apply_subprocess_home_env,
     build_hermes_subprocess_env,
     get_current_write_origin,
+    get_delegated_child_identity,
     get_file_read_safety,
     get_file_write_safety,
     get_hermes_home,
@@ -1732,8 +1733,10 @@ def _tool_bridge_activity(
     }
 
 
-def _runtime_conversation_identity() -> str:
+def _runtime_conversation_identity() -> tuple[str, bool]:
     """Stable Hermes conversation identity when running inside Hermes.
+
+    Returns ``(identity, ambiguous_delegated_child)``.
 
     ``HERMES_SESSION_KEY`` is the stable gateway conversation identity across
     cached/fresh AIAgent turns. ``HERMES_SESSION_ID`` is a fallback for surfaces
@@ -1742,13 +1745,28 @@ def _runtime_conversation_identity() -> str:
     share the parent's physical conversation but must never share its native ACP
     continuation state. Both imports are optional so the standalone plugin and
     tests remain usable outside Hermes.
+
+    Issue #2: a delegate_task child inherits the parent's route key, so the key
+    cannot identify whose continuation a fan-out request owns.  Inside a
+    delegated-child execution the identity is namespaced onto the child's own
+    Core-scoped session id (sibling-unique, same-child-stable — verified
+    against the deployed Core).  A delegated execution without that id is
+    ambiguous: the caller must not fall back to any inherited identity, so it
+    gets ``(("", True))`` and the affinity layer fails closed to a fresh
+    native session instead of resuming a parent's or sibling's continuation.
     """
     session_id, session_key = get_runtime_session_env()
-    identity = session_key or session_id
+    delegated, child_id = get_delegated_child_identity()
+    if delegated:
+        if not child_id:
+            return "", True
+        identity = f"delegated-child\0{child_id}"
+    else:
+        identity = session_key or session_id
     if not identity:
-        return ""
+        return "", False
     lane = get_current_write_origin()
-    return f"{identity}\0{lane}"
+    return f"{identity}\0{lane}", False
 
 
 def _conversation_affinity(messages: list[dict[str, Any]], cwd: str) -> str:
@@ -1756,11 +1774,17 @@ def _conversation_affinity(messages: list[dict[str, Any]], cwd: str) -> str:
 
     Prefer Hermes' stable gateway session key over prompt bytes and the more
     transiently-bound durable session id: cached and freshly rebuilt AIAgents must
-    resolve to the same native ACP continuation. Outside Hermes, fall back to cwd +
-    the immutable opening user prefix so the standalone client still has deterministic
-    affinity.
+    resolve to the same native ACP continuation.  Delegated children are routed
+    through their child-scoped identity (see :func:`_runtime_conversation_identity`);
+    an ambiguous delegated child returns the empty affinity, which downstream
+    means "no registry, no mux pin, fresh native session with full replay".
+    Outside Hermes, fall back to cwd + the immutable opening user prefix so the
+    standalone client still has deterministic affinity.
     """
-    if runtime_identity := _runtime_conversation_identity():
+    runtime_identity, ambiguous_child = _runtime_conversation_identity()
+    if ambiguous_child:
+        return ""
+    if runtime_identity:
         material = f"hermes-session\0{runtime_identity}"
         return "sha256:" + hashlib.sha256(
             material.encode("utf-8", errors="surrogatepass")
