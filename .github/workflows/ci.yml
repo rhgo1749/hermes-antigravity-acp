@@ -38,8 +38,9 @@ jobs:
         # Credential-free fake-ACP lifecycle for install paths
         # A/B/combined plus the per-platform registry-pin install mechanics
         # behind the README verification tiers (Linux x86_64 carries a bounded
-        # out-of-repo initialize-only canary record; macOS arm64, Windows
-        # x64/arm64, Linux aarch64 are registry-pinned only). The executed
+        # out-of-repo initialize-only canary record; macOS arm64 and Linux
+        # aarch64 are registry-pinned only; Windows x64/arm64 run real
+        # binaries in their own hosted job). The executed
         # real-binary install lifecycle for Linux x86_64 lives in the
         # acp-clean-room job below — this job authenticates nothing and never
         # executes the real Google binary.

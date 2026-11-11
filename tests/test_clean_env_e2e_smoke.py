@@ -993,7 +993,7 @@ def test_offline_install_flow_smoke_for_registry_pinned_unverified_platforms(
     assert verified["version_dir"] == prefix / VERSION
 
 
-def test_readme_declares_canary_and_registry_only_os_tiers():
+def test_readme_declares_executed_and_not_run_os_tiers():
     """The README tier demarcation is itself under test (docs = contract)."""
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     heading = "## OS support and verification tiers"
@@ -1007,10 +1007,19 @@ def test_readme_declares_canary_and_registry_only_os_tiers():
     assert "official-server-1.4.4-clean-room-e2e-2026-11-07.md" in section, (
         "the Linux x86_64 tier must link the executed clean-room evidence record"
     )
-    # Tier 2: every registry-pinned platform must appear as live-unverified.
-    for platform in ("macOS arm64", "Windows x64", "Windows arm64", "Linux aarch64"):
+    # Tier 2 (since the windows-install job runs the real binary on hosted
+    # Windows runners): Windows x64/arm64 must appear as real-binary
+    # hosted-CI executed, explicitly below the clean-room class.
+    assert "Real-binary hosted-CI executed tier" in section
+    for platform in ("Windows x64", "Windows arm64"):
         assert platform in section
-    assert "not live-verified" in section
+    assert "one tier below the dedicated-UID clean-room class" in section, (
+        "the Windows tier must not be presented as clean-room-grade evidence"
+    )
+    # Tier 3: the remaining registry-pinned platforms must appear as NOT RUN.
+    assert "Registry-pinned but NOT RUN tier" in section
+    for platform in ("macOS arm64", "Linux aarch64"):
+        assert platform in section
     # The four evidence classes and the sanctioned NO-GO must be stated.
     for fragment in (
         "auth success",
