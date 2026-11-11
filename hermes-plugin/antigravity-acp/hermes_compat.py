@@ -154,36 +154,49 @@ def get_runtime_session_env() -> tuple[str, str]:
     return session_id, session_key
 
 
-# Hermes marks in-process delegate_task children (and child processes it spawns)
-# with this contextvar/env marker; the name is core's own contract.
-_DELEGATED_CHILD_ENV_MARKER = "HERMES_DELEGATED_CHILD_CONTEXT"
-
-
+# Hermes' in-process delegate_task marker lives in agent.delegation_context.
+# The core's env marker (HERMES_DELEGATED_CHILD_CONTEXT) marks DESCENDANT
+# processes of a child lineage; it does not imply ownership of the same ACP
+# conversation, so this gate deliberately never reads it.
 def is_delegated_child_context() -> bool:
-    """True while executing for a delegate_task child (in-process or marked child process).
+    """True only while executing for an in-process delegate_task child.
 
-    A delegated child intentionally inherits the parent's ``HERMES_SESSION_KEY``
-    contextvar because that key is the async-completion routing address, not a
-    conversation identity.  Callers that derive conversation identity must ask
-    this gate so a child never keys itself with the parent's routing key.
-    Outside Hermes there is no child context; a loaded-but-broken core package
+    This mirrors core's contextvar predicate ``is_delegated_child_context()``
+    and NOT core's ``is_delegated_child_process_context()`` (contextvar OR
+    descendant env marker). A delegated child intentionally inherits the
+    parent's ``HERMES_SESSION_KEY`` contextvar because that key is the
+    async-completion routing address, not a conversation identity; callers that
+    derive conversation identity must ask this gate so a child never keys
+    itself with the parent's routing key.
+
+    A Hermes runtime without the delegation-context module (standalone plugin
+    use, or a core older than the shipped ``>=0.21.6`` floor, which carries
+    the module) reports no child context: standalone has no delegate runtime
+    at all, and pre-module cores keep their pre-issue-#2 keying — documented,
+    not silent. A module that is present but fails to import or evaluate
     fails closed rather than guessing.
     """
     try:
         from agent.delegation_context import is_delegated_child_context as resolve_child
     except ImportError as exc:
-        if "agent" not in sys.modules:
-            return bool(os.environ.get(_DELEGATED_CHILD_ENV_MARKER, "").strip())
+        try:
+            import importlib.util
+
+            spec = importlib.util.find_spec("agent.delegation_context")
+        except Exception:
+            spec = None
+        if spec is None:
+            return False
         raise RuntimeError(
-            "Hermes delegation context is unavailable; refusing to guess whether this "
-            "turn may inherit another conversation's session identity."
+            "Hermes delegation context is present but unimportable; refusing to "
+            "guess whether this turn may inherit another conversation's session identity."
         ) from exc
     try:
         return bool(resolve_child())
     except Exception as exc:
         raise RuntimeError(
-            "Hermes delegation-context lookup failed; refusing to guess whether this "
-            "turn may inherit another conversation's session identity."
+            "Hermes delegation-context lookup failed; refusing to guess whether "
+            "this turn may inherit another conversation's session identity."
         ) from exc
 
 

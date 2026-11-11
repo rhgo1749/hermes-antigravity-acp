@@ -487,14 +487,98 @@ def test_delegated_child_affinity_never_inherits_parent_session_key(monkeypatch)
     child_b = client_module._conversation_affinity(messages, "/tmp/a")
     assert child_b not in {parent, child_a}
 
-    # A child whose durable id is transiently absent must NOT fall back to the
-    # parent's routing key; it degrades to the standalone prompt-prefix path.
+    # A child whose durable id is transiently absent is AMBIGUOUS: no key can
+    # tell it apart from parent or siblings, so it must run stateless (empty
+    # affinity, fresh native session, resume nothing) — never the parent's key
+    # and never a shared prompt-prefix key with a same-prompt sibling.
     values["HERMES_SESSION_ID"] = ""
-    child_no_id = client_module._conversation_affinity(messages, "/tmp/a")
-    assert child_no_id != parent
+    assert client_module._conversation_affinity(messages, "/tmp/a") == ""
     child["value"] = False
     values["HERMES_SESSION_ID"] = "parent-durable-1"
     assert client_module._conversation_affinity(messages, "/tmp/a") == parent
+
+def test_delegated_child_affinity_ignores_foreign_process_env_ids(monkeypatch) -> None:
+    """PR #4 counterexample: os.environ may carry another profile's ids (or none).
+
+    Inside Hermes the gateway ContextVar is the only identity source; a stale or
+    foreign process-env id must never leak into a child's affinity.
+    """
+    _, _, client_module = _load(monkeypatch)
+    gateway = types.ModuleType("gateway")
+    gateway.__path__ = []
+    session_context = types.ModuleType("gateway.session_context")
+    values = {"HERMES_SESSION_ID": "child-a-1", "HERMES_SESSION_KEY": "agent:main:telegram:dm:1:2"}
+    session_context.get_session_env = lambda name, default="": values.get(name, default)
+    tools_pkg = types.ModuleType("tools")
+    tools_pkg.__path__ = []
+    provenance = types.ModuleType("tools.skill_provenance")
+    provenance.get_current_write_origin = lambda: "foreground"
+    agent_pkg = types.ModuleType("agent")
+    agent_pkg.__path__ = []
+    delegation = types.ModuleType("agent.delegation_context")
+    delegation.is_delegated_child_context = lambda: True
+    monkeypatch.setitem(sys.modules, "gateway", gateway)
+    monkeypatch.setitem(sys.modules, "gateway.session_context", session_context)
+    monkeypatch.setitem(sys.modules, "tools", tools_pkg)
+    monkeypatch.setitem(sys.modules, "tools.skill_provenance", provenance)
+    monkeypatch.setitem(sys.modules, "agent", agent_pkg)
+    monkeypatch.setitem(sys.modules, "agent.delegation_context", delegation)
+    # Foreign env ids (another profile) and the parent-key-absent variant must
+    # not change the child's key: ContextVar values are authoritative.
+    monkeypatch.setenv("HERMES_SESSION_ID", "foreign-profile-id")
+    monkeypatch.setenv("HERMES_SESSION_KEY", "foreign:profile:key")
+    messages = [{"role": "user", "content": "task"}]
+    keyed = client_module._conversation_affinity(messages, "/tmp/a")
+    monkeypatch.delenv("HERMES_SESSION_ID")
+    monkeypatch.delenv("HERMES_SESSION_KEY")
+    assert client_module._conversation_affinity(messages, "/tmp/a") == keyed
+    # And the child's key is exactly its own session id + lane, not the key.
+    expected_material = "hermes-session\0child-a-1\0foreground"
+    import hashlib
+
+    assert keyed == "sha256:" + hashlib.sha256(
+        expected_material.encode("utf-8")
+    ).hexdigest()
+
+def test_delegated_child_affinity_is_order_independent(monkeypatch) -> None:
+    """PR #4 counterexample: a child request may be observed before its parent.
+
+    Affinity is a pure function of the current context; no parent turn needs to
+    have been observed first, and observation order must not change any key.
+    """
+    _, _, client_module = _load(monkeypatch)
+    gateway = types.ModuleType("gateway")
+    gateway.__path__ = []
+    session_context = types.ModuleType("gateway.session_context")
+    values = {
+        "HERMES_SESSION_ID": "child-a-1",
+        "HERMES_SESSION_KEY": "agent:main:telegram:dm:1:2",
+    }
+    session_context.get_session_env = lambda name, default="": values.get(name, default)
+    tools_pkg = types.ModuleType("tools")
+    tools_pkg.__path__ = []
+    provenance = types.ModuleType("tools.skill_provenance")
+    provenance.get_current_write_origin = lambda: "foreground"
+    agent_pkg = types.ModuleType("agent")
+    agent_pkg.__path__ = []
+    delegation = types.ModuleType("agent.delegation_context")
+    child = {"value": True}
+    delegation.is_delegated_child_context = lambda: child["value"]
+    monkeypatch.setitem(sys.modules, "gateway", gateway)
+    monkeypatch.setitem(sys.modules, "gateway.session_context", session_context)
+    monkeypatch.setitem(sys.modules, "tools", tools_pkg)
+    monkeypatch.setitem(sys.modules, "tools.skill_provenance", provenance)
+    monkeypatch.setitem(sys.modules, "agent", agent_pkg)
+    monkeypatch.setitem(sys.modules, "agent.delegation_context", delegation)
+    messages = [{"role": "user", "content": "task"}]
+    child_first = client_module._conversation_affinity(messages, "/tmp/a")
+    child["value"] = False
+    values["HERMES_SESSION_ID"] = "parent-durable-1"
+    parent = client_module._conversation_affinity(messages, "/tmp/a")
+    child["value"] = True
+    values["HERMES_SESSION_ID"] = "child-a-1"
+    assert client_module._conversation_affinity(messages, "/tmp/a") == child_first
+    assert child_first != parent
 
 def test_full_replay_isolates_latest_user_request_from_history(monkeypatch) -> None:
     _, _, client_module = _load(monkeypatch)

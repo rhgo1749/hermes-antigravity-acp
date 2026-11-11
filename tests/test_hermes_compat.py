@@ -30,15 +30,42 @@ def _host_tools_package(monkeypatch, subprocess_env):
     monkeypatch.setitem(sys.modules, "tools.environments.local", local_module)
 
 
-def test_delegated_child_gate_is_false_outside_hermes_and_reads_env_marker(monkeypatch):
+def test_delegated_child_gate_is_false_without_core_and_ignores_env_marker(monkeypatch):
+    """Reviewer contract: the descendant env marker is NOT conversation ownership."""
     _, compat = _compat(monkeypatch)
     monkeypatch.delitem(sys.modules, "agent", raising=False)
     monkeypatch.delitem(sys.modules, "agent.delegation_context", raising=False)
     monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
     assert compat.is_delegated_child_context() is False
 
+    # A stale/foreign marker in the environment must not flip the gate: it
+    # marks a descendant process of some child lineage, not this conversation.
     monkeypatch.setenv("HERMES_DELEGATED_CHILD_CONTEXT", "1")
-    assert compat.is_delegated_child_context() is True
+    assert compat.is_delegated_child_context() is False
+
+
+def test_delegated_child_gate_is_false_on_cores_without_the_module(monkeypatch, tmp_path):
+    """A Hermes older than the shipped floor has no delegation_context module."""
+    _, compat = _compat(monkeypatch)
+    agent_pkg = types.ModuleType("agent")
+    agent_pkg.__path__ = [str(tmp_path)]  # real, empty directory: no submodule
+    monkeypatch.setitem(sys.modules, "agent", agent_pkg)
+    monkeypatch.delitem(sys.modules, "agent.delegation_context", raising=False)
+    assert compat.is_delegated_child_context() is False
+
+
+def test_delegated_child_gate_fails_closed_on_present_but_broken_module(monkeypatch, tmp_path):
+    """Module file exists but explodes on import: refuse to guess."""
+    _, compat = _compat(monkeypatch)
+    (tmp_path / "delegation_context.py").write_text(
+        "raise RuntimeError('module body exploded')\n", encoding="utf-8"
+    )
+    agent_pkg = types.ModuleType("agent")
+    agent_pkg.__path__ = [str(tmp_path)]
+    monkeypatch.setitem(sys.modules, "agent", agent_pkg)
+    monkeypatch.delitem(sys.modules, "agent.delegation_context", raising=False)
+    with pytest.raises(RuntimeError, match="module body exploded"):
+        compat.is_delegated_child_context()
 
 
 def test_delegated_child_gate_uses_core_contextvar_and_fails_closed_on_api_loss(monkeypatch):
@@ -59,8 +86,9 @@ def test_delegated_child_gate_uses_core_contextvar_and_fails_closed_on_api_loss(
         compat.is_delegated_child_context()
 
     monkeypatch.delitem(sys.modules, "agent.delegation_context")
-    with pytest.raises(RuntimeError, match="delegation context is unavailable"):
-        compat.is_delegated_child_context()
+    # The fake package has no delegation_context file, so the module is absent
+    # (old-core shape) rather than present-but-broken: the gate reports False.
+    assert compat.is_delegated_child_context() is False
 
 
 def test_home_adapter_prefers_hermes_resolver_and_uses_explicit_home_fallback(

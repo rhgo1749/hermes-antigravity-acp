@@ -1733,7 +1733,7 @@ def _tool_bridge_activity(
     }
 
 
-def _runtime_conversation_identity() -> str:
+def _runtime_conversation_identity() -> str | None:
     """Stable Hermes conversation identity when running inside Hermes.
 
     ``HERMES_SESSION_KEY`` is the stable gateway conversation identity across
@@ -1752,11 +1752,20 @@ def _runtime_conversation_identity() -> str:
     (``agent/delegation_context.py::delegated_child_context``).  Keying a child
     with the parent's routing key makes every sibling and the parent fight over
     one native ACP continuation (issue #2), so a child keys with its own session
-    id and, when it has none, falls back to the standalone path — never the
-    parent's key.
+    id.  A child whose own id is absent is AMBIGUOUS: no key can distinguish it
+    from its parent or siblings, so it returns ``None`` — the caller must run it
+    stateless (empty affinity, fresh native session, resume nothing) rather than
+    degrade to the prompt-prefix path, which two same-prompt siblings would
+    share.
+
+    Return contract: non-empty string = identity; ``""`` = no Hermes runtime
+    identity (standalone fallback path applies); ``None`` = ambiguous delegated
+    child (stateless, never resume).
     """
     session_id, session_key = get_runtime_session_env()
     if is_delegated_child_context():
+        if not session_id:
+            return None
         identity = session_id
     else:
         identity = session_key or session_id
@@ -1773,9 +1782,14 @@ def _conversation_affinity(messages: list[dict[str, Any]], cwd: str) -> str:
     transiently-bound durable session id: cached and freshly rebuilt AIAgents must
     resolve to the same native ACP continuation. Outside Hermes, fall back to cwd +
     the immutable opening user prefix so the standalone client still has deterministic
-    affinity.
+    affinity. An ambiguous delegated child (no own session id) gets the EMPTY
+    affinity: the request runs stateless against a fresh native session and resumes
+    nothing, because no derivable key can tell it apart from its parent or siblings.
     """
-    if runtime_identity := _runtime_conversation_identity():
+    runtime_identity = _runtime_conversation_identity()
+    if runtime_identity is None:
+        return ""
+    if runtime_identity:
         material = f"hermes-session\0{runtime_identity}"
         return "sha256:" + hashlib.sha256(
             material.encode("utf-8", errors="surrogatepass")
