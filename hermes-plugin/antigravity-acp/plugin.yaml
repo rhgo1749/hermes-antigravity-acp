@@ -1,6 +1,6 @@
 name: antigravity-acp-provider
 kind: model-provider
-version: 0.7.8
+version: 0.7.9
 description: Google Antigravity through Google's official ACP server
 author: rhgo1749
 # Compatibility floor proven by CI (catalog-floor-gate job): official Hermes
