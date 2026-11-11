@@ -91,6 +91,45 @@ def test_delegated_child_gate_uses_core_contextvar_and_fails_closed_on_api_loss(
     assert compat.is_delegated_child_context() is False
 
 
+def test_session_lookup_failure_fails_closed_for_children_keeps_env_fallback_otherwise(monkeypatch):
+    """P1: a child must never key affinity from process-global env ids.
+
+    When the Core ContextVar lookup fails mid-child, the os.environ fallback
+    could hand the child the PARENT's ids. Foreground and standalone keep the
+    documented env fallback.
+    """
+    _, compat = _compat(monkeypatch)
+    gateway = types.ModuleType("gateway")
+    gateway.__path__ = []
+    session_context = types.ModuleType("gateway.session_context")
+
+    def broken_get_session_env(name, default=""):
+        raise RuntimeError("context exploded")
+
+    session_context.get_session_env = broken_get_session_env
+    agent_pkg = types.ModuleType("agent")
+    agent_pkg.__path__ = []
+    delegation = types.ModuleType("agent.delegation_context")
+    child = {"value": True}
+    delegation.is_delegated_child_context = lambda: child["value"]
+    monkeypatch.setitem(sys.modules, "gateway", gateway)
+    monkeypatch.setitem(sys.modules, "gateway.session_context", session_context)
+    monkeypatch.setitem(sys.modules, "agent", agent_pkg)
+    monkeypatch.setitem(sys.modules, "agent.delegation_context", delegation)
+    monkeypatch.setenv("HERMES_SESSION_ID", "parent-durable-1")
+    monkeypatch.setenv("HERMES_SESSION_KEY", "agent:main:telegram:dm:1:2")
+
+    with pytest.raises(RuntimeError, match="refusing to key this child"):
+        compat.get_runtime_session_env()
+
+    # Foreground keeps the env fallback (unchanged documented behavior).
+    child["value"] = False
+    assert compat.get_runtime_session_env() == (
+        "parent-durable-1",
+        "agent:main:telegram:dm:1:2",
+    )
+
+
 def test_home_adapter_prefers_hermes_resolver_and_uses_explicit_home_fallback(
     monkeypatch, tmp_path
 ):

@@ -30,6 +30,8 @@ import importlib.util
 import json
 import os
 import sys
+import threading
+import time
 import types
 from pathlib import Path
 
@@ -39,12 +41,16 @@ PLUGIN_DIR = Path(__file__).resolve().parent.parent / "hermes-plugin" / "antigra
 
 try:
     from agent.delegation_context import delegated_child_context
-    from gateway.session_context import clear_session_vars, set_session_vars
+    from gateway.session_context import (
+        clear_session_vars,
+        get_session_env,
+        set_session_vars,
+    )
 
     _CORE_IMPORT_ERROR = None
 except Exception as exc:  # pragma: no cover - environment gate
     delegated_child_context = None
-    clear_session_vars = set_session_vars = None
+    clear_session_vars = set_session_vars = get_session_env = None
     _CORE_IMPORT_ERROR = exc
 
 pytestmark = pytest.mark.skipif(
@@ -96,10 +102,7 @@ def emit(payload):
     sys.stdout.flush()
 
 def log(payload):
-    row = {
-        "affinity": os.environ.get("ACP_MUX_AFFINITY", ""),
-        **payload,
-    }
+    row = {"pid": os.getpid(), **payload}
     with open(log_path, "a", encoding="utf-8") as fh:
         fh.write(json.dumps(row) + "\n")
 
@@ -107,10 +110,12 @@ for line in sys.stdin:
     msg = json.loads(line)
     method = msg.get("method")
     params = msg.get("params") or {}
+    prompt = ((params.get("prompt") or [{}])[0].get("text") or "")[:8000]
     log({
         "id": msg.get("id"),
         "method": method,
         "sessionId": params.get("sessionId", ""),
+        "prompt": prompt,
     })
     if method == "initialize":
         emit({"jsonrpc": "2.0", "id": msg["id"], "result": {}})
@@ -404,9 +409,11 @@ def test_concurrent_same_prompt_siblings_never_share_affinity_or_frontier(
     lane = client_mod.get_current_write_origin()
 
     keyed_ids = ["child-a-1", "child-b-1", "child-c-1"]
-    contexts = {cid: _captured_child_context(cid) for cid in keyed_ids + [""]}
+    parent_key = "agent:main:telegram:dm:1:2"
     identical_prompt = [{"role": "user", "content": "identical sibling task"}]
-    histories: dict[str, list] = {cid: list(identical_prompt) for cid in contexts}
+    histories: dict[str, list] = {
+        cid: list(identical_prompt) for cid in keyed_ids + [""]
+    }
     failures: list[BaseException] = []
 
     def run_turn(cid: str, extra: str | None, actor) -> None:
@@ -420,29 +427,52 @@ def test_concurrent_same_prompt_siblings_never_share_affinity_or_frontier(
         assert isinstance(content, str) and content, cid
         histories[cid] = messages + [{"role": "assistant", "content": content}]
 
-    def guarded(cid: str, extra: str | None, actor) -> None:
+    def guarded(cid: str, extra: str | None, actor, window) -> None:
         try:
+            window.append(time.monotonic())
             run_turn(cid, extra, actor)
+            window.append(time.monotonic())
         except BaseException as exc:  # noqa: BLE001 - surfaced via failures
             failures.append(exc)
 
+    # Bind the PARENT session first; only then snapshot each child context,
+    # so every snapshot provably inherits the parent's session key and binds
+    # its own durable id (the exact inheritance shape issue #2 is about).
     tokens = set_session_vars(
         platform="telegram",
         source="telegram",
         chat_id="1",
-        session_key="agent:main:telegram:dm:1:2",
+        session_key=parent_key,
         session_id="parent-durable-1",
     )
     try:
-        import threading
+        contexts = {cid: _captured_child_context(cid) for cid in keyed_ids + [""]}
+        for cid, ctx in contexts.items():
+            inherited_key, inherited_id = ctx.run(
+                lambda: (
+                    get_session_env("HERMES_SESSION_KEY", ""),
+                    get_session_env("HERMES_SESSION_ID", ""),
+                )
+            )
+            assert inherited_key == parent_key, (cid, inherited_key)
+            assert inherited_id == cid, (cid, inherited_id)
+
+        def assert_phase_overlap(windows: dict) -> None:
+            # Every participant's request window must overlap a common point:
+            # max(start) < min(end). Without this the barrier proved nothing.
+            assert all(len(w) == 2 for w in windows.values()), windows
+            assert max(w[0] for w in windows.values()) < min(
+                w[1] for w in windows.values()
+            ), windows
 
         # Phase 1: all four children enter create() simultaneously with the
         # SAME prompt bytes and cwd; keyed children differ only by durable id.
         barrier = threading.Barrier(len(contexts), timeout=120)
+        windows1: dict[str, list] = {cid: [] for cid in contexts}
 
         def phase1(cid: str) -> None:
             barrier.wait()
-            guarded(cid, None, client)
+            guarded(cid, None, client, windows1[cid])
 
         threads = [
             threading.Thread(target=contexts[cid].run, args=(phase1, cid), name=cid)
@@ -452,13 +482,18 @@ def test_concurrent_same_prompt_siblings_never_share_affinity_or_frontier(
             thread.start()
         for thread in threads:
             thread.join(timeout=180)
+        assert not any(t.is_alive() for t in threads), [t.name for t in threads if t.is_alive()]
         assert not failures, failures
+        assert_phase_overlap(windows1)
 
         # Phase 2: concurrent follow-ups — each conversation must resume only
         # its own session while siblings are mid-request.
+        windows2: dict[str, list] = {cid: [] for cid in contexts}
+        follow_ups = {cid: f"follow-up {cid or 'ambiguous-child'}" for cid in contexts}
+
         def phase2(cid: str) -> None:
             barrier.wait()
-            guarded(cid, f"follow-up {cid}", client)
+            guarded(cid, follow_ups[cid], client, windows2[cid])
 
         threads = [
             threading.Thread(target=contexts[cid].run, args=(phase2, cid), name=cid)
@@ -468,12 +503,14 @@ def test_concurrent_same_prompt_siblings_never_share_affinity_or_frontier(
             thread.start()
         for thread in threads:
             thread.join(timeout=180)
+        assert not any(t.is_alive() for t in threads), [t.name for t in threads if t.is_alive()]
         assert not failures, failures
+        assert_phase_overlap(windows2)
 
         # Phase 3: reverse-order completion with a freshly regenerated client
         # per request — affinity must survive client lifetime entirely.
         for cid in reversed(keyed_ids):
-            contexts[cid].run(guarded, cid, f"late turn {cid}", fresh_client())
+            contexts[cid].run(guarded, cid, f"late turn {cid}", fresh_client(), [])
         assert not failures, failures
     finally:
         clear_session_vars(tokens)
@@ -495,26 +532,71 @@ def test_concurrent_same_prompt_siblings_never_share_affinity_or_frontier(
     # durable id + lane — not the shared parent key, not the identical prompt.
     import hashlib
 
-    expected_affinities = {
-        "sha256:"
-        + hashlib.sha256(
-            f"hermes-session\0{cid}\0{lane}".encode("utf-8", errors="surrogatepass")
-        ).hexdigest()
-        for cid in keyed_ids
-    }
-    assert set(states) == expected_affinities, set(states)
+    def affinity_of(cid: str) -> str:
+        return (
+            "sha256:"
+            + hashlib.sha256(
+                f"hermes-session\0{cid}\0{lane}".encode("utf-8", errors="surrogatepass")
+            ).hexdigest()
+        )
 
-    keyed_sessions = {entry["session_id"] for entry in states.values()}
+    assert set(states) == {affinity_of(cid) for cid in keyed_ids}, set(states)
+    # The recorded (affinity -> native session) ledger per child.
+    expected_session = {cid: states[affinity_of(cid)]["session_id"] for cid in keyed_ids}
+    keyed_sessions = set(expected_session.values())
     assert len(keyed_sessions) == 3, keyed_sessions
 
     # Ambiguous child: two stateless turns, two fresh sessions, zero state.
     unkeyed = [sid for sid in created if sid not in keyed_sessions]
     assert len(unkeyed) == 2, unkeyed
 
-    # Resume ledger: 3 keyed conversations x 2 follow-up phases = 6 resumes,
-    # every one targeting its own keyed session; the ambiguous child's fresh
-    # sessions were never resumed, and no frontier was ever overwritten by a
-    # sibling (each keyed session id is stable across all three phases).
-    assert len(resumed) == 6, resumed
-    assert set(resumed) == keyed_sessions, (resumed, keyed_sessions)
+    # Per-request attribution: within one server process the request stream is
+    # strictly (new|resume) -> prompt. Pair each prompt with the transport that
+    # preceded it in the same pid, identify the issuing child from the prompt
+    # marker, and assert the transport was the child's OWN session. A sibling
+    # swap (A resumes B's session) is detected here, not by set equality.
+    last_transport: dict[int, tuple[str, str]] = {}
+    attributed_resumes: list[tuple[str, str]] = []
+    ambiguous_transports: list[str] = []
+    for row in rows:
+        pid = row["pid"]
+        if row["method"] in ("session/new", "session/resume"):
+            last_transport[pid] = (row["method"], row["sessionId"])
+            continue
+        if row["method"] != "session/prompt":
+            continue
+        prompt = row.get("prompt", "")
+        issuer = next(
+            (
+                cid
+                for cid in keyed_ids
+                if f"follow-up {cid}" in prompt or f"late turn {cid}" in prompt
+            ),
+            None,
+        )
+        transport = last_transport.get(pid)
+        if "follow-up ambiguous-child" in prompt:
+            ambiguous_transports.append(transport[0] if transport else "missing")
+            continue
+        if issuer is None:
+            # Phase-1 identical-prompt turns (and the ambiguous child's first
+            # turn): keyed conversations only ever bootstrap here; the
+            # transport must be a fresh session/new.
+            assert "identical sibling task" in prompt, prompt[:80]
+            assert transport is not None and transport[0] == "session/new", transport
+            continue
+        assert transport is not None, prompt[:80]
+        kind, session_id = transport
+        assert kind == "session/resume", (issuer, transport)
+        assert session_id == expected_session[issuer], (issuer, transport)
+        attributed_resumes.append((issuer, session_id))
+
+    assert len(attributed_resumes) == 6, attributed_resumes
+    assert sorted(issuer for issuer, _ in attributed_resumes) == sorted(
+        [cid for cid in keyed_ids for _ in range(2)]
+    )
+    # The ambiguous child's marker-bearing (phase-2) prompt was served by a
+    # fresh session; its phase-1 prompt is the identical-prompt bootstrap
+    # already covered by the issuer-None branch above.
+    assert ambiguous_transports == ["session/new"], ambiguous_transports
     assert not set(resumed) & set(unkeyed)

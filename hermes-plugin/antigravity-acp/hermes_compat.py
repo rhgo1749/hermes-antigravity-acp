@@ -142,13 +142,26 @@ def windows_hide_flags() -> int:
 
 
 def get_runtime_session_env() -> tuple[str, str]:
-    """Return gateway session identifiers, falling back to explicit process env."""
+    """Return gateway session identifiers, falling back to explicit process env.
+
+    The os.environ fallback is process-global and may carry a parent's or
+    another profile's ids. That is acceptable for foreground/standalone
+    surfaces where the ContextVar path is genuinely unavailable. It is NOT
+    acceptable for a delegated child (issue #2): a child whose Core lookup
+    fails must fail closed rather than silently key its affinity with an
+    inherited environment id.
+    """
     try:
         from gateway.session_context import get_session_env
 
         session_id = str(get_session_env("HERMES_SESSION_ID", "") or "").strip()
         session_key = str(get_session_env("HERMES_SESSION_KEY", "") or "").strip()
     except Exception:
+        if is_delegated_child_context():
+            raise RuntimeError(
+                "Hermes session lookup failed during delegated child execution; "
+                "refusing to key this child from process-global environment ids."
+            )
         session_id = str(os.environ.get("HERMES_SESSION_ID", "") or "").strip()
         session_key = str(os.environ.get("HERMES_SESSION_KEY", "") or "").strip()
     return session_id, session_key
