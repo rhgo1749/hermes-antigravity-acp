@@ -30,6 +30,106 @@ def _host_tools_package(monkeypatch, subprocess_env):
     monkeypatch.setitem(sys.modules, "tools.environments.local", local_module)
 
 
+def test_delegated_child_gate_is_false_without_core_and_ignores_env_marker(monkeypatch):
+    """Reviewer contract: the descendant env marker is NOT conversation ownership."""
+    _, compat = _compat(monkeypatch)
+    monkeypatch.delitem(sys.modules, "agent", raising=False)
+    monkeypatch.delitem(sys.modules, "agent.delegation_context", raising=False)
+    monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
+    assert compat.is_delegated_child_context() is False
+
+    # A stale/foreign marker in the environment must not flip the gate: it
+    # marks a descendant process of some child lineage, not this conversation.
+    monkeypatch.setenv("HERMES_DELEGATED_CHILD_CONTEXT", "1")
+    assert compat.is_delegated_child_context() is False
+
+
+def test_delegated_child_gate_is_false_on_cores_without_the_module(monkeypatch, tmp_path):
+    """A Hermes older than the shipped floor has no delegation_context module."""
+    _, compat = _compat(monkeypatch)
+    agent_pkg = types.ModuleType("agent")
+    agent_pkg.__path__ = [str(tmp_path)]  # real, empty directory: no submodule
+    monkeypatch.setitem(sys.modules, "agent", agent_pkg)
+    monkeypatch.delitem(sys.modules, "agent.delegation_context", raising=False)
+    assert compat.is_delegated_child_context() is False
+
+
+def test_delegated_child_gate_fails_closed_on_present_but_broken_module(monkeypatch, tmp_path):
+    """Module file exists but explodes on import: refuse to guess."""
+    _, compat = _compat(monkeypatch)
+    (tmp_path / "delegation_context.py").write_text(
+        "raise RuntimeError('module body exploded')\n", encoding="utf-8"
+    )
+    agent_pkg = types.ModuleType("agent")
+    agent_pkg.__path__ = [str(tmp_path)]
+    monkeypatch.setitem(sys.modules, "agent", agent_pkg)
+    monkeypatch.delitem(sys.modules, "agent.delegation_context", raising=False)
+    with pytest.raises(RuntimeError, match="module body exploded"):
+        compat.is_delegated_child_context()
+
+
+def test_delegated_child_gate_uses_core_contextvar_and_fails_closed_on_api_loss(monkeypatch):
+    _, compat = _compat(monkeypatch)
+    agent_pkg = types.ModuleType("agent")
+    agent_pkg.__path__ = []
+    delegation = types.ModuleType("agent.delegation_context")
+    delegation.is_delegated_child_context = lambda: True
+    monkeypatch.setitem(sys.modules, "agent", agent_pkg)
+    monkeypatch.setitem(sys.modules, "agent.delegation_context", delegation)
+    assert compat.is_delegated_child_context() is True
+
+    def broken():
+        raise RuntimeError("core context lookup exploded")
+
+    delegation.is_delegated_child_context = broken
+    with pytest.raises(RuntimeError, match="delegation-context lookup failed"):
+        compat.is_delegated_child_context()
+
+    monkeypatch.delitem(sys.modules, "agent.delegation_context")
+    # The fake package has no delegation_context file, so the module is absent
+    # (old-core shape) rather than present-but-broken: the gate reports False.
+    assert compat.is_delegated_child_context() is False
+
+
+def test_session_lookup_failure_fails_closed_for_children_keeps_env_fallback_otherwise(monkeypatch):
+    """P1: a child must never key affinity from process-global env ids.
+
+    When the Core ContextVar lookup fails mid-child, the os.environ fallback
+    could hand the child the PARENT's ids. Foreground and standalone keep the
+    documented env fallback.
+    """
+    _, compat = _compat(monkeypatch)
+    gateway = types.ModuleType("gateway")
+    gateway.__path__ = []
+    session_context = types.ModuleType("gateway.session_context")
+
+    def broken_get_session_env(name, default=""):
+        raise RuntimeError("context exploded")
+
+    session_context.get_session_env = broken_get_session_env
+    agent_pkg = types.ModuleType("agent")
+    agent_pkg.__path__ = []
+    delegation = types.ModuleType("agent.delegation_context")
+    child = {"value": True}
+    delegation.is_delegated_child_context = lambda: child["value"]
+    monkeypatch.setitem(sys.modules, "gateway", gateway)
+    monkeypatch.setitem(sys.modules, "gateway.session_context", session_context)
+    monkeypatch.setitem(sys.modules, "agent", agent_pkg)
+    monkeypatch.setitem(sys.modules, "agent.delegation_context", delegation)
+    monkeypatch.setenv("HERMES_SESSION_ID", "parent-durable-1")
+    monkeypatch.setenv("HERMES_SESSION_KEY", "agent:main:telegram:dm:1:2")
+
+    with pytest.raises(RuntimeError, match="refusing to key this child"):
+        compat.get_runtime_session_env()
+
+    # Foreground keeps the env fallback (unchanged documented behavior).
+    child["value"] = False
+    assert compat.get_runtime_session_env() == (
+        "parent-durable-1",
+        "agent:main:telegram:dm:1:2",
+    )
+
+
 def test_home_adapter_prefers_hermes_resolver_and_uses_explicit_home_fallback(
     monkeypatch, tmp_path
 ):

@@ -359,6 +359,7 @@ jobs:
           upstream-hermes/.venv/bin/python -m pytest -q
           tests/test_vanilla_hermes_seam.py
           tests/test_upstream_hermes_runtime_contracts.py
+          tests/test_upstream_delegate_affinity_e2e.py
       - name: Confirm Hermes Core source remained unmodified
         run: |
           git -C upstream-hermes diff --exit-code
@@ -437,6 +438,7 @@ jobs:
           upstream-hermes/.venv/bin/python -m pytest -q
           tests/test_vanilla_hermes_seam.py
           tests/test_upstream_hermes_runtime_contracts.py
+          tests/test_upstream_delegate_affinity_e2e.py
       - name: Confirm Hermes Core source remained unmodified
         run: |
           git -C upstream-hermes diff --exit-code
