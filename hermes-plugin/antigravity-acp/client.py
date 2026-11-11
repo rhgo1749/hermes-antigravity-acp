@@ -54,6 +54,7 @@ from .hermes_compat import (
     get_nt_namespace_error,
     get_runtime_session_env,
     hermes_runtime_present,
+    is_delegated_child_context,
     resolve_agent_cwd,
     windows_hide_flags,
 )
@@ -1742,9 +1743,23 @@ def _runtime_conversation_identity() -> str:
     share the parent's physical conversation but must never share its native ACP
     continuation state. Both imports are optional so the standalone plugin and
     tests remain usable outside Hermes.
+
+    A delegate_task child is the one case where the session key is NOT the
+    conversation identity: core deliberately propagates the parent's key into the
+    child because it is the async-completion routing address
+    (``tools/delegate_tool_dispatch.py::_resolve_async_session_key``), while the
+    child's own durable session id is bound task-locally around its run
+    (``agent/delegation_context.py::delegated_child_context``).  Keying a child
+    with the parent's routing key makes every sibling and the parent fight over
+    one native ACP continuation (issue #2), so a child keys with its own session
+    id and, when it has none, falls back to the standalone path — never the
+    parent's key.
     """
     session_id, session_key = get_runtime_session_env()
-    identity = session_key or session_id
+    if is_delegated_child_context():
+        identity = session_id
+    else:
+        identity = session_key or session_id
     if not identity:
         return ""
     lane = get_current_write_origin()

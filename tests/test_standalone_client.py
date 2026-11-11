@@ -440,6 +440,62 @@ def test_affinity_prefers_stable_gateway_key_and_separates_fork_lanes(monkeypatc
     )
     assert new_conversation != first
 
+def test_delegated_child_affinity_never_inherits_parent_session_key(monkeypatch) -> None:
+    """Issue #2: delegate_task children inherit the parent's routing key by core
+    design; affinity must key each child with its own session id instead."""
+    _, _, client_module = _load(monkeypatch)
+    gateway = types.ModuleType("gateway")
+    gateway.__path__ = []
+    session_context = types.ModuleType("gateway.session_context")
+    values = {
+        "HERMES_SESSION_ID": "parent-durable-1",
+        "HERMES_SESSION_KEY": "agent:main:telegram:dm:1:2",
+    }
+    session_context.get_session_env = lambda name, default="": values.get(name, default)
+    tools_pkg = types.ModuleType("tools")
+    tools_pkg.__path__ = []
+    provenance = types.ModuleType("tools.skill_provenance")
+    provenance.get_current_write_origin = lambda: "foreground"
+    agent_pkg = types.ModuleType("agent")
+    agent_pkg.__path__ = []
+    delegation = types.ModuleType("agent.delegation_context")
+    child = {"value": False}
+    delegation.is_delegated_child_context = lambda: child["value"]
+    monkeypatch.setitem(sys.modules, "gateway", gateway)
+    monkeypatch.setitem(sys.modules, "gateway.session_context", session_context)
+    monkeypatch.setitem(sys.modules, "tools", tools_pkg)
+    monkeypatch.setitem(sys.modules, "tools.skill_provenance", provenance)
+    monkeypatch.setitem(sys.modules, "agent", agent_pkg)
+    monkeypatch.setitem(sys.modules, "agent.delegation_context", delegation)
+
+    messages = [{"role": "system", "content": "sys"}, {"role": "user", "content": "task"}]
+    parent = client_module._conversation_affinity(messages, "/tmp/a")
+
+    # Child A runs with the parent's contextvars (key inherited) plus its own id.
+    child["value"] = True
+    values["HERMES_SESSION_ID"] = "child-a-1"
+    child_a = client_module._conversation_affinity(messages, "/tmp/a")
+    assert child_a != parent
+
+    # The same child across its own turns keeps one affinity.
+    assert client_module._conversation_affinity(
+        messages + [{"role": "assistant", "content": "done"}], "/tmp/a"
+    ) == child_a
+
+    # A sibling child spawned from the same parent gets a distinct affinity.
+    values["HERMES_SESSION_ID"] = "child-b-1"
+    child_b = client_module._conversation_affinity(messages, "/tmp/a")
+    assert child_b not in {parent, child_a}
+
+    # A child whose durable id is transiently absent must NOT fall back to the
+    # parent's routing key; it degrades to the standalone prompt-prefix path.
+    values["HERMES_SESSION_ID"] = ""
+    child_no_id = client_module._conversation_affinity(messages, "/tmp/a")
+    assert child_no_id != parent
+    child["value"] = False
+    values["HERMES_SESSION_ID"] = "parent-durable-1"
+    assert client_module._conversation_affinity(messages, "/tmp/a") == parent
+
 def test_full_replay_isolates_latest_user_request_from_history(monkeypatch) -> None:
     _, _, client_module = _load(monkeypatch)
     messages = [

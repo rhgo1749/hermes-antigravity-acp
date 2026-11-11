@@ -30,6 +30,39 @@ def _host_tools_package(monkeypatch, subprocess_env):
     monkeypatch.setitem(sys.modules, "tools.environments.local", local_module)
 
 
+def test_delegated_child_gate_is_false_outside_hermes_and_reads_env_marker(monkeypatch):
+    _, compat = _compat(monkeypatch)
+    monkeypatch.delitem(sys.modules, "agent", raising=False)
+    monkeypatch.delitem(sys.modules, "agent.delegation_context", raising=False)
+    monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
+    assert compat.is_delegated_child_context() is False
+
+    monkeypatch.setenv("HERMES_DELEGATED_CHILD_CONTEXT", "1")
+    assert compat.is_delegated_child_context() is True
+
+
+def test_delegated_child_gate_uses_core_contextvar_and_fails_closed_on_api_loss(monkeypatch):
+    _, compat = _compat(monkeypatch)
+    agent_pkg = types.ModuleType("agent")
+    agent_pkg.__path__ = []
+    delegation = types.ModuleType("agent.delegation_context")
+    delegation.is_delegated_child_context = lambda: True
+    monkeypatch.setitem(sys.modules, "agent", agent_pkg)
+    monkeypatch.setitem(sys.modules, "agent.delegation_context", delegation)
+    assert compat.is_delegated_child_context() is True
+
+    def broken():
+        raise RuntimeError("core context lookup exploded")
+
+    delegation.is_delegated_child_context = broken
+    with pytest.raises(RuntimeError, match="delegation-context lookup failed"):
+        compat.is_delegated_child_context()
+
+    monkeypatch.delitem(sys.modules, "agent.delegation_context")
+    with pytest.raises(RuntimeError, match="delegation context is unavailable"):
+        compat.is_delegated_child_context()
+
+
 def test_home_adapter_prefers_hermes_resolver_and_uses_explicit_home_fallback(
     monkeypatch, tmp_path
 ):
