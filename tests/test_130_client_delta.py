@@ -75,6 +75,20 @@ import sys
 mode = MODE
 counter = COUNTER
 spawn_index = 0
+
+def read_last():
+    # last_reported_used is NATIVE-SESSION state on the official server:
+    # it survives stdio reconnects and resumes, so the fake persists it in a
+    # file rather than a process global.
+    try:
+        with open(LASTFILE, encoding="utf-8") as fh:
+            return int(fh.read().strip())
+    except (OSError, ValueError):
+        return None
+
+def write_last(value):
+    with open(LASTFILE, "w", encoding="utf-8") as fh:
+        fh.write(str(value))
 if counter:
     with open(counter, "a", encoding="utf-8") as fh:
         fh.write("spawn\n")
@@ -83,6 +97,10 @@ if counter:
 def emit(payload):
     sys.stdout.write(json.dumps(payload) + "\n")
     sys.stdout.flush()
+
+def usage_frame(used):
+    emit({"jsonrpc": "2.0", "method": "session/update", "params": {"update": {
+        "sessionUpdate": "usage_update", "used": used, "size": 1048576}}})
 
 def text_update(text):
     emit({"jsonrpc": "2.0", "method": "session/update", "params": {"update": {
@@ -93,11 +111,48 @@ for line in sys.stdin:
     msg = json.loads(line)
     method, rid = msg.get("method"), msg.get("id")
     if method == "initialize":
-        emit({"jsonrpc": "2.0", "id": rid, "result": {"protocolVersion": 1}})
+        result = {"protocolVersion": 1}
+        if mode.endswith("-verified"):
+            # The observed official 1.4.x identity triple (issue #6 AC4-3 pin).
+            result["agentInfo"] = {
+                "name": "antigravity-acp",
+                "title": "Google Antigravity",
+                "version": "1.4.0",
+            }
+        emit({"jsonrpc": "2.0", "id": rid, "result": result})
     elif method == "session/new":
+        if mode == "usage-sequence-verified":
+            # Official server new-session placeholder: used=0, no consumption.
+            write_last(0)
+            usage_frame(0)
         emit({"jsonrpc": "2.0", "id": rid, "result": {"sessionId": "s-1"}})
+    elif method == "session/resume":
+        if mode == "usage-sequence-verified":
+            # Protocol-level simulation of a nonzero re-report arriving
+            # OUTSIDE any prompt window (the official server's
+            # _apply_session_model re-report shape, or a late-drained
+            # trailing frame).  The adapter must never count it.
+            re_report = read_last()
+            if re_report is not None:
+                usage_frame(re_report)
+        emit({"jsonrpc": "2.0", "id": rid, "result": {
+            "sessionId": (msg.get("params") or {}).get("sessionId") or "s-1"}})
+    elif method in ("session/set_model", "session/set_config_option"):
+        if mode == "usage-sequence-verified":
+            re_report = read_last()
+            if re_report is not None:
+                # Official _apply_session_model re-emits last_reported_used
+                # with zero actual consumption, outside any prompt turn
+                # (issue #6 AC4-2).
+                usage_frame(re_report)
+        emit({"jsonrpc": "2.0", "id": rid, "result": {}})
     elif method == "session/prompt":
-        if mode == "usage-update":
+        if mode == "usage-sequence-verified":
+            write_last(500)
+            usage_frame(500)
+            text_update("ok-seq")
+            emit({"jsonrpc": "2.0", "id": rid, "result": {"stopReason": "end_turn"}})
+        elif mode in ("usage-update", "usage-update-verified"):
             # 1.3.0 _maybe_send_usage_update: token counters around the reply.
             for used in (100, 250, 300):
                 emit({"jsonrpc": "2.0", "method": "session/update", "params": {"update": {
@@ -145,6 +200,7 @@ def _fake_server(tmp_path: Path, mode: str, spawn_count: Path | None = None) -> 
     header = (
         f"MODE = {mode!r}\n"
         f"COUNTER = {str(spawn_count) if spawn_count is not None else ''!r}\n"
+        f"LASTFILE = {str(tmp_path / 'last_used.txt')!r}\n"
     )
     script.write_text(header + FAKE, encoding="utf-8")
     return [str(script)]
@@ -176,19 +232,20 @@ def test_usage_update_is_non_billing_context_occupancy(monkeypatch, tmp_path, no
     else:
         content = reply.choices[0].message.content
         usage = reply.usage
-    # v0.7.4: completion.usage carries the server-reported consumption proxy.
-    # Valid frames here are 100+250+300 (the trailing -1/True frames are
-    # rejected whole): prompt = latest call, completion = earlier calls.
-    assert usage is not None
-    assert usage.prompt_tokens == 300
-    assert usage.completion_tokens == 350
-    assert usage.total_tokens == 650
+    # Issue #6 AC4-1/AC4-3: this fake self-reports no `agentInfo`, so the
+    # server's consumption semantics are UNVERIFIED.  Frames are never
+    # accumulated, never synthesized into completion.usage, and never priced:
+    # usage stays None (Core's designed usage-less path) and the only
+    # surviving signal is the ungated latest-valid occupancy reading.
+    assert usage is None
     assert content == "ok-130"
     assert "usage" not in content and "1048576" not in content
     telemetry = reply.antigravity_usage_telemetry
     assert telemetry["schema_id"] == "antigravity-acp-usage-v1"
     assert telemetry["status"] == "unavailable"
     assert telemetry["provider"] == "antigravity-acp"
+    assert telemetry["server_consumption_semantics"] == "unverified"
+    assert telemetry["turn_consumption"] is None
     assert telemetry["request_usage"] == {
         "input_tokens": None,
         "output_tokens": None,
@@ -198,20 +255,110 @@ def test_usage_update_is_non_billing_context_occupancy(monkeypatch, tmp_path, no
     }
     assert telemetry["context_occupancy"] == {
         "source": "acp.session/update:usage_update",
-        "scope": "per_model_call_consumption_delta",
+        "scope": "unverified_server_semantics",
         "is_billing_usage": False,
         "used": 300,
         "size": 1048576,
     }
+    store_payload = json.loads((tmp_path / "acp-state.json").read_text(encoding="utf-8"))
+    assert "usage_totals" not in store_payload
+    assert store_payload["usage_drop_counters"]["dropped_semantics_unverified"] == 3
     assert telemetry["native_session_id_hash"].startswith("sha256:")
     assert telemetry["turn_id_hash"].startswith("sha256:")
     assert "s-1" not in json.dumps(telemetry)
+
+
+def test_verified_identity_accumulates_consumption_without_synthetic_split(
+    monkeypatch, tmp_path, no_slash_env
+) -> None:
+    """Issue #6 AC4-1/AC4-3: a source-verified identity accumulates observed
+    consumption sums, but completion.usage stays None without the server's own
+    per-turn breakdown — the fabricated prompt/completion split is gone."""
+    client = _load_client(
+        monkeypatch, args=_fake_server(tmp_path, "usage-update-verified"), cwd=str(tmp_path)
+    )
+    client_module = sys.modules["antigravity_acp_130.client"]
+    monkeypatch.setattr(
+        client_module, "get_runtime_session_env",
+        lambda: ("hermes-session-verified", ""),
+    )
+    reply = client.chat.completions.create(
+        model="antigravity-acp", messages=[{"role": "user", "content": "hi"}],
+        timeout=10, stream=False,
+    )
+    assert reply.usage is None  # no session/prompt result usage in this fake
+    assert reply.choices[0].message.content == "ok-130"
+    telemetry = reply.antigravity_usage_telemetry
+    assert telemetry["server_consumption_semantics"] == "verified"
+    assert telemetry["turn_consumption"] == {
+        "source": "acp.session/update:usage_update",
+        "scope": "per_model_call_consumption_delta",
+        "is_billing_usage": False,
+        "semantics": "verified",
+        "model_calls_observed": 3,
+        "total_tokens": 650,
+    }
     store_payload = json.loads((tmp_path / "acp-state.json").read_text(encoding="utf-8"))
-    usage_totals = store_payload["usage_totals"]
-    assert set(usage_totals) == {"hermes-session-130"}
-    assert usage_totals["hermes-session-130"]["summed_tokens"] == 650
-    assert usage_totals["hermes-session-130"]["frames_observed"] == 3
-    assert "s-1" not in json.dumps(usage_totals)
+    entry = store_payload["usage_totals"]["hermes-session-verified"]
+    assert entry["summed_tokens"] == 650
+    assert entry["frames_observed"] == 3
+    assert "s-1" not in json.dumps(entry)
+
+
+def test_verified_session_sequence_counts_only_real_consumption(
+    monkeypatch, tmp_path, no_slash_env
+) -> None:
+    """Issue #6 review: full lifecycle on a verified fake server.
+
+    new-session used=0 -> set_model re-report 0 -> real 500 -> resume with a
+    nonzero re-report of 500 arriving outside any prompt window -> real 500.
+    The durable total must be exactly 1000: the two zero placeholders land in
+    dropped_zero, the nonzero re-report in dropped_outside_prompt_turn, and
+    both real calls accumulate.
+    """
+    client = _load_client(
+        monkeypatch,
+        args=_fake_server(tmp_path, "usage-sequence-verified"),
+        cwd=str(tmp_path),
+    )
+    client_module = sys.modules["antigravity_acp_130.client"]
+    monkeypatch.setattr(
+        client_module, "get_runtime_session_env",
+        lambda: ("hermes-session-seq", ""),
+    )
+    first = client.chat.completions.create(
+        model="model-a", messages=[{"role": "user", "content": "hi"}], timeout=10,
+    )
+    assert first.choices[0].message.content == "ok-seq"
+    # Same conversation AND same model: the adapter resumes the native
+    # session (a model change would deliberately rotate to a fresh session).
+    # The resume response carries the simulated out-of-window re-report.
+    second = client.chat.completions.create(
+        model="model-a",
+        messages=[
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "ok-seq"},
+            {"role": "user", "content": "again"},
+        ],
+        timeout=10,
+    )
+    assert second.choices[0].message.content == "ok-seq"
+
+    store_payload = json.loads((tmp_path / "acp-state.json").read_text(encoding="utf-8"))
+    entry = store_payload["usage_totals"]["hermes-session-seq"]
+    assert entry["summed_tokens"] == 1000
+    assert entry["frames_observed"] == 2
+    counters = store_payload["usage_drop_counters"]
+    assert counters == {
+        "frames_seen": 5,
+        "dropped_zero": 2,
+        "dropped_outside_prompt_turn": 1,
+    }
+    assert counters.get("dropped_semantics_unverified", 0) == 0
+    # Per-turn telemetry stays honest too: the second turn observed exactly
+    # one real call (500), not the re-report.
+    assert second.antigravity_usage_telemetry["turn_consumption"]["total_tokens"] == 500
+    assert second.antigravity_usage_telemetry["turn_consumption"]["model_calls_observed"] == 1
 
 
 @pytest.mark.parametrize("stream", [False, True])

@@ -832,17 +832,17 @@ def test_fake_subprocess_normal_tool_turn_and_native_resume(monkeypatch, tmp_pat
         tools=tools,
     )
     assert second.choices[0].message.content == "done after tool result"
-    # v0.7.4: this turn observed usage_update frames (11840+12000);
-    # completion.usage carries the consumption proxy — latest call as
-    # prompt_tokens, earlier same-turn calls as completion_tokens.
-    assert second.usage is not None
-    assert second.usage.prompt_tokens == 12000
-    assert second.usage.completion_tokens == 11840
-    assert second.usage.total_tokens == 23840
+    # Issue #6 AC4-1/AC4-3: this fake self-reports no `agentInfo`, so its
+    # consumption semantics are unverified — frames are never accumulated and
+    # never synthesized into completion.usage.  The occupancy reading stays
+    # available as non-billing telemetry only.
+    assert second.usage is None
     assert second.antigravity_usage_telemetry["request_usage"] == first.antigravity_usage_telemetry["request_usage"]
+    assert second.antigravity_usage_telemetry["server_consumption_semantics"] == "unverified"
+    assert second.antigravity_usage_telemetry["turn_consumption"] is None
     assert second.antigravity_usage_telemetry["context_occupancy"] == {
         "source": "acp.session/update:usage_update",
-        "scope": "per_model_call_consumption_delta",
+        "scope": "unverified_server_semantics",
         "is_billing_usage": False,
         "used": 12000,
         "size": 1048576,

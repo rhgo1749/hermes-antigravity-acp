@@ -47,6 +47,10 @@ _USAGE_FRAME_COUNTER_KEYS = (
     "dropped_invalid",
     "dropped_no_session_identity",
     "dropped_no_native_session",
+    # Issue #6 gates: each is an explicit, non-silent drop reason.
+    "dropped_semantics_unverified",
+    "dropped_outside_prompt_turn",
+    "dropped_zero",
 )
 
 
