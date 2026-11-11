@@ -285,14 +285,14 @@ def test_failover_replay_still_recovers_without_tool_activity(monkeypatch, tmp_p
     assert reply.choices[0].message.content == "recovered"
     assert counter.read_text(encoding="utf-8").count("spawn") == 2
     telemetry = reply.antigravity_usage_telemetry
-    # v0.7.4: the successful attempt reported one usage_update frame (used=30);
-    # the failed first attempt's frame (900000) is not merged into the surfaced
-    # turn's proxy (docs/acp-usage-telemetry.md).
-    assert reply.usage is not None
-    assert reply.usage.prompt_tokens == 30
-    assert reply.usage.completion_tokens == 0
-    assert reply.usage.total_tokens == 30
+    # Issue #6 AC4-1/AC4-3: this fake self-reports no `agentInfo`, so its
+    # frames are unverified — never accumulated, never synthesized into
+    # completion.usage.  The failed first attempt's frame (900000) must not
+    # leak into the surfaced turn's occupancy either (docs/acp-usage-telemetry.md).
+    assert reply.usage is None
     assert telemetry["status"] == "unavailable"
+    assert telemetry["server_consumption_semantics"] == "unverified"
+    assert telemetry["turn_consumption"] is None
     assert telemetry["context_occupancy"] == {
         "source": "acp.session/update:usage_update",
         "scope": "per_model_call_consumption_delta",

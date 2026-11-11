@@ -93,11 +93,19 @@ for line in sys.stdin:
     msg = json.loads(line)
     method, rid = msg.get("method"), msg.get("id")
     if method == "initialize":
-        emit({"jsonrpc": "2.0", "id": rid, "result": {"protocolVersion": 1}})
+        result = {"protocolVersion": 1}
+        if mode.endswith("-verified"):
+            # The observed official 1.4.x identity triple (issue #6 AC4-3 pin).
+            result["agentInfo"] = {
+                "name": "antigravity-acp",
+                "title": "Google Antigravity",
+                "version": "1.4.0",
+            }
+        emit({"jsonrpc": "2.0", "id": rid, "result": result})
     elif method == "session/new":
         emit({"jsonrpc": "2.0", "id": rid, "result": {"sessionId": "s-1"}})
     elif method == "session/prompt":
-        if mode == "usage-update":
+        if mode in ("usage-update", "usage-update-verified"):
             # 1.3.0 _maybe_send_usage_update: token counters around the reply.
             for used in (100, 250, 300):
                 emit({"jsonrpc": "2.0", "method": "session/update", "params": {"update": {
@@ -176,19 +184,20 @@ def test_usage_update_is_non_billing_context_occupancy(monkeypatch, tmp_path, no
     else:
         content = reply.choices[0].message.content
         usage = reply.usage
-    # v0.7.4: completion.usage carries the server-reported consumption proxy.
-    # Valid frames here are 100+250+300 (the trailing -1/True frames are
-    # rejected whole): prompt = latest call, completion = earlier calls.
-    assert usage is not None
-    assert usage.prompt_tokens == 300
-    assert usage.completion_tokens == 350
-    assert usage.total_tokens == 650
+    # Issue #6 AC4-1/AC4-3: this fake self-reports no `agentInfo`, so the
+    # server's consumption semantics are UNVERIFIED.  Frames are never
+    # accumulated, never synthesized into completion.usage, and never priced:
+    # usage stays None (Core's designed usage-less path) and the only
+    # surviving signal is the ungated latest-valid occupancy reading.
+    assert usage is None
     assert content == "ok-130"
     assert "usage" not in content and "1048576" not in content
     telemetry = reply.antigravity_usage_telemetry
     assert telemetry["schema_id"] == "antigravity-acp-usage-v1"
     assert telemetry["status"] == "unavailable"
     assert telemetry["provider"] == "antigravity-acp"
+    assert telemetry["server_consumption_semantics"] == "unverified"
+    assert telemetry["turn_consumption"] is None
     assert telemetry["request_usage"] == {
         "input_tokens": None,
         "output_tokens": None,
@@ -203,15 +212,49 @@ def test_usage_update_is_non_billing_context_occupancy(monkeypatch, tmp_path, no
         "used": 300,
         "size": 1048576,
     }
+    store_payload = json.loads((tmp_path / "acp-state.json").read_text(encoding="utf-8"))
+    assert "usage_totals" not in store_payload
+    assert store_payload["usage_drop_counters"]["dropped_semantics_unverified"] == 3
     assert telemetry["native_session_id_hash"].startswith("sha256:")
     assert telemetry["turn_id_hash"].startswith("sha256:")
     assert "s-1" not in json.dumps(telemetry)
+
+
+def test_verified_identity_accumulates_consumption_without_synthetic_split(
+    monkeypatch, tmp_path, no_slash_env
+) -> None:
+    """Issue #6 AC4-1/AC4-3: a source-verified identity accumulates observed
+    consumption sums, but completion.usage stays None without the server's own
+    per-turn breakdown — the fabricated prompt/completion split is gone."""
+    client = _load_client(
+        monkeypatch, args=_fake_server(tmp_path, "usage-update-verified"), cwd=str(tmp_path)
+    )
+    client_module = sys.modules["antigravity_acp_130.client"]
+    monkeypatch.setattr(
+        client_module, "get_runtime_session_env",
+        lambda: ("hermes-session-verified", ""),
+    )
+    reply = client.chat.completions.create(
+        model="antigravity-acp", messages=[{"role": "user", "content": "hi"}],
+        timeout=10, stream=False,
+    )
+    assert reply.usage is None  # no session/prompt result usage in this fake
+    assert reply.choices[0].message.content == "ok-130"
+    telemetry = reply.antigravity_usage_telemetry
+    assert telemetry["server_consumption_semantics"] == "verified"
+    assert telemetry["turn_consumption"] == {
+        "source": "acp.session/update:usage_update",
+        "scope": "per_model_call_consumption_delta",
+        "is_billing_usage": False,
+        "semantics": "verified",
+        "model_calls_observed": 3,
+        "total_tokens": 650,
+    }
     store_payload = json.loads((tmp_path / "acp-state.json").read_text(encoding="utf-8"))
-    usage_totals = store_payload["usage_totals"]
-    assert set(usage_totals) == {"hermes-session-130"}
-    assert usage_totals["hermes-session-130"]["summed_tokens"] == 650
-    assert usage_totals["hermes-session-130"]["frames_observed"] == 3
-    assert "s-1" not in json.dumps(usage_totals)
+    entry = store_payload["usage_totals"]["hermes-session-verified"]
+    assert entry["summed_tokens"] == 650
+    assert entry["frames_observed"] == 3
+    assert "s-1" not in json.dumps(entry)
 
 
 @pytest.mark.parametrize("stream", [False, True])

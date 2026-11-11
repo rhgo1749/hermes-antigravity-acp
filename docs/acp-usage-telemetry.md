@@ -16,24 +16,48 @@ usage, not an invoice; the server can omit it and excludes subagent usage.
 Do not derive billing values from prompt characters, output length, or
 `native_tokens`.
 
-When the final result has no valid usage, the adapter retains the v0.7.4
-consumption proxy described below. The separate `antigravity_usage_telemetry`
-attribute still uses `status="unavailable"` and null `request_usage` buckets;
-those fields do not describe the separate `completion.usage` value.
+When the final result has no valid usage, `completion.usage` stays `None` and
+Hermes Core's display-only estimate fallback remains in charge (issue #6
+AC4-1). The separate `antigravity_usage_telemetry` attribute still uses
+`status="unavailable"` and null `request_usage` buckets; those fields do not
+describe the separate `completion.usage` value.
 
-## v0.7.4 consumption proxy in `completion.usage`
+## Issue #6: no fabricated split in `completion.usage`
+
+Earlier builds (v0.7.4–v0.7.8) synthesized `completion.usage` from
+`usage_update` frames — latest call as `prompt_tokens`, earlier same-turn
+calls as `completion_tokens`. That split was fabricated: the server reports
+one undifferentiated per-call consumption number, and pricing it as an
+input/output pair corrupted `/usage`, `state.db` stats, and cost views
+(issue #6). The synthesis is removed. `completion.usage` is now populated
+exclusively from the server's own `session/prompt` result `usage` breakdown.
 
 The official server streams `usage_update` frames whose `used` is the
 consumption of the latest model call (per-call, not cumulative; see below).
-When one or more valid frames are observed during a turn, the completion's
-`usage` carries them in the OpenAI chat shape so Hermes' native accounting
-(`/usage`, context-occupancy footers, compaction verdicts) uses provider
-numbers instead of its display-only text estimate:
+Observed frames feed two honest surfaces instead:
 
-- `prompt_tokens` = the latest call's consumption (newest occupancy reading),
-- `completion_tokens` = the earlier same-turn calls' consumption (turn sum
-  minus the latest),
-- `total_tokens` = the turn sum.
+- `context_occupancy` in the telemetry attribute (latest valid observation,
+  non-billing, ungated), and
+- `turn_consumption` in the telemetry attribute plus the durable
+  `usage_totals` store: the sum of gated per-call deltas observed during the
+  turn, explicitly scoped, never priced.
+
+Accumulation (turn sum and durable totals) is gated on three conditions,
+each with its own drop counter:
+
+1. **Verified server semantics** — the `initialize` result's `agentInfo`
+   `(name, title, version)` must match a source-verified identity whose
+   per-call delta semantics were confirmed against server source
+   (`server_consumption_semantics: "verified"`). Spec-compliant or unknown
+   servers are never summed.
+2. **Prompt-turn window** — frames are counted only between sending
+   `session/prompt` and receiving its response. This is event-order
+   correlation against the adapter's own request, NOT value equality: two
+   real calls with identical `used` both accumulate, while a model-switch
+   re-report of `last_reported_used` (emitted outside the window with zero
+   consumption) is excluded.
+3. **Nonzero** — the server's own `_maybe_send_usage_update` never reports a
+   zero delta; a zero frame can only be the new-session placeholder.
 
 Known limits, stated so nobody re-reads these numbers as invoices: the server
 omits zero-delta frames and excludes subagent calls, so the sum may
@@ -60,12 +84,15 @@ Every completed response uses this JSON-compatible shape:
   },
   "provenance": {
     "source": "official_acp_v1.4.0",
-    "request_usage": "not populated in this telemetry contract; see completion.usage",
-    "context_occupancy": "usage_update.used is per-model-call consumption, not billing usage"
+    "request_usage": "populated in completion.usage ONLY from the server's own session/prompt result usage breakdown; never synthesized from usage_update frames (issue #6 AC4-1)",
+    "context_occupancy": "usage_update.used is per-model-call consumption, not billing usage; size is the context window",
+    "turn_consumption": "sum of gated per-model-call consumption deltas observed this turn (main-agent-only, may under-report); observed processing, not unique-context size, billed tokens, or account quota"
   },
+  "server_consumption_semantics": "verified",
   "native_session_id_hash": "sha256:<opaque>",
   "turn_id_hash": "sha256:<opaque>",
-  "context_occupancy": null
+  "context_occupancy": null,
+  "turn_consumption": null
 }
 ```
 
@@ -189,6 +216,10 @@ Every `usage_update` frame that carries a `used` value is a usage-delta
 candidate. Each candidate increments `usage_drop_counters.frames_seen`; a
 candidate rejected before `add_usage_delta` increments exactly one reason
 counter: `dropped_invalid` (malformed value or missing activity stats),
+`dropped_semantics_unverified` (server identity not in the source-verified
+set), `dropped_outside_prompt_turn` (frame observed outside the adapter's own
+in-flight `session/prompt` window — model-switch re-reports, session-init
+placeholders, late-drained frames), `dropped_zero` (zero-value placeholder),
 `dropped_no_session_identity` (no explicit Hermes session ID at capture time),
 or `dropped_no_native_session` (no native session ID to correlate). Frames
 that are not candidates are never counted. The counters live additively in

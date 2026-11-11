@@ -161,6 +161,10 @@ def test_usage_update_deltas_accumulate_for_explicit_hermes_session(monkeypatch,
         "prompt": "prompt text secret",
         "command": "private-command",
         "path": "/private/workspace",
+        # Issue #6 gates: accumulation requires a source-verified server
+        # identity and an in-flight prompt turn (see _capture_usage_delta).
+        client._SERVER_CONSUMPTION_SEMANTICS_KEY: client._USAGE_SEMANTICS_VERIFIED,
+        client._PROMPT_TURN_ACTIVE_KEY: True,
     }
 
     for used in (100, 250, 300):
@@ -205,7 +209,12 @@ def test_usage_totals_keep_truthful_model_breakdown_when_switching_back(monkeypa
     for model, used in (("model-a", 100), ("model-b", 200), ("model-a", 50)):
         client._capture_usage_delta(
             {"sessionUpdate": "usage_update", "used": used},
-            {"native_session_id": f"raw-native-{model}", "model": model},
+            {
+                "native_session_id": f"raw-native-{model}",
+                "model": model,
+                client._SERVER_CONSUMPTION_SEMANTICS_KEY: client._USAGE_SEMANTICS_VERIFIED,
+                client._PROMPT_TURN_ACTIVE_KEY: True,
+            },
         )
 
     import os
@@ -272,7 +281,12 @@ def test_single_usage_delta_is_recorded_and_absent_identity_is_not_guessed(monke
     monkeypatch.setattr(client, "get_runtime_session_env", lambda: ("only-session-id", ""))
     client._capture_usage_delta(
         {"sessionUpdate": "usage_update", "used": 17},
-        {"native_session_id": "native-a", "model": "model-a"},
+        {
+            "native_session_id": "native-a",
+            "model": "model-a",
+            client._SERVER_CONSUMPTION_SEMANTICS_KEY: client._USAGE_SEMANTICS_VERIFIED,
+            client._PROMPT_TURN_ACTIVE_KEY: True,
+        },
     )
     payload = json.loads(state_path.read_text(encoding="utf-8"))
     assert payload["usage_totals"]["only-session-id"]["summed_tokens"] == 17
@@ -288,7 +302,12 @@ def test_single_usage_delta_is_recorded_and_absent_identity_is_not_guessed(monke
     )
     client._capture_usage_delta(
         {"sessionUpdate": "usage_update", "used": 99},
-        {"native_session_id": "native-b", "model": "model-b"},
+        {
+            "native_session_id": "native-b",
+            "model": "model-b",
+            client._SERVER_CONSUMPTION_SEMANTICS_KEY: client._USAGE_SEMANTICS_VERIFIED,
+            client._PROMPT_TURN_ACTIVE_KEY: True,
+        },
     )
     payload = json.loads(state_path.read_text())
     assert not payload.get("usage_totals")
@@ -313,13 +332,22 @@ def test_usage_frame_drop_counters_cover_every_gate(monkeypatch, tmp_path) -> No
     # Candidate with a malformed value: dropped_invalid (still a seen frame).
     client._capture_usage_delta(
         {"sessionUpdate": "usage_update", "used": "bogus"},
-        {"native_session_id": "native-a", "model": "model-a"},
+        {
+            "native_session_id": "native-a",
+            "model": "model-a",
+            client._SERVER_CONSUMPTION_SEMANTICS_KEY: client._USAGE_SEMANTICS_VERIFIED,
+            client._PROMPT_TURN_ACTIVE_KEY: True,
+        },
     )
     # Candidate with an identity but no native session id: no_native counter.
     monkeypatch.setattr(client, "get_runtime_session_env", lambda: ("session-c", ""))
     client._capture_usage_delta(
         {"sessionUpdate": "usage_update", "used": 10},
-        {"model": "model-a"},
+        {
+            "model": "model-a",
+            client._SERVER_CONSUMPTION_SEMANTICS_KEY: client._USAGE_SEMANTICS_VERIFIED,
+            client._PROMPT_TURN_ACTIVE_KEY: True,
+        },
     )
     counters = json.loads(state_path.read_text())["usage_drop_counters"]
     assert counters == {
@@ -331,11 +359,95 @@ def test_usage_frame_drop_counters_cover_every_gate(monkeypatch, tmp_path) -> No
     # A fully valid frame increments frames_seen and no drop counter.
     client._capture_usage_delta(
         {"sessionUpdate": "usage_update", "used": 42},
-        {"native_session_id": "native-a", "model": "model-a"},
+        {
+            "native_session_id": "native-a",
+            "model": "model-a",
+            client._SERVER_CONSUMPTION_SEMANTICS_KEY: client._USAGE_SEMANTICS_VERIFIED,
+            client._PROMPT_TURN_ACTIVE_KEY: True,
+        },
     )
     payload = json.loads(state_path.read_text())
     assert payload["usage_drop_counters"]["frames_seen"] == 3
     assert payload["usage_totals"]["session-c"]["summed_tokens"] == 42
+
+    # Issue #6 gates: each rejection names its own reason, never silently.
+    client._capture_usage_delta(  # unverified server identity
+        {"sessionUpdate": "usage_update", "used": 7},
+        {"native_session_id": "native-a", "model": "model-a"},
+    )
+    client._capture_usage_delta(  # verified but outside the prompt-turn window
+        {"sessionUpdate": "usage_update", "used": 7},
+        {
+            "native_session_id": "native-a",
+            "model": "model-a",
+            client._SERVER_CONSUMPTION_SEMANTICS_KEY: client._USAGE_SEMANTICS_VERIFIED,
+        },
+    )
+    client._capture_usage_delta(  # in-window zero placeholder
+        {"sessionUpdate": "usage_update", "used": 0},
+        {
+            "native_session_id": "native-a",
+            "model": "model-a",
+            client._SERVER_CONSUMPTION_SEMANTICS_KEY: client._USAGE_SEMANTICS_VERIFIED,
+            client._PROMPT_TURN_ACTIVE_KEY: True,
+        },
+    )
+    counters = json.loads(state_path.read_text())["usage_drop_counters"]
+    assert counters == {
+        "frames_seen": 6,
+        "dropped_invalid": 1,
+        "dropped_no_native_session": 1,
+        "dropped_semantics_unverified": 1,
+        "dropped_outside_prompt_turn": 1,
+        "dropped_zero": 1,
+    }
+    # The gated frames changed nothing in the totals.
+    assert payload["usage_totals"]["session-c"]["summed_tokens"] == 42
+
+
+def test_identical_used_values_in_window_both_accumulate_while_rerports_do_not(
+    monkeypatch, tmp_path
+) -> None:
+    """Issue #6 AC4-2: retransmission discrimination is event-order based.
+
+    Two legitimate model calls that happen to consume the SAME token count
+    must both accumulate (no value-equality dedup), while a model-switch
+    re-report of `last_reported_used` outside the prompt-turn window must not.
+    """
+    client, _ = _load_client_module(monkeypatch, tmp_path)
+    import os
+
+    monkeypatch.setattr(client, "get_runtime_session_env", lambda: ("dup-value-session", ""))
+    state_path = Path(os.environ["HERMES_ANTIGRAVITY_ACP_STATE_FILE"])
+
+    def stats(active: bool) -> dict:
+        return {
+            "native_session_id": "native-dup",
+            "model": "model-a",
+            client._SERVER_CONSUMPTION_SEMANTICS_KEY: client._USAGE_SEMANTICS_VERIFIED,
+            client._PROMPT_TURN_ACTIVE_KEY: active,
+        }
+
+    # Turn 1: two real calls consuming identical amounts.
+    for _ in range(2):
+        client._capture_usage_delta(
+            {"sessionUpdate": "usage_update", "used": 500}, stats(True)
+        )
+    # Model switch between turns: server re-reports the SAME value with no
+    # consumption.  Same number, different lifecycle position -> excluded.
+    client._capture_usage_delta(
+        {"sessionUpdate": "usage_update", "used": 500}, stats(False)
+    )
+    # Turn 2: another real identical call.
+    client._capture_usage_delta(
+        {"sessionUpdate": "usage_update", "used": 500}, stats(True)
+    )
+
+    payload = json.loads(state_path.read_text())
+    entry = payload["usage_totals"]["dup-value-session"]
+    assert entry["summed_tokens"] == 1500  # 3 real calls, not 2000, not 500
+    assert entry["frames_observed"] == 3
+    assert payload["usage_drop_counters"]["dropped_outside_prompt_turn"] == 1
 
 
 def test_state_save_preserves_usage_drop_counters_and_totals(monkeypatch, tmp_path) -> None:
@@ -352,11 +464,21 @@ def test_state_save_preserves_usage_drop_counters_and_totals(monkeypatch, tmp_pa
     monkeypatch.setattr(client, "get_runtime_session_env", lambda: ("save-session", ""))
     client._capture_usage_delta(
         {"sessionUpdate": "usage_update", "used": "bogus"},
-        {"native_session_id": "native-a", "model": "model-a"},
+        {
+            "native_session_id": "native-a",
+            "model": "model-a",
+            client._SERVER_CONSUMPTION_SEMANTICS_KEY: client._USAGE_SEMANTICS_VERIFIED,
+            client._PROMPT_TURN_ACTIVE_KEY: True,
+        },
     )
     client._capture_usage_delta(
         {"sessionUpdate": "usage_update", "used": 11},
-        {"native_session_id": "native-a", "model": "model-a"},
+        {
+            "native_session_id": "native-a",
+            "model": "model-a",
+            client._SERVER_CONSUMPTION_SEMANTICS_KEY: client._USAGE_SEMANTICS_VERIFIED,
+            client._PROMPT_TURN_ACTIVE_KEY: True,
+        },
     )
     before = json.loads(state_path.read_text())
     assert before["usage_drop_counters"] == {

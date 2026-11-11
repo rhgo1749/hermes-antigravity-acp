@@ -2306,6 +2306,51 @@ _USAGE_BUCKETS = (
 _CONTEXT_OCCUPANCY_SOURCE = "acp.session/update:usage_update"
 _USAGE_DELTA_SCOPE = "per_model_call_consumption_delta"
 
+# Server identities whose ``usage_update.used`` semantics are SOURCE-VERIFIED
+# as per-model-call consumption deltas (NOT the ACP v1 occupancy snapshot):
+#   * ``agy_acp_server.par`` 1.4.0 ``server.py`` (``_maybe_send_usage_update``,
+#     ``_extract_tokens_used``) — verified 2026-11-02 (antigravity-acp-harness
+#     issue #68 evidence).
+#   * ``agy_acp_server.par`` 1.4.4 ``server.py`` — re-verified 2026-11-11 from
+#     the installed par.  Its ``initialize`` result still self-reports
+#     ``agentInfo.version == "1.4.0"`` (the ``useragent`` constant lags the par
+#     version), so this pin is an OBSERVED IDENTITY triple, not a trustworthy
+#     version comparison: any deviation (absent, unknown, changed, malformed
+#     ``agentInfo``) disables consumption accumulation instead of guessing
+#     (issue #6 AC4-3).  Residual risk: a future server that keeps this exact
+#     triple while changing the semantics would pass the gate.
+_VERIFIED_CONSUMPTION_IDENTITIES = frozenset(
+    {("antigravity-acp", "Google Antigravity", "1.4.0")}
+)
+_USAGE_SEMANTICS_VERIFIED = "verified"
+_USAGE_SEMANTICS_UNVERIFIED = "unverified"
+_USAGE_SEMANTICS_ATTR = "_antigravity_usage_semantics"
+_SERVER_CONSUMPTION_SEMANTICS_KEY = "server_consumption_semantics"
+_PROMPT_TURN_ACTIVE_KEY = "prompt_turn_active"
+
+
+def _usage_semantics_from_initialize(result: Any) -> str:
+    """Pin the observed server identity from the ``initialize`` result.
+
+    Returns ``verified`` only when ``agentInfo`` is a well-formed object whose
+    exact ``(name, title, version)`` triple matches a source-verified
+    per-call-delta server.  Anything else — absent, non-string, unknown, or
+    changed identity — is ``unverified``; the adapter never guesses semantics.
+    """
+    if not isinstance(result, dict):
+        return _USAGE_SEMANTICS_UNVERIFIED
+    agent_info = result.get("agentInfo")
+    if not isinstance(agent_info, dict):
+        return _USAGE_SEMANTICS_UNVERIFIED
+    fields = tuple(agent_info.get(field) for field in ("name", "title", "version"))
+    if not all(isinstance(field, str) and field for field in fields):
+        return _USAGE_SEMANTICS_UNVERIFIED
+    return (
+        _USAGE_SEMANTICS_VERIFIED
+        if fields in _VERIFIED_CONSUMPTION_IDENTITIES
+        else _USAGE_SEMANTICS_UNVERIFIED
+    )
+
 
 def _nonnegative_json_number(value: Any) -> bool:
     if isinstance(value, bool):
@@ -2338,6 +2383,27 @@ def _capture_usage_delta(
     conversation_registry.note_usage_frame("frames_seen")
     if not isinstance(activity_stats, dict) or not _nonnegative_json_number(update["used"]):
         conversation_registry.note_usage_frame("dropped_invalid")
+        return
+    # Issue #6 AC4-3: accumulate only for a server identity whose per-call
+    # delta semantics are source-verified (see _VERIFIED_CONSUMPTION_IDENTITIES).
+    if activity_stats.get(_SERVER_CONSUMPTION_SEMANTICS_KEY) != _USAGE_SEMANTICS_VERIFIED:
+        conversation_registry.note_usage_frame("dropped_semantics_unverified")
+        return
+    # Issue #6 AC4-2: the official 1.4.x server emits consumption deltas ONLY
+    # while a prompt turn is in flight (`_maybe_send_usage_update` is reached
+    # exclusively from `prompt()`/`_stream_live_step`).  Frames outside the
+    # window are re-reports of `last_reported_used` (model switch) or the
+    # new-session `used=0` frame — never new consumption.  This is event-order
+    # correlation against the adapter's own `session/prompt` request, NOT
+    # value equality: two real calls with identical `used` both accumulate.
+    if not activity_stats.get(_PROMPT_TURN_ACTIVE_KEY):
+        conversation_registry.note_usage_frame("dropped_outside_prompt_turn")
+        return
+    # The server never reports a zero delta from `_maybe_send_usage_update`
+    # (`if not used: return`); a zero frame can only be the new-session
+    # placeholder. It is not consumption and must not create totals entries.
+    if update["used"] == 0:
+        conversation_registry.note_usage_frame("dropped_zero")
         return
     try:
         hermes_session_id, _session_key = get_runtime_session_env()
@@ -2406,7 +2472,6 @@ def _capture_context_occupancy(
 
 _TURN_USAGE_CALLS_KEY = "turn_usage_calls_observed"
 _TURN_USAGE_SUM_KEY = "turn_usage_tokens_sum"
-_TURN_USAGE_LAST_KEY = "turn_usage_last_call_tokens"
 
 
 def _capture_turn_usage(update: Any, activity_stats: dict[str, Any] | None) -> None:
@@ -2414,11 +2479,12 @@ def _capture_turn_usage(update: Any, activity_stats: dict[str, Any] | None) -> N
 
     ``usage_update.used`` is the official server's consumption delta for the
     latest model call (docs/acp-usage-telemetry.md), not cumulative session
-    occupancy.  Summing the frames observed inside one turn gives the
+    occupancy.  Summing the gated frames observed inside one turn gives the
     provider's own view of the turn's token consumption.  It may under-report
     (the server omits zero-delta frames and excludes subagent calls) and
-    carries no input/output split; the mapping into the OpenAI usage shape is
-    documented at the completion site.
+    carries no input/output split, so it is exposed ONLY as explicitly scoped
+    provider telemetry (``turn_consumption``) and durable observed sums —
+    never as the generic OpenAI-shaped usage (issue #6 AC4-1).
     """
     if (
         not isinstance(update, dict)
@@ -2434,11 +2500,20 @@ def _capture_turn_usage(update: Any, activity_stats: dict[str, Any] | None) -> N
         _nonnegative_json_number(update[field]) for field in present
     ):
         return
+    # Same consumption gates as _capture_usage_delta: the turn sum is a
+    # per-call consumption proxy only for a verified identity's in-prompt-turn
+    # frames; re-reports, out-of-window frames, and zero placeholders are not
+    # consumption and must not inflate the sum or the call count.
+    if (
+        activity_stats.get(_SERVER_CONSUMPTION_SEMANTICS_KEY) != _USAGE_SEMANTICS_VERIFIED
+        or not activity_stats.get(_PROMPT_TURN_ACTIVE_KEY)
+        or update["used"] == 0
+    ):
+        return
     activity_stats[_TURN_USAGE_CALLS_KEY] = int(activity_stats.get(_TURN_USAGE_CALLS_KEY) or 0) + 1
     activity_stats[_TURN_USAGE_SUM_KEY] = float(
         activity_stats.get(_TURN_USAGE_SUM_KEY) or 0.0
     ) + float(update["used"])
-    activity_stats[_TURN_USAGE_LAST_KEY] = float(update["used"])
 
 
 def _turn_usage_from_prompt_result(result: Any) -> Any:
@@ -2467,33 +2542,6 @@ def _turn_usage_from_prompt_result(result: Any) -> Any:
     return result_usage
 
 
-def _turn_usage_from_activity(activity_stats: dict[str, Any]) -> Any:
-    """OpenAI-shaped usage from this turn's observed ``usage_update`` frames.
-
-    Returns ``None`` when the server reported no consumption this turn, which
-    keeps Hermes' display-only estimate fallback in charge.  The mapping is
-    the best faithful reading of a per-call consumption stream that has no
-    input/output split: ``prompt_tokens`` = the latest call's consumption (the
-    newest context-occupancy reading, which is what drives context % and the
-    compaction verdict), ``completion_tokens`` = the earlier calls' consumption
-    within the same turn, ``total_tokens`` = the turn sum.
-    """
-    calls = int(activity_stats.get(_TURN_USAGE_CALLS_KEY) or 0)
-    tokens_sum = activity_stats.get(_TURN_USAGE_SUM_KEY)
-    last_call = activity_stats.get(_TURN_USAGE_LAST_KEY)
-    if calls <= 0 or tokens_sum is None or last_call is None:
-        return None
-    if (
-        not _nonnegative_json_number(tokens_sum)
-        or not _nonnegative_json_number(last_call)
-        or tokens_sum <= 0
-    ):
-        return None
-    return SimpleNamespace(
-        prompt_tokens=int(last_call),
-        completion_tokens=int(max(0.0, tokens_sum - float(last_call))),
-        total_tokens=int(tokens_sum),
-    )
 
 
 def _build_usage_telemetry(
@@ -2502,6 +2550,8 @@ def _build_usage_telemetry(
     session_id: Any,
     turn_id_hash: str | None,
     context_occupancy: Any,
+    turn_consumption: Any = None,
+    server_consumption_semantics: str = _USAGE_SEMANTICS_UNVERIFIED,
 ) -> dict[str, Any]:
     """Build JSON-compatible metadata without inferring billable token counts."""
     occupancy: dict[str, Any] | None = None
@@ -2520,23 +2570,38 @@ def _build_usage_telemetry(
                 **values,
             }
 
+    consumption: dict[str, Any] | None = (
+        dict(turn_consumption) if isinstance(turn_consumption, dict) else None
+    )
+
     return {
         "schema_id": "antigravity-acp-usage-v1",
         "status": "unavailable",
         "provider": "antigravity-acp",
         "model": str(model or "antigravity-acp"),
         "request_usage": {bucket: None for bucket in _USAGE_BUCKETS},
+        "server_consumption_semantics": str(server_consumption_semantics),
         "provenance": {
             "source": "official_acp_v1.4.0",
-            "request_usage": "not populated in this telemetry contract; see completion.usage",
+            "request_usage": (
+                "populated in completion.usage ONLY from the server's own "
+                "session/prompt result usage breakdown; never synthesized from "
+                "usage_update frames (issue #6 AC4-1)"
+            ),
             "context_occupancy": (
                 "usage_update.used is per-model-call consumption, not billing usage; "
                 "size is the context window"
+            ),
+            "turn_consumption": (
+                "sum of gated per-model-call consumption deltas observed this turn "
+                "(main-agent-only, may under-report); observed processing, not "
+                "unique-context size, billed tokens, or account quota"
             ),
         },
         "native_session_id_hash": _opaque_permission_id(session_id, "native-session"),
         "turn_id_hash": turn_id_hash or _opaque_permission_id(uuid.uuid4().hex, "turn"),
         "context_occupancy": occupancy,
+        "turn_consumption": consumption,
     }
 
 
@@ -4579,6 +4644,11 @@ class AntigravityACPClient:
                     session_id=session_id,
                     turn_id_hash=session_result.get("turn_id_hash"),
                     context_occupancy=session_result.get("context_occupancy"),
+                    turn_consumption=session_result.get("turn_consumption"),
+                    server_consumption_semantics=str(
+                        session_result.get("server_consumption_semantics")
+                        or _USAGE_SEMANTICS_UNVERIFIED
+                    ),
                 ),
                 choices=[
                     SimpleNamespace(
@@ -4737,6 +4807,10 @@ class AntigravityACPClient:
                 "native_tool_calls": [],
                 "permission_denied": False,
                 "_native_tool_call_index": {},
+                _SERVER_CONSUMPTION_SEMANTICS_KEY: str(
+                    getattr(proc, _USAGE_SEMANTICS_ATTR, _USAGE_SEMANTICS_UNVERIFIED)
+                    or _USAGE_SEMANTICS_UNVERIFIED
+                ),
             }
         )
 
@@ -4758,6 +4832,11 @@ class AntigravityACPClient:
                 activity_stats["turn_id_hash"] = _opaque_permission_id(
                     f"{session_id}\0{uuid.uuid4().hex}", "turn"
                 )
+                # Consumption-window correlation (issue #6 AC4-2): from this
+                # send until the prompt response, usage_update frames are
+                # per-model-call deltas; frames outside it are re-reports or
+                # placeholders (see _capture_usage_delta).
+                activity_stats[_PROMPT_TURN_ACTIVE_KEY] = True
             proc.stdin.write(
                 json.dumps(
                     {
@@ -4828,7 +4907,21 @@ class AntigravityACPClient:
         poisoned = False
         try:
             if fresh:
-                request("initialize", _INITIALIZE_PARAMS)
+                initialize_result = request("initialize", _INITIALIZE_PARAMS)
+                # Pin the server's consumption semantics for the lifetime of
+                # this stdio connection (issue #6 AC4-3); warm reuse of the
+                # same process keeps the pinned identity.
+                setattr(
+                    proc,
+                    _USAGE_SEMANTICS_ATTR,
+                    _usage_semantics_from_initialize(initialize_result),
+                )
+                # The activity_stats seed above ran before this handshake on a
+                # fresh connection; refresh it with the pinned identity.
+                activity_stats[_SERVER_CONSUMPTION_SEMANTICS_KEY] = str(
+                    getattr(proc, _USAGE_SEMANTICS_ATTR)
+                    or _USAGE_SEMANTICS_UNVERIFIED
+                )
             # The default Hermes model-provider mode disables the native
             # run_command built-in at launch; trusted coding mode omits the
             # override so the server keeps its normal built-in tool set.
@@ -5221,6 +5314,11 @@ class AntigravityACPClient:
                     reasoning_parts=reasoning_parts,
                 )
             finally:
+                # The consumption window closes with the prompt response: any
+                # later usage_update frame (model-switch re-report, new-session
+                # placeholder, or a frame the pump only now drains) is outside
+                # the window and is never accumulated as consumption.
+                activity_stats[_PROMPT_TURN_ACTIVE_KEY] = False
                 # Preserve partial native-tool provenance even when ACP returns an
                 # executor error instead of a completed prompt response.
                 if session_result is not None:
@@ -5279,9 +5377,45 @@ class AntigravityACPClient:
                 session_result["context_occupancy"] = (
                     dict(occupancy) if isinstance(occupancy, dict) else None
                 )
-                session_result["turn_usage"] = (
-                    _turn_usage_from_prompt_result(prompt_result)
-                    or _turn_usage_from_activity(activity_stats)
+                # Issue #6 AC4-1: the ONLY source for the generic OpenAI-shaped
+                # usage is the server's own per-turn `usage` breakdown on the
+                # prompt result.  When it is absent or invalid, usage stays
+                # None (Core's designed usage-less path); the observed
+                # per-call consumption frames are reported ONLY as explicitly
+                # scoped provider telemetry below, never as measured
+                # input/output.
+                session_result["turn_usage"] = _turn_usage_from_prompt_result(
+                    prompt_result
+                )
+                session_result["server_consumption_semantics"] = str(
+                    activity_stats.get(_SERVER_CONSUMPTION_SEMANTICS_KEY)
+                    or _USAGE_SEMANTICS_UNVERIFIED
+                )
+                # Observed per-call consumption stays in explicitly scoped
+                # provider telemetry (issue #6 AC4-1): never generic-priced,
+                # never presented as an input/output split.
+                _turn_calls = int(activity_stats.get(_TURN_USAGE_CALLS_KEY) or 0)
+                _turn_sum = activity_stats.get(_TURN_USAGE_SUM_KEY)
+                session_result["turn_consumption"] = (
+                    {
+                        "source": _CONTEXT_OCCUPANCY_SOURCE,
+                        "scope": _USAGE_DELTA_SCOPE,
+                        "is_billing_usage": False,
+                        "semantics": str(
+                            activity_stats.get(_SERVER_CONSUMPTION_SEMANTICS_KEY)
+                            or _USAGE_SEMANTICS_UNVERIFIED
+                        ),
+                        "model_calls_observed": _turn_calls,
+                        "total_tokens": (
+                            int(_turn_sum)
+                            if _turn_calls
+                            and _turn_sum is not None
+                            and _nonnegative_json_number(_turn_sum)
+                            else None
+                        ),
+                    }
+                    if _turn_calls
+                    else None
                 )
             return answer, "".join(reasoning_parts)
 
