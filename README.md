@@ -28,18 +28,18 @@ Hermes terminal approvals; a workspace path check is not a sandbox.
 
 | Topic | Current status |
 |---|---|
-| Hermes version | `plugin.yaml` declares `requires_hermes: ">=0.21.6"` — a CI-proven floor re-run on every change (`catalog-floor-gate`); the latest upstream Hermes release is `v0.23.0`. |
-| OS support | **Ubuntu 24.04 x86_64** is the only OS with real-binary, dedicated-OS-UID clean-room execution evidence (GitHub-hosted CI; see [OS support and verification tiers](#os-support-and-verification-tiers)). Linux aarch64, macOS arm64, Windows x64, and Windows arm64 are registry-pinned with publisher digests but **not executed-verified** by this repository — pinned-only, not executed support. |
-| Public plugin catalog | **Not registered yet.** `hermes plugins install antigravity-acp-provider` does not resolve today (upstream `plugin-catalog/` contains no entry for this provider as of 2026-11-08). Catalog submission is a separate, separately approved task. The only currently reproducible install path is the standalone installer below. |
+| Hermes version | `plugin.yaml` declares `requires_hermes: ">=0.21.6"` — a CI-proven floor re-run on every change (`catalog-floor-gate`); the latest upstream Hermes release is `v0.23.1`. |
+| OS support | **Ubuntu 24.04 x86_64** is the only OS with real-binary, dedicated-OS-UID clean-room execution evidence (GitHub-hosted CI; see [OS support and verification tiers](#os-support-and-verification-tiers)). **Windows x64 and Windows arm64** have real-binary hosted-CI execution evidence (actual installer + provider registration + unauthenticated ACP `initialize` on `windows-2022`/`windows-11-arm` runners) — one tier below clean-room, still executed. **Linux aarch64 and macOS arm64** are registry-pinned with publisher digests but **NOT RUN** — pinned-only, not executed support. |
+| Public plugin catalog | **Not registered yet.** `hermes plugins install antigravity-acp-provider` does not resolve today (upstream `plugin-catalog/` contains no entry for this provider as of 2026-11-12). The catalog submission PR ([NousResearch/hermes-agent#153182](https://github.com/NousResearch/hermes-agent/pull/153182)) is open and pending upstream review; registration is not approved or merged as of this writing. The only currently reproducible install path is the standalone installer below. |
 | Official server binary | Pinned `1.4.4`, fetched **only during an explicit install command** over HTTPS from `dl.google.com`; the publisher-pinned SHA-256 digest is verified **before** the archive is opened, extracted, or installed. No self-update; no redistribution. |
 | Authentication & first model call | Credential-free CI does not validate authentication or real inference. A supervised one-prompt canary produced a real response on an earlier client version; the current release has not been verified end-to-end in that same way. This observation does not establish terms compliance for other uses. |
-| `/quota` | Unavailable / unsupported: the official server reports no billed request tokens; completions carry `completion.usage` only as a server-reported consumption proxy from `usage_update` frames (may under-report; see `docs/acp-usage-telemetry.md`) and otherwise `completion.usage=None`, with `antigravity_usage_telemetry.status="unavailable"`; no quota command ships in the plugin. Usage, context occupancy, and billed tokens are different things — see `docs/acp-usage-telemetry.md`. |
+| `/quota` | Unavailable / unsupported: the official server reports no billed request tokens. Since v0.7.9, `completion.usage` is populated **only** when the server itself supplies a valid per-turn usage payload — the official server currently never does, so completions carry `completion.usage=None` and Hermes uses its designed estimation fallback (`/usage` reports token records as unavailable rather than fabricated numbers). The adapter previously synthesized a prompt/completion split from `usage_update` frames; that fabrication was removed (issue #6). Durable session totals accumulate only source-verified per-call consumption deltas (see `docs/acp-usage-telemetry.md`), with `antigravity_usage_telemetry.status="unavailable"` for per-call fields; no quota command ships in the plugin. Usage, context occupancy, and billed tokens are different things — see `docs/acp-usage-telemetry.md`. |
 
-## Known concurrency limitation: delegated children
+## Delegated children: ACP affinity fix (v0.7.9)
 
-Issue [#2](https://github.com/rhgo1749/hermes-antigravity-acp/issues/2) —
-candidate fix proposed in PR #7, not yet released; the issue stays open until
-real-server verification closes it. Previously, `delegate_task` children
+Issue [#2](https://github.com/rhgo1749/hermes-antigravity-acp/issues/2) is
+**closed** by the fix merged in PR #7 (released in v0.7.9). Previously,
+`delegate_task` children
 inherited the parent Hermes route key (by core design: it is the
 async-completion routing address) and the plugin keyed ACP continuation
 affinity with it, so a parent and all of its children fought over one native
@@ -48,8 +48,11 @@ a delegated child with the child's own durable session id; a child without one
 runs stateless (empty affinity, fresh native session, resume nothing) — never
 the parent's key. Unit tests cover parent/child/sibling keying and the
 fail-closed delegation-context gate; a real-core-context E2E (fake ACP server)
-covers concurrent same-prompt siblings; real-server concurrent-resume behavior
-across sibling children has not yet been executed-verified.
+covers concurrent same-prompt siblings and runs in both the current-core and
+the v0.21.6-floor CI lanes. Real-server concurrent-resume behavior
+across sibling children is tracked as post-merge validation in
+issue [#10](https://github.com/rhgo1749/hermes-antigravity-acp/issues/10) and
+has not yet been executed-verified.
 
 ## 5-minute Quick Start (single account, credential-free)
 
@@ -440,8 +443,17 @@ verification tier:
   credential-free unauthenticated `initialize` probes, never an
   authentication frame or a model prompt. An earlier initialize-only
   operational observation is not a substitute for dedicated-UID CI evidence.
-- **Registry-pinned but not live-verified tier — macOS arm64, Windows x64,
-  Windows arm64, Linux aarch64.** These targets are registry-pinned with
+- **Real-binary hosted-CI executed tier (not dedicated-UID clean-room) —
+  Windows x64, Windows arm64.** The `windows-install` job runs the actual
+  Windows installer on `windows-2022` (x64) and `windows-11-arm` (arm64)
+  hosted runners against the real Google-distributed official server binary,
+  then verifies native architecture, provider registration/enabled state, and
+  an unauthenticated ACP `initialize` (`install_acp.py verify`). This is
+  executed evidence one tier below the dedicated-UID clean-room class: no
+  dedicated OS UID isolation, and no authentication frame or model prompt is
+  ever sent.
+- **Registry-pinned but NOT RUN tier — macOS arm64, Linux aarch64.** These
+  targets are registry-pinned with
   publisher digests and are covered by a credential-free CI install smoke
   (fake-ACP archive + lifecycle mechanics in
   `tests/test_clean_env_e2e_smoke.py`), but the real Google binary on
