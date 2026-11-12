@@ -122,19 +122,51 @@ def test_no_secret_environment_reads_outside_declared_surface() -> None:
     assert not offenders, f"undeclared environment reads (declare or remove): {sorted(offenders)}"
 
 
-# --- hermes_compat.py core-import inventory (issue #12) ----------------------
+# --- hermes_compat.py core-import inventory (issue #12) ---------------------- (reworked after review)
 # docs/hermes-compatibility.md (module dependency register + Public API
-# promotion record, 2026-11-12) is the register; this test is its enforcer in
-# the credential-free lane. The PRIVATE set is the documented fail-closed
-# allowlist of imports with NO published plugin-API route as of the 2026-11-12
-# audit (upstream main 67664e236d); adding an entry means a new private
-# dependency, a register row, and a fail-closed contract — all in one change.
-# Removing an entry (upstream promotion, or a migration) must land with the
-# register update too: this inventory is exact, not a ceiling.
+# promotion record, 2026-11-12) is the register; this test is its BLOCKING
+# enforcer in the credential-free lane. The upstream `hermes plugins validate`
+# Rule 9 warning is advisory (the validator exits 0 with warnings), so the
+# warning existing is NOT a gate — this inventory is what fails CI.
+#
+# Hermes-owned namespaces: snapshot of the two official Core definitions
+# (`plugin_validate_private_imports._hermes_packages` and
+# `plugin_validate_core_override._hermes_top_level`), taken as the union over
+# the audited refs v0.21.6, v0.23.0, v0.23.1, main@67664e23 on 2026-11-12.
+# The credential-free lane has no Core checkout, so the sync check lives in
+# tests/test_upstream_hermes_runtime_contracts.py: in both upstream CI lanes
+# the installed Core's own namespaces must stay inside this snapshot. A new
+# upstream namespace turns that lane RED until snapshot + register move
+# together. Names upstream later drops stay in the snapshot (superset filter;
+# this scan targets one plugin file with no third-party name collisions).
 
-_HERMES_TOP_LEVEL = frozenset({
-    "agent", "gateway", "hermes_cli", "hermes_constants", "plugins",
-    "providers", "tools", "utils",
+HERMES_TOP_LEVEL_SNAPSHOT = frozenset({
+    "acp_adapter", "agent", "batch_runner", "cli",
+    "cron", "evals", "gateway", "hermes_agent",
+    "hermes_bootstrap", "hermes_cli", "hermes_constants", "hermes_constants_scratch",
+    "hermes_constants_scratch_detach", "hermes_constants_scratch_stuck", "hermes_dir_acl", "hermes_logging",
+    "hermes_platform", "hermes_plugins", "hermes_scope", "hermes_startup_watchdog",
+    "hermes_state", "hermes_state_api_content", "hermes_state_common", "hermes_state_compaction_display",
+    "hermes_state_compression", "hermes_state_coverage", "hermes_state_dbfile", "hermes_state_delegate_children",
+    "hermes_state_detached_results", "hermes_state_errors", "hermes_state_fts", "hermes_state_gateway",
+    "hermes_state_guard", "hermes_state_health", "hermes_state_holders", "hermes_state_identity",
+    "hermes_state_ids", "hermes_state_keys", "hermes_state_legacy_refusal", "hermes_state_local",
+    "hermes_state_local_lineage", "hermes_state_local_migration", "hermes_state_lockguard", "hermes_state_lockowners",
+    "hermes_state_maintenance", "hermes_state_media", "hermes_state_messages", "hermes_state_mutation_binding",
+    "hermes_state_mutation_branch", "hermes_state_mutation_chat_pick", "hermes_state_mutation_compress", "hermes_state_mutation_guards",
+    "hermes_state_mutation_prepared", "hermes_state_mutation_reset", "hermes_state_mutation_retirement", "hermes_state_mutation_transcript",
+    "hermes_state_mutations", "hermes_state_pidns", "hermes_state_portability", "hermes_state_profile_repair",
+    "hermes_state_prompt_refresh", "hermes_state_prune_rewrite", "hermes_state_readpool", "hermes_state_reconcile",
+    "hermes_state_registry", "hermes_state_repair", "hermes_state_rewind", "hermes_state_runtime",
+    "hermes_state_runtime_workers", "hermes_state_schema", "hermes_state_search", "hermes_state_session_list",
+    "hermes_state_sessions", "hermes_state_sessions_model_config", "hermes_state_stored_reads", "hermes_state_telegram",
+    "hermes_state_terminal", "hermes_state_timeline", "hermes_state_titles", "hermes_state_todo",
+    "hermes_state_tool_retries", "hermes_state_usage", "hermes_state_user_copy", "hermes_state_wal",
+    "hermes_state_worker_compression", "hermes_state_worker_context", "hermes_state_worker_lifecycle", "hermes_time",
+    "hermes_yaml", "mcp_serve", "mini_swe_runner", "model_tools",
+    "plugins", "pm", "providers", "registration_lifecycle",
+    "run_agent", "tests", "tools", "toolset_distributions",
+    "toolsets", "trajectory_compressor", "tui_gateway", "utils",
 })
 
 # module.name pairs hermes_compat.py imports from Hermes core that the
@@ -158,28 +190,138 @@ PRIVATE_CORE_IMPORTS = frozenset({
     "agent.file_safety.get_nt_namespace_error",
 })
 
+DOCUMENTED_CORE_IMPORTS = PUBLIC_CORE_IMPORTS | PRIVATE_CORE_IMPORTS
 
-def _core_import_targets(path: Path) -> set[str]:
-    """Every ``module.name`` (or bare ``module``) Hermes import the AST sees."""
+
+def _core_import_targets(source: str) -> set[str]:
+    """Hermes-core import targets in ``source``, mirroring the official
+    validator's ``_imported()`` semantics: ``import a.b`` (target ``a.b``),
+    non-relative ``from a import b`` (target ``a.b``), and string-literal
+    ``importlib.import_module("a")`` / ``import_module("a")`` calls (target
+    ``a``).
+
+    Deliberate deviations from the official pass, both tightening-only and
+    intentional (review requirement 6):
+    - imports under ``if TYPE_CHECKING:`` are counted here; the official pass
+      exempts them. A type-only core import still couples this plugin to the
+      core module path and belongs in the register.
+    - the official pass drops imports whose path resolves to one of the
+      plugin's own modules (``_is_own_module_path``). This scan targets one
+      plugin file and skips relative imports (``level > 0``), so a plugin-own
+      module cannot appear under a Hermes top-level name; if that ever
+      changes the exact inventory fails loudly instead of silently filing it
+      as core.
+    - the official pass treats a module-level catalog entry as allowing any
+      non-underscore name in it; this inventory is exact per symbol, which is
+      stricter by design.
+
+    Documented static-analysis boundary (shared with the official pass):
+    computed module names (f-strings, variables, loops) are invisible to AST
+    scanning. This gate covers literal import spellings only; the
+    upstream-hermes-compat ``hermes plugins validate`` run remains the
+    advisory full-surface oracle, never the blocker.
+    """
     targets: set[str] = set()
-    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+    for node in ast.walk(ast.parse(source)):
         if isinstance(node, ast.Import):
             targets |= {
                 alias.name for alias in node.names
-                if alias.name.split(".")[0] in _HERMES_TOP_LEVEL
+                if alias.name.split(".")[0] in HERMES_TOP_LEVEL_SNAPSHOT
             }
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            if node.module.split(".")[0] in _HERMES_TOP_LEVEL:
+        elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+            if node.module.split(".")[0] in HERMES_TOP_LEVEL_SNAPSHOT:
                 targets |= {f"{node.module}.{alias.name}" for alias in node.names}
+        elif (
+            isinstance(node, ast.Call)
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+            and ast.unparse(node.func) in ("importlib.import_module", "import_module")
+        ):
+            module = node.args[0].value
+            if module.split(".")[0] in HERMES_TOP_LEVEL_SNAPSHOT:
+                targets.add(module)
     return targets
 
 
+def _snippet(tmp_path, text: str) -> str:
+    """Isolated temp-file source for the negative regressions (the production
+    plugin file is never modified by these tests)."""
+    path = tmp_path / "injected_surface.py"
+    path.write_text(text, encoding="utf-8")
+    return path.read_text(encoding="utf-8")
+
+
 def test_hermes_compat_core_import_surface_is_the_documented_inventory() -> None:
-    found = _core_import_targets(PLUGIN_DIR / "hermes_compat.py")
-    documented = PUBLIC_CORE_IMPORTS | PRIVATE_CORE_IMPORTS
-    assert found == documented, (
+    found = _core_import_targets((PLUGIN_DIR / "hermes_compat.py").read_text(encoding="utf-8"))
+    assert found == DOCUMENTED_CORE_IMPORTS, (
         "hermes_compat.py core imports drifted from the "
         "docs/hermes-compatibility.md register; "
-        f"unregistered: {sorted(found - documented)}, "
-        f"no longer imported: {sorted(documented - found)}"
+        f"unregistered: {sorted(found - DOCUMENTED_CORE_IMPORTS)}, "
+        f"no longer imported: {sorted(DOCUMENTED_CORE_IMPORTS - found)}"
+    )
+
+
+def test_inventory_flags_unregistered_core_namespace_import(tmp_path) -> None:
+    found = _core_import_targets(_snippet(tmp_path, "import hermes_state\n"))
+    extra, _missing = found - DOCUMENTED_CORE_IMPORTS, DOCUMENTED_CORE_IMPORTS - found
+    assert extra == {"hermes_state"}, (
+        f"an unregistered `import hermes_state` must be an inventory violation, got extra={sorted(extra)}"
+    )
+
+
+def test_inventory_flags_dynamic_core_import(tmp_path) -> None:
+    source = _snippet(
+        tmp_path,
+        "import importlib\n"
+        "from importlib import import_module\n"
+        'importlib.import_module("agent.file_safety")\n'
+        'import_module("cron.execution_identity")\n',
+    )
+    found = _core_import_targets(source)
+    assert found == {"agent.file_safety", "cron.execution_identity"}, (
+        f"string-literal dynamic core imports must be inventoried as bare modules, got {sorted(found)}"
+    )
+    assert found - DOCUMENTED_CORE_IMPORTS == found, (
+        "dynamic core imports outside the documented register must never pass as registered"
+    )
+
+
+def test_inventory_flags_unregistered_from_import(tmp_path) -> None:
+    found = _core_import_targets(_snippet(tmp_path, "from cron import execution_identity\n"))
+    assert found == {"cron.execution_identity"}
+    assert found - DOCUMENTED_CORE_IMPORTS == found
+
+
+def test_inventory_accepts_registered_import_spellings(tmp_path) -> None:
+    source = _snippet(
+        tmp_path,
+        "from agent.file_safety import get_read_block_error\n"
+        "from agent.redact import redact_sensitive_text\n"
+        "from gateway.session_context import get_session_env\n",
+    )
+    found = _core_import_targets(source)
+    assert found <= DOCUMENTED_CORE_IMPORTS, (
+        f"registered import spellings must never be flagged, got {sorted(found - DOCUMENTED_CORE_IMPORTS)}"
+    )
+
+
+def test_inventory_flags_removed_registered_import(tmp_path) -> None:
+    production = (PLUGIN_DIR / "hermes_compat.py").read_text(encoding="utf-8")
+    removed = production.replace(
+        "        from agent.delegation_context import is_delegated_child_context as resolve_child\n",
+        "        pass  # registered import removed by this fixture\n",
+    )
+    assert removed != production, "the fixture anchor moved; update this test with the source"
+    found = _core_import_targets(_snippet(tmp_path, removed))
+    missing = DOCUMENTED_CORE_IMPORTS - found
+    assert missing == {"agent.delegation_context.is_delegated_child_context"}, (
+        f"dropping a registered core import must fail the exact inventory, missing={sorted(missing)}"
+    )
+
+
+def test_inventory_ignores_relative_plugin_imports(tmp_path) -> None:
+    source = _snippet(tmp_path, "from . import client\nfrom .bridge import x\n")
+    assert _core_import_targets(source) == set(), (
+        "relative plugin-own imports must never be classified as core imports"
     )
