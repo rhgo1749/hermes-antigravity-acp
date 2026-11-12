@@ -1416,6 +1416,11 @@ def _lane_bundle_bytes(store: Path, records: dict[str, dict]) -> int | None:
     """
     total = 0
     for record in records.values():
+        if record["unsafe"]:
+            # Irregular members were excluded from record["files"]; their
+            # footprint is unknowable, so a partial sum would present an
+            # unknown capacity as a (smaller) real number.  Fail closed.
+            return None
         for path in record["files"]:
             try:
                 total += path.lstat().st_size
@@ -1614,8 +1619,19 @@ def session_inventory(
         report["totals"] = totals
         if lock_state == "absent" and os.path.exists(_gc_lock_path()):
             # A GC or owner-prune pass started mid-walk (every pass creates
-            # the lock file first): this snapshot is not serialized against
-            # deletion and must not be reported as ok.
+            # the lock file before deleting): this snapshot is not serialized
+            # against deletion.  Census counts stay as walked, but candidate
+            # figures are invalidated (None, lanes and totals alike) so a
+            # raced report never presents a reclamation prediction as
+            # trustworthy.
+            for key in (
+                "gc_candidate_expired",
+                "gc_candidate_capacity",
+                "gc_candidate_bytes",
+            ):
+                totals[key] = None
+                for lane_report in report["lanes"]:
+                    lane_report[key] = None
             return _incomplete("gc-lock-appeared-mid-scan")
     return report
 

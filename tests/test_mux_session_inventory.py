@@ -432,3 +432,28 @@ def test_inventory_lock_appeared_mid_scan_is_incomplete(lanes, monkeypatch):
 
     assert report["status"] == "incomplete"
     assert "gc-lock-appeared-mid-scan" in report["reasons"]
+    # R1: a raced snapshot must not return candidate figures as if trusted
+    for key in ("gc_candidate_expired", "gc_candidate_capacity", "gc_candidate_bytes"):
+        assert report["totals"][key] is None, f"totals.{key} must be invalidated"
+        for lane_report in report["lanes"]:
+            assert lane_report[key] is None, f"lane {lane_report['lane']}.{key} must be invalidated"
+    assert report["totals"]["bundles"] == 1  # census counts stay as walked
+
+
+def test_unsafe_bundle_bytes_are_unknown_not_zero(lanes):
+    """R2: irregular bundle members make capacity unknowable, never partial."""
+    a, _b, state_file = lanes
+    now = time.time()
+    good = _bundle(a, SID_FRESH, mtime=now - 60)
+    store = a / ".gemini" / "antigravity-acp"
+    (store / "conversations" / f"{SID_OLD}.db").symlink_to(good)
+    (store / "brain" / SID_PROTECTED).symlink_to(store / "brain" / SID_FRESH)
+    _checkpoints(state_file, [], now=now)
+
+    report = _inventory(state_file, now=now)
+
+    lane = [row for row in report["lanes"] if row["bundles"] == 3][0]
+    assert lane["unsafe"] == 2
+    assert lane["bytes"] is None, "unknown capacity must not be a partial sum"
+    assert report["totals"]["bytes"] is None
+    assert report["totals"]["bundles"] == 3
