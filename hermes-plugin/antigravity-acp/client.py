@@ -255,6 +255,12 @@ _MALFORMED_TOOL_CALL_CORRECTION = (
     "Do not invent a different action or claim that a setting was changed."
 )
 _MAX_MALFORMED_TOOL_CALL_CORRECTIONS = 1
+# Request-wide hard cap on malformed tool-call regeneration shared by the
+# primary extraction path and the read-evidence correction path (issue #14).
+# The primary path keeps its local cap of 1; the read-evidence path may only
+# spend what the primary path left of this budget, so one request never emits
+# more than two additional generations for a malformed sequence.
+_MAX_MALFORMED_TOOL_CALL_CORRECTIONS_TOTAL = 2
 _ARTIFACT_CLAIM_CORRECTION = (
     "Your previous final answer claimed one or more Hermes scratch artifacts that do not exist on disk. "
     "Do not repeat or invent those paths. If the task still requires those artifacts, emit the exact Hermes tool call "
@@ -4142,54 +4148,29 @@ class AntigravityACPClient:
             )
             tool_calls: list[Any] = []
             cleaned_text = ""
-            for malformed_attempt in range(_MAX_MALFORMED_TOOL_CALL_CORRECTIONS + 1):
-                try:
-                    tool_calls, cleaned_text = _extract_advertised_tool_calls(
-                        response_text, active_tools
-                    )
-                    break
-                except MalformedToolCallError as exc:
-                    if exc.unrecoverable:
-                        if exc.reason == "unadvertised_tool":
-                            raise RuntimeError(str(exc)) from exc
-                        raise RuntimeError(
-                            "Antigravity ACP leaked malformed tool-result protocol data; "
-                            "outcome is UNKNOWN, refusing to replay any action or expose the result."
-                        ) from exc
-                    if malformed_attempt >= _MAX_MALFORMED_TOOL_CALL_CORRECTIONS:
-                        raise RuntimeError(
-                            "Antigravity ACP emitted malformed Hermes tool-call JSON again after one correction; "
-                            "refusing to expose or execute the invalid action."
-                        ) from exc
-                    remaining = timeout_seconds - (time.monotonic() - started)
-                    if remaining <= 0:
-                        raise TimeoutError(
-                            "Timed out while correcting malformed Antigravity ACP tool-call JSON."
-                        ) from exc
-                    prior_session_id = str(session_result.get("session_id") or "").strip()
-                    correction_full_prompt = (
-                        f"{full_prompt_text}\n\nPrevious malformed model output (not executed):\n{response_text}"
-                        f"\n\n{_MALFORMED_TOOL_CALL_CORRECTION}"
-                    )
-                    correction_result: dict[str, Any] = {}
-                    logger.warning(
-                        "Antigravity ACP emitted malformed tool-call JSON%s; requesting one in-session correction.",
-                        f" for {exc.tool_name!r}" if exc.tool_name else "",
-                    )
-                    response_text, reasoning = self._run_prompt(
-                        _MALFORMED_TOOL_CALL_CORRECTION,
-                        timeout_seconds=remaining,
-                        model=model,
-                        affinity_key=affinity_key,
-                        resume_session_id=prior_session_id,
-                        full_prompt_text=correction_full_prompt,
-                        session_result=correction_result,
-                        image_blocks=(),
-                        replay_image_blocks=replay_image_blocks,
-                        thinking_level=requested_thinking_level,
-                    )
-                    session_result = correction_result
-            if malformed_attempt and not tool_calls:
+            # One request-wide malformed-correction budget (issue #14). The
+            # primary path spends at most _MAX_MALFORMED_TOOL_CALL_CORRECTIONS
+            # of it; whatever remains is what the read-evidence correction
+            # path below may still spend, so nested loops never multiply the
+            # regeneration allowance.
+            malformed_budget = [_MAX_MALFORMED_TOOL_CALL_CORRECTIONS]
+            tool_calls, cleaned_text, session_result, reasoning, malformed_corrections_used = (
+                self._extract_with_malformed_recovery(
+                    response_text,
+                    active_tools,
+                    session_result=session_result,
+                    budget=malformed_budget,
+                    model=model,
+                    affinity_key=affinity_key,
+                    full_prompt_text=full_prompt_text,
+                    replay_image_blocks=replay_image_blocks,
+                    thinking_level=requested_thinking_level,
+                    timeout_seconds=timeout_seconds,
+                    started=started,
+                    reasoning=reasoning,
+                )
+            )
+            if malformed_corrections_used and not tool_calls:
                 raise RuntimeError(
                     "Antigravity ACP correction did not produce a valid Hermes tool call; "
                     "refusing to present an unverified task completion."
@@ -4265,6 +4246,17 @@ class AntigravityACPClient:
                 )
                 and not _pending_read_tool_call(tool_calls)
             ):
+                # Issue #14: the read-evidence path may only spend what the
+                # primary path left of the request-wide malformed budget, and
+                # the same list carries consumption across outer iterations so
+                # the loops never multiply the regeneration allowance.
+                read_evidence_malformed_budget = [
+                    max(
+                        0,
+                        _MAX_MALFORMED_TOOL_CALL_CORRECTIONS_TOTAL
+                        - malformed_corrections_used,
+                    )
+                ]
                 for _read_evidence_attempt in range(_MAX_READ_EVIDENCE_CORRECTIONS):
                     remaining = timeout_seconds - (time.monotonic() - started)
                     if remaining <= 0:
@@ -4291,10 +4283,22 @@ class AntigravityACPClient:
                         replay_image_blocks=replay_image_blocks,
                         thinking_level=requested_thinking_level,
                     )
-                    tool_calls, cleaned_text = _extract_advertised_tool_calls(
-                        response_text, active_tools
+                    tool_calls, cleaned_text, session_result, reasoning, _used = (
+                        self._extract_with_malformed_recovery(
+                            response_text,
+                            active_tools,
+                            session_result=correction_result,
+                            budget=read_evidence_malformed_budget,
+                            model=model,
+                            affinity_key=affinity_key,
+                            full_prompt_text=correction_full_prompt,
+                            replay_image_blocks=replay_image_blocks,
+                            thinking_level=requested_thinking_level,
+                            timeout_seconds=timeout_seconds,
+                            started=started,
+                            reasoning=reasoning,
+                        )
                     )
-                    session_result = correction_result
                     if _pending_read_tool_call(tool_calls) or _native_completed_read_evidence(
                         dict(session_result.get("native_activity") or {})
                     ):
@@ -4832,6 +4836,116 @@ class AntigravityACPClient:
                 return config_entries, legacy_entries
         finally:
             self.close()
+
+    def _extract_with_malformed_recovery(
+        self,
+        response_text: str,
+        tools: list[dict[str, Any]] | None,
+        *,
+        session_result: dict[str, Any],
+        budget: list[int],
+        model: str | None,
+        affinity_key: str,
+        full_prompt_text: str,
+        replay_image_blocks: tuple[dict[str, str], ...],
+        thinking_level: str | None,
+        timeout_seconds: float,
+        started: float,
+        reasoning: str = "",
+    ) -> tuple[list[Any], str, dict[str, Any], str, int]:
+        """Extract advertised tool calls, correcting malformed envelopes in-session.
+
+        Shared by the primary extraction path and the read-evidence correction
+        path so both consume one bounded malformed-correction budget (``budget``
+        is a single-element remaining-count list). Only recoverable
+        ``MalformedToolCallError`` enters the correction loop; unadvertised
+        tools, leaked tool-result protocol data, and every other exception keep
+        their existing fail-closed behavior. The invalid call is never
+        dispatched. Regeneration resumes the same ACP session; when the session
+        identity is unavailable the request terminates instead of silently
+        opening a new session and replaying the prompt.
+
+        Returns ``(tool_calls, cleaned_text, session_result, reasoning,
+        corrections_used)``.
+        """
+        current_session_result = session_result
+        corrections = 0
+        while True:
+            try:
+                tool_calls, cleaned_text = _extract_advertised_tool_calls(
+                    response_text, tools
+                )
+            except MalformedToolCallError as exc:
+                if exc.unrecoverable:
+                    if exc.reason == "unadvertised_tool":
+                        raise RuntimeError(str(exc)) from exc
+                    raise RuntimeError(
+                        "Antigravity ACP leaked malformed tool-result protocol data; "
+                        "outcome is UNKNOWN, refusing to replay any action or expose the result."
+                    ) from exc
+                if budget[0] <= 0:
+                    count_word = {0: "no", 1: "one", 2: "two"}.get(
+                        corrections, str(corrections)
+                    )
+                    raise RuntimeError(
+                        "Antigravity ACP emitted malformed Hermes tool-call JSON again after "
+                        f"{count_word} correction{'' if corrections == 1 else 's'}; the "
+                        "request-wide malformed budget is exhausted, refusing to expose or "
+                        "execute the invalid action."
+                    ) from exc
+                remaining = timeout_seconds - (time.monotonic() - started)
+                if remaining <= 0:
+                    raise TimeoutError(
+                        "Timed out while correcting malformed Antigravity ACP tool-call JSON."
+                    ) from exc
+                prior_session_id = str(
+                    current_session_result.get("session_id") or ""
+                ).strip()
+                if not prior_session_id:
+                    raise RuntimeError(
+                        "Antigravity ACP cannot recover a malformed tool call: the ACP session "
+                        "id is unavailable, so same-session regeneration cannot be confirmed; "
+                        "refusing to open a new session or replay the request."
+                    ) from exc
+                budget[0] -= 1
+                corrections += 1
+                correction_full_prompt = (
+                    f"{full_prompt_text}\n\nPrevious malformed model output (not executed):\n{response_text}"
+                    f"\n\n{_MALFORMED_TOOL_CALL_CORRECTION}"
+                )
+                correction_result: dict[str, Any] = {}
+                logger.warning(
+                    "Antigravity ACP emitted malformed tool-call JSON%s; requesting in-session "
+                    "correction %d (request-wide malformed budget remaining %d).",
+                    f" for {exc.tool_name!r}" if exc.tool_name else "",
+                    corrections,
+                    budget[0],
+                )
+                response_text, reasoning = self._run_prompt(
+                    _MALFORMED_TOOL_CALL_CORRECTION,
+                    timeout_seconds=remaining,
+                    model=model,
+                    affinity_key=affinity_key,
+                    resume_session_id=prior_session_id,
+                    full_prompt_text=correction_full_prompt,
+                    session_result=correction_result,
+                    image_blocks=(),
+                    replay_image_blocks=replay_image_blocks,
+                    thinking_level=thinking_level,
+                )
+                current_session_result = correction_result
+                continue
+            if corrections:
+                logger.info(
+                    "Antigravity ACP malformed tool-call recovery produced a valid extraction "
+                    "after %d in-session correction(s).",
+                    corrections,
+                )
+            else:
+                logger.debug(
+                    "Antigravity ACP tool-call extraction succeeded on the first pass."
+                )
+            return tool_calls, cleaned_text, current_session_result, reasoning, corrections
 
     def _run_prompt(
         self,
