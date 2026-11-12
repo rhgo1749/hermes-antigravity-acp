@@ -19,10 +19,11 @@ of a PTY, TUI parser, or a custom `agy --input-format stream-json` bridge.
 ![How Hermes connects to the official Antigravity ACP server, and the default tool execution boundary](docs/images/how-it-works.svg)
 
 The provider communicates with the official server over ACP JSON-RPC via stdio.
-Hermes tool calls follow Hermes policies and approvals. By default, the ACP
-server can also execute native coding tools: vetted native file edits and shell
-commands are automatically authorized by the provider. Native commands bypass
-Hermes terminal approvals; a workspace path check is not a sandbox.
+Hermes tool calls follow Hermes policies and approvals. The ACP server's native
+coding tools are never auto-approved: native `run_command` is disabled at
+session launch and native file-mutation or command permission frames are
+answered with the server's own reject option, so shell and file work runs
+through Hermes' own approval-gated terminal and file tools.
 
 ## Status at a glance (evidence-backed, checked 2026-11-08)
 
@@ -70,7 +71,13 @@ switches are inert and no configuration re-enables native auto-approval.
 Preserved unchanged: the read-only Hermes scratch permission route, the
 harness `fs/read`/`fs/write` callbacks bridged through Hermes' write-safety
 chain, and the v0.7.9 session-ownership, delegated-child, and usage
-accounting contracts. See `docs/data-and-permissions.md` §5 and
+accounting contracts. The coding-loop evidence in
+`tests/test_native_permission_policy.py` is a **scripted fake-ACP loop**: the
+fallback `fs/write` calls and the Hermes `terminal` `<tool_call>` are emitted
+by the test's fake server, so they prove the harness protocol path only.
+Whether the real Google model autonomously chooses Hermes tools after its
+native requests are rejected is **NOT RUN** until a supervised live canary
+executes it. See `docs/data-and-permissions.md` §5 and
 `tests/test_native_permission_policy.py`.
 
 ## 5-minute Quick Start (single account, credential-free)

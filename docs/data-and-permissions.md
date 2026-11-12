@@ -108,10 +108,13 @@ every entry.
 - Usage reporting is a **response-level attribute**, truthful by contract:
   `antigravity_usage_telemetry` with `status="unavailable"` and null
   request-usage buckets; that separate attribute does not expose billing.
-  `completion.usage` prefers a valid per-turn breakdown in the ACP prompt
-  result. Otherwise, since v0.7.4, it carries a server-reported consumption
-  proxy when `usage_update` frames were observed (may under-report; not
-  billing), and is `None` when neither source is available.
+  `completion.usage` is populated **only** when the server itself supplies a
+  valid per-turn usage breakdown in the ACP prompt result — the pinned
+  official server currently never does, so completions carry
+  `completion.usage=None` and Hermes applies its designed estimation
+  fallback. The pre-v0.7.9 consumption-proxy split synthesized from
+  `usage_update` frames was removed as fabricated (issue #6) and is never
+  produced again.
   `usage_update` counters are kept
   separately as non-billing `context_occupancy`
   (`docs/acp-usage-telemetry.md`). `/quota` is unavailable/unsupported — no
