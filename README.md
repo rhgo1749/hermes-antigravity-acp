@@ -540,6 +540,18 @@ selection list. Ordinary plugin changes still require the three OS lanes;
 unreviewed tests remain full-matrix, and main pushes still run all five native
 targets. See [the path matrix, measured baseline and estimate boundaries](docs/ci-cost-phase-a.md).
 
+Phase B of the same issue adds the **release-candidate verification gate**,
+dispatch-only and separate from `CI gate`: `gh workflow run ci.yml -f
+candidate_sha=<40-hex>` pins every lane checkout to that exact commit, each
+lane attests its own HEAD SHA plus the verification stages it executed, and a
+conditional `Release gate` job fails closed unless every required cell of the
+version-controlled matrix (`release/verification-matrix.json`, documented in
+[docs/release-verification-matrix.md](docs/release-verification-matrix.md))
+is attested at exactly that SHA by successful lanes. Evidence from another
+SHA, skipped or missing lanes, and optional-lane substitution for required
+gaps all fail the gate. Ordinary PR and main-push runs are unaffected and
+pay no extra native cost.
+
 ### Four distinct evidence classes (never conflated)
 
 Verification reporting in this repository separates four evidence classes

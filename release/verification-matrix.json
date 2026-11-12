@@ -1,0 +1,369 @@
+{
+  "schema_version": 1,
+  "issue": "https://github.com/rhgo1749/hermes-antigravity-acp/issues/28",
+  "description": "Version-controlled release verification matrix (issue #28 Phase B). One entry per declared native target x verification stage. `required` entries must be attested by the named lane at the exact release-candidate SHA before scripts/release_gate_check.py may certify a release candidate. `status` records the CURRENT executed state of this repository's CI: PASS only when a cited executed lane covers it; BLOCKED/NOT_RUN are never green. Optional PASS entries are reported but never substitute for a required gap.",
+  "status_values": [
+    "PASS",
+    "FAIL",
+    "BLOCKED",
+    "NOT_RUN"
+  ],
+  "evidence_classes": {
+    "official_binary_clean_room": "Real official ACP binary executed in a dedicated-OS-UID GitHub-hosted clean room.",
+    "official_binary_hosted": "Real official ACP binary executed on a native GitHub-hosted runner (no dedicated-UID isolation).",
+    "real_core_integration": "Executed against an unmodified official Hermes Core checkout (strict seam or provider probe).",
+    "fake_transport_protocol": "Deterministic credential-free fake-ACP protocol contract; OS-independent; never claims real-binary or vendor-auth behavior.",
+    "registry_pin_only": "Publisher digest pinned in antigravity_acp/registry.py with no executed native lifecycle.",
+    "not_executed": "No executed evidence exists in this repository's CI for this cell."
+  },
+  "stages": {
+    "binary_publisher_pin_sha256": "Official distribution downloaded under the reviewed first-party SHA-256 pin and digest-verified before execution.",
+    "install_status_verify_uninstall": "Install -> status -> integrity verify -> uninstall -> confirmed absence lifecycle.",
+    "provider_registration_enabled": "Hermes provider projection registered under HERMES_HOME and observed enabled (hermes plugins list or provider probe).",
+    "provider_selection_factory": "providers.get_provider_profile discovery, profile field equality, and create_client factory path executed under an official Hermes Core venv.",
+    "acp_initialize_unauthenticated": "Unauthenticated ACP initialize handshake against the real official binary (no auth frame, no prompt).",
+    "error_timeout_permission_failclosed": "Error, timeout and permission-denial paths fail closed (fake-transport protocol class; real-binary diagnostics are covered under platform_security_hardening).",
+    "session_resume_recovery": "Session resume/recovery protocol contract (fake-transport protocol class).",
+    "platform_security_hardening": "Platform-specific additional security verification (dedicated-UID isolation and fail-closed diagnostics on Linux x86_64; owned process-tree teardown on Windows x64)."
+  },
+  "targets": [
+    {
+      "id": "linux-x86_64",
+      "lane": "acp-clean-room",
+      "runner": "ubuntu-24.04",
+      "stages": {
+        "binary_publisher_pin_sha256": {
+          "required": true,
+          "status": "PASS",
+          "evidence_class": "official_binary_clean_room",
+          "trigger": "ci_full_matrix",
+          "evidence": ".github/workflows/ci.yml acp-clean-room preflight + hosted_clean_room_ci.py fetch/pin steps"
+        },
+        "install_status_verify_uninstall": {
+          "required": true,
+          "status": "PASS",
+          "evidence_class": "official_binary_clean_room",
+          "trigger": "ci_full_matrix",
+          "evidence": "hosted_clean_room_ci.py install/status/verify/uninstall/reinstall chain"
+        },
+        "provider_registration_enabled": {
+          "required": true,
+          "status": "PASS",
+          "evidence_class": "real_core_integration",
+          "trigger": "ci_full_matrix",
+          "evidence": "hosted_clean_room_ci.py provider projection + clean_room_provider_probe.py served_from_hermes_home"
+        },
+        "provider_selection_factory": {
+          "required": true,
+          "status": "PASS",
+          "evidence_class": "real_core_integration",
+          "trigger": "ci_full_matrix",
+          "evidence": "clean_room_provider_probe.py PROBE|selection + PROBE|client at pinned HERMES_CORE_REF"
+        },
+        "acp_initialize_unauthenticated": {
+          "required": true,
+          "status": "PASS",
+          "evidence_class": "official_binary_clean_room",
+          "trigger": "ci_full_matrix",
+          "evidence": "hosted_clean_room_ci.py h09 acp_probe initialize steps"
+        },
+        "error_timeout_permission_failclosed": {
+          "required": true,
+          "status": "PASS",
+          "evidence_class": "fake_transport_protocol",
+          "trigger": "ci_every_event",
+          "lane": "fake-acp",
+          "evidence": "credential-free auto-discovered regressions (permission fail-closed, timeout, cancel suites)"
+        },
+        "session_resume_recovery": {
+          "required": true,
+          "status": "PASS",
+          "evidence_class": "fake_transport_protocol",
+          "trigger": "ci_every_event",
+          "lane": "fake-acp",
+          "evidence": "credential-free session/resume regressions"
+        },
+        "platform_security_hardening": {
+          "required": true,
+          "status": "PASS",
+          "evidence_class": "official_binary_clean_room",
+          "trigger": "ci_full_matrix",
+          "evidence": "dedicated-UID isolation, private-canary DAC proof, fail-closed diagnostics, post-run integrity scan"
+        }
+      }
+    },
+    {
+      "id": "windows-x64",
+      "lane": "windows-x64",
+      "runner": "windows-2022",
+      "stages": {
+        "binary_publisher_pin_sha256": {
+          "required": true,
+          "status": "PASS",
+          "evidence_class": "official_binary_hosted",
+          "trigger": "ci_full_matrix",
+          "evidence": "install-windows.cmd + install_acp.py verify under the registry pin"
+        },
+        "install_status_verify_uninstall": {
+          "required": true,
+          "status": "PASS",
+          "evidence_class": "official_binary_hosted",
+          "trigger": "ci_full_matrix",
+          "evidence": "actual Windows installer executed; install_acp.py verify lifecycle"
+        },
+        "provider_registration_enabled": {
+          "required": true,
+          "status": "PASS",
+          "evidence_class": "official_binary_hosted",
+          "trigger": "ci_full_matrix",
+          "evidence": "hermes plugins list enabled antigravity-acp-provider assertion"
+        },
+        "provider_selection_factory": {
+          "required": false,
+          "status": "NOT_RUN",
+          "evidence_class": "not_executed",
+          "trigger": "none",
+          "limitation": "clean_room_provider_probe.py is POSIX-only (os.getuid, HOME/.local/bin launcher); provider selection/factory on Windows remains unverified and is never claimed from the registration check."
+        },
+        "acp_initialize_unauthenticated": {
+          "required": true,
+          "status": "PASS",
+          "evidence_class": "official_binary_hosted",
+          "trigger": "ci_full_matrix",
+          "evidence": "install_acp.py verify unauthenticated initialize + acp_probe login-helper path"
+        },
+        "error_timeout_permission_failclosed": {
+          "required": true,
+          "status": "PASS",
+          "evidence_class": "fake_transport_protocol",
+          "trigger": "ci_every_event",
+          "lane": "fake-acp",
+          "evidence": "credential-free auto-discovered regressions (protocol class, OS-independent)"
+        },
+        "session_resume_recovery": {
+          "required": true,
+          "status": "PASS",
+          "evidence_class": "fake_transport_protocol",
+          "trigger": "ci_every_event",
+          "lane": "fake-acp",
+          "evidence": "credential-free session/resume regressions"
+        },
+        "platform_security_hardening": {
+          "required": false,
+          "status": "PASS",
+          "evidence_class": "official_binary_hosted",
+          "trigger": "ci_full_matrix",
+          "evidence": "issue #23 owned process-tree teardown verification (verify_process_tree_teardown.py) executed on the x64 lane"
+        }
+      }
+    },
+    {
+      "id": "windows-arm64",
+      "lane": "windows-arm64",
+      "runner": "windows-11-arm",
+      "stages": {
+        "binary_publisher_pin_sha256": {
+          "required": true,
+          "status": "PASS",
+          "evidence_class": "official_binary_hosted",
+          "trigger": "ci_full_matrix",
+          "evidence": "install-windows.cmd + install_acp.py verify under the registry pin"
+        },
+        "install_status_verify_uninstall": {
+          "required": true,
+          "status": "PASS",
+          "evidence_class": "official_binary_hosted",
+          "trigger": "ci_full_matrix",
+          "evidence": "actual Windows installer executed on windows-11-arm"
+        },
+        "provider_registration_enabled": {
+          "required": true,
+          "status": "PASS",
+          "evidence_class": "official_binary_hosted",
+          "trigger": "ci_full_matrix",
+          "evidence": "hermes plugins list enabled antigravity-acp-provider assertion"
+        },
+        "provider_selection_factory": {
+          "required": false,
+          "status": "NOT_RUN",
+          "evidence_class": "not_executed",
+          "trigger": "none",
+          "limitation": "POSIX-only probe; see windows-x64 limitation. Removing or weakening the existing Windows arm64 install verification is forbidden."
+        },
+        "acp_initialize_unauthenticated": {
+          "required": true,
+          "status": "PASS",
+          "evidence_class": "official_binary_hosted",
+          "trigger": "ci_full_matrix",
+          "evidence": "install_acp.py verify unauthenticated initialize + acp_probe login-helper path"
+        },
+        "error_timeout_permission_failclosed": {
+          "required": true,
+          "status": "PASS",
+          "evidence_class": "fake_transport_protocol",
+          "trigger": "ci_every_event",
+          "lane": "fake-acp",
+          "evidence": "credential-free auto-discovered regressions (protocol class, OS-independent)"
+        },
+        "session_resume_recovery": {
+          "required": true,
+          "status": "PASS",
+          "evidence_class": "fake_transport_protocol",
+          "trigger": "ci_every_event",
+          "lane": "fake-acp",
+          "evidence": "credential-free session/resume regressions"
+        },
+        "platform_security_hardening": {
+          "required": false,
+          "status": "NOT_RUN",
+          "evidence_class": "not_executed",
+          "trigger": "none",
+          "limitation": "process-tree teardown is verified on the x64 lane only and is explicitly not substituted by this lane (issue #23 contract)."
+        }
+      }
+    },
+    {
+      "id": "macos-arm64",
+      "lane": "macos-arm64",
+      "runner": "macos-15",
+      "stages": {
+        "binary_publisher_pin_sha256": {
+          "required": true,
+          "status": "PASS",
+          "evidence_class": "official_binary_hosted",
+          "trigger": "ci_full_matrix",
+          "evidence": "install_official.py publisher-pinned download + verify on native arm64"
+        },
+        "install_status_verify_uninstall": {
+          "required": true,
+          "status": "PASS",
+          "evidence_class": "official_binary_hosted",
+          "trigger": "ci_full_matrix",
+          "evidence": "install -> status -> verify -> uninstall -> confirmed absence on macos-15"
+        },
+        "provider_registration_enabled": {
+          "required": true,
+          "status": "BLOCKED",
+          "evidence_class": "not_executed",
+          "trigger": "ci_full_matrix",
+          "evidence": "install_acp.py install + clean_room_provider_probe.py served_from_hermes_home on macos-15 at pinned HERMES_CORE_REF (issue #28 Phase B)",
+          "limitation": "Added by issue #28 Phase B; awaiting first hosted execution at the release-candidate SHA. Until a cited green run exists this cell is BLOCKED, never PASS."
+        },
+        "provider_selection_factory": {
+          "required": true,
+          "status": "BLOCKED",
+          "evidence_class": "not_executed",
+          "trigger": "ci_full_matrix",
+          "evidence": "clean_room_provider_probe.py PROBE|selection + PROBE|client on macos-15 (issue #28 Phase B)",
+          "limitation": "Added by issue #28 Phase B; awaiting first hosted execution at the release-candidate SHA. Until a cited green run exists this cell is BLOCKED, never PASS."
+        },
+        "acp_initialize_unauthenticated": {
+          "required": true,
+          "status": "PASS",
+          "evidence_class": "official_binary_hosted",
+          "trigger": "ci_full_matrix",
+          "evidence": "acp_probe.py initialize on native arm64"
+        },
+        "error_timeout_permission_failclosed": {
+          "required": true,
+          "status": "PASS",
+          "evidence_class": "fake_transport_protocol",
+          "trigger": "ci_every_event",
+          "lane": "fake-acp",
+          "evidence": "credential-free auto-discovered regressions (protocol class, OS-independent)"
+        },
+        "session_resume_recovery": {
+          "required": true,
+          "status": "PASS",
+          "evidence_class": "fake_transport_protocol",
+          "trigger": "ci_every_event",
+          "lane": "fake-acp",
+          "evidence": "credential-free session/resume regressions"
+        },
+        "platform_security_hardening": {
+          "required": false,
+          "status": "NOT_RUN",
+          "evidence_class": "not_executed",
+          "trigger": "none",
+          "limitation": "No dedicated-UID (or equivalent sandbox-identity) isolation on the macOS lane; the Linux clean-room contract is not claimed here."
+        }
+      }
+    },
+    {
+      "id": "linux-aarch64",
+      "lane": "linux-aarch64",
+      "runner": "ubuntu-24.04-arm",
+      "stages": {
+        "binary_publisher_pin_sha256": {
+          "required": true,
+          "status": "PASS",
+          "evidence_class": "official_binary_hosted",
+          "trigger": "ci_full_matrix",
+          "evidence": "install_official.py publisher-pinned download + verify on native aarch64"
+        },
+        "install_status_verify_uninstall": {
+          "required": true,
+          "status": "PASS",
+          "evidence_class": "official_binary_hosted",
+          "trigger": "ci_full_matrix",
+          "evidence": "install -> status -> verify -> uninstall -> confirmed absence on ubuntu-24.04-arm"
+        },
+        "provider_registration_enabled": {
+          "required": true,
+          "status": "BLOCKED",
+          "evidence_class": "not_executed",
+          "trigger": "ci_full_matrix",
+          "evidence": "install_acp.py install + clean_room_provider_probe.py served_from_hermes_home on ubuntu-24.04-arm at pinned HERMES_CORE_REF (issue #28 Phase B)",
+          "limitation": "Added by issue #28 Phase B; awaiting first hosted execution at the release-candidate SHA. Until a cited green run exists this cell is BLOCKED, never PASS."
+        },
+        "provider_selection_factory": {
+          "required": true,
+          "status": "BLOCKED",
+          "evidence_class": "not_executed",
+          "trigger": "ci_full_matrix",
+          "evidence": "clean_room_provider_probe.py PROBE|selection + PROBE|client on ubuntu-24.04-arm (issue #28 Phase B)",
+          "limitation": "Added by issue #28 Phase B; awaiting first hosted execution at the release-candidate SHA. Until a cited green run exists this cell is BLOCKED, never PASS."
+        },
+        "acp_initialize_unauthenticated": {
+          "required": true,
+          "status": "PASS",
+          "evidence_class": "official_binary_hosted",
+          "trigger": "ci_full_matrix",
+          "evidence": "acp_probe.py initialize on native aarch64"
+        },
+        "error_timeout_permission_failclosed": {
+          "required": true,
+          "status": "PASS",
+          "evidence_class": "fake_transport_protocol",
+          "trigger": "ci_every_event",
+          "lane": "fake-acp",
+          "evidence": "credential-free auto-discovered regressions (protocol class, OS-independent)"
+        },
+        "session_resume_recovery": {
+          "required": true,
+          "status": "PASS",
+          "evidence_class": "fake_transport_protocol",
+          "trigger": "ci_every_event",
+          "lane": "fake-acp",
+          "evidence": "credential-free session/resume regressions"
+        },
+        "platform_security_hardening": {
+          "required": false,
+          "status": "NOT_RUN",
+          "evidence_class": "not_executed",
+          "trigger": "none",
+          "limitation": "Not a dedicated-UID clean room; the Linux x86_64 clean-room tier is not claimed for aarch64."
+        }
+      }
+    }
+  ],
+  "cross_cutting": {
+    "never_claimed_by_any_lane": [
+      "vendor authentication success",
+      "authenticated model discovery",
+      "real model inference",
+      "exactly-once external side effects"
+    ],
+    "release_lane_note": "upstream-hermes-compat and catalog-floor-gate (latest + minimum-supported Hermes strict seams) are additional required release lanes on ubuntu x86_64; they are Hermes-API integration evidence, not per-target native lifecycle evidence."
+  }
+}
