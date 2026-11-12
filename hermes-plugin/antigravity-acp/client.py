@@ -4861,9 +4861,11 @@ class AntigravityACPClient:
         ``MalformedToolCallError`` enters the correction loop; unadvertised
         tools, leaked tool-result protocol data, and every other exception keep
         their existing fail-closed behavior. The invalid call is never
-        dispatched. Regeneration resumes the same ACP session; when the session
-        identity is unavailable the request terminates instead of silently
-        opening a new session and replaying the prompt.
+        dispatched. Regeneration resumes the same ACP session under
+        ``strict_same_session`` (no resume-miss replay, no fresh-session
+        failover, confirmed session id); when the session identity is
+        unavailable the request terminates instead of silently opening a new
+        session and replaying the prompt.
 
         Returns ``(tool_calls, cleaned_text, session_result, reasoning,
         corrections_used)``.
@@ -4932,6 +4934,7 @@ class AntigravityACPClient:
                     image_blocks=(),
                     replay_image_blocks=replay_image_blocks,
                     thinking_level=thinking_level,
+                    strict_same_session=True,
                 )
                 current_session_result = correction_result
                 continue
@@ -4961,12 +4964,26 @@ class AntigravityACPClient:
         image_blocks: tuple[dict[str, str], ...] = (),
         replay_image_blocks: tuple[dict[str, str], ...] = (),
         thinking_level: str | None = None,
+        strict_same_session: bool = False,
     ) -> tuple[str, str]:
-        """Run a prompt with native resume, resume-miss replay, and bounded failover."""
+        """Run a prompt with native resume, resume-miss replay, and bounded failover.
+
+        ``strict_same_session`` pins this generation to the resumed session
+        (issue #14 P1 rework): a resume miss or any failover-eligible error
+        raises a classified refusal instead of rebuilding on a fresh session,
+        and a response reported under a different session id than pinned is
+        rejected. Used only by malformed tool-call regeneration; the ordinary
+        conversation transport policy is untouched.
+        """
         deadline = time.monotonic() + timeout_seconds
         replay_text = full_prompt_text or prompt_text
         next_text = prompt_text
         next_resume = str(resume_session_id or "").strip()
+        if strict_same_session and not next_resume:
+            raise RuntimeError(
+                "Antigravity ACP strict same-session recovery refused: no session id "
+                "was supplied to pin the regeneration to."
+            )
         next_image_blocks = image_blocks
         resume_miss_replayed = False
         failovers = 0
@@ -4978,7 +4995,7 @@ class AntigravityACPClient:
                 raise TimeoutError("Timed out before Antigravity ACP prompt could complete.")
             attempt_activity: dict[str, Any] = {}
             try:
-                return self._run_prompt_once(
+                outcome = self._run_prompt_once(
                     next_text,
                     timeout_seconds=remaining,
                     model=model,
@@ -5014,6 +5031,18 @@ class AntigravityACPClient:
                     model,
                     inferred_upper_bound=native_token_hint if next_resume else 0,
                 )
+                if strict_same_session:
+                    # Issue #14 P1: malformed tool-call regeneration never
+                    # leaves the pinned session. Rebuilding or rotating would
+                    # full-replay the prompt and could duplicate native side
+                    # effects, so refuse with a classified error instead.
+                    raise RuntimeError(
+                        "Antigravity ACP strict same-session recovery refused: the "
+                        "regeneration turn failed on the pinned session and neither "
+                        "resume-miss replay nor fresh-session failover is permitted "
+                        "for malformed tool-call correction; refusing to replay the "
+                        "prompt outside the original session."
+                    ) from exc
                 if next_resume and not resume_miss_replayed and _resume_session_missing(exc):
                     logger.info(
                         "Antigravity ACP session %s is unavailable; rebuilding with one full replay.",
@@ -5066,6 +5095,22 @@ class AntigravityACPClient:
                 next_text = replay_text
                 next_resume = ""
                 next_image_blocks = replay_image_blocks
+                continue
+            if strict_same_session:
+                # The server confirms the session it actually answered under;
+                # anything other than the pinned id means the response came
+                # from a session this correction contract cannot vouch for.
+                issued_session_id = str(
+                    (session_result or {}).get("session_id") or ""
+                ).strip()
+                if issued_session_id != next_resume:
+                    raise RuntimeError(
+                        "Antigravity ACP strict same-session recovery refused: the "
+                        f"regeneration reported session {issued_session_id[:12]!r} "
+                        f"instead of the pinned session {next_resume[:12]!r}; refusing "
+                        "to trust a response from an unconfirmed session."
+                    )
+            return outcome
 
     def _run_prompt_once(
         self,

@@ -276,3 +276,201 @@ def test_unadvertised_tool_in_read_evidence_fails_closed_without_correction(monk
         _create(client)
 
     assert len(turns) == 2
+
+
+# --- P1 rework (independent review of PR #29): strict same-session transport ---
+#
+# The malformed regeneration inside _extract_with_malformed_recovery must never
+# let _run_prompt's transport fall back to a resume-miss full replay or a
+# fresh-session failover, and must reject a response that reports a different
+# session id than the pinned one.  The ordinary conversation transport policy
+# must stay byte-identical.
+
+
+def _strict_transport(monkeypatch, client, fake_once):
+    attempts: list[dict] = []
+
+    def recording_once(prompt_text, **kwargs):
+        attempts.append(
+            {"resume": kwargs["resume_session_id"], "prompt": prompt_text}
+        )
+        return fake_once(prompt_text, attempts=len(attempts), **kwargs)
+
+    monkeypatch.setattr(client, "_run_prompt_once", recording_once)
+    return attempts
+
+
+def test_strict_same_session_blocks_resume_miss_replay(monkeypatch) -> None:
+    """A resume miss during malformed regeneration refuses, never replays."""
+    _, client, _ = _load(monkeypatch)
+
+    def resume_miss(prompt_text, *, attempts, **kwargs):
+        raise RuntimeError("session not found: durable-session")
+
+    calls = _strict_transport(monkeypatch, client, resume_miss)
+
+    with pytest.raises(RuntimeError, match="strict same-session"):
+        client._run_prompt(
+            "malformed correction delta",
+            timeout_seconds=30,
+            resume_session_id="durable-session",
+            full_prompt_text="full original prompt",
+            session_result={},
+            strict_same_session=True,
+        )
+
+    # Exactly one wire attempt: no fresh-session full replay was issued.
+    assert len(calls) == 1
+
+
+def test_strict_same_session_blocks_rate_limit_failover(monkeypatch) -> None:
+    """A failover-eligible error during malformed regeneration never rotates."""
+    _, client, _ = _load(monkeypatch)
+
+    def rate_limited(prompt_text, *, attempts, **kwargs):
+        raise RuntimeError("429 too many requests")
+
+    calls = _strict_transport(monkeypatch, client, rate_limited)
+
+    with pytest.raises(RuntimeError, match="strict same-session"):
+        client._run_prompt(
+            "malformed correction delta",
+            timeout_seconds=30,
+            resume_session_id="durable-session",
+            full_prompt_text="full original prompt",
+            session_result={},
+            strict_same_session=True,
+        )
+
+    # Exactly one wire attempt: no fresh-session failover was issued.
+    assert len(calls) == 1
+
+
+def test_strict_same_session_rejects_unconfirmed_session_id(monkeypatch) -> None:
+    """A response reported by a different session id than pinned is refused."""
+    _, client, _ = _load(monkeypatch)
+
+    def wrong_session(prompt_text, *, attempts, **kwargs):
+        kwargs["session_result"].update(session_id="other-session", resumed=False)
+        return _valid_call(), ""
+
+    calls = _strict_transport(monkeypatch, client, wrong_session)
+
+    with pytest.raises(RuntimeError, match="strict same-session"):
+        client._run_prompt(
+            "malformed correction delta",
+            timeout_seconds=30,
+            resume_session_id="durable-session",
+            full_prompt_text="full original prompt",
+            session_result={},
+            strict_same_session=True,
+        )
+
+    assert len(calls) == 1
+
+
+def test_strict_same_session_happy_path_returns_pinned_session(monkeypatch) -> None:
+    """Same-session regeneration succeeds when the server confirms the pinned id."""
+    _, client, _ = _load(monkeypatch)
+
+    def same_session(prompt_text, *, attempts, **kwargs):
+        kwargs["session_result"].update(session_id="durable-session", resumed=True)
+        return _valid_call(), ""
+
+    calls = _strict_transport(monkeypatch, client, same_session)
+
+    answer, _reasoning = client._run_prompt(
+        "malformed correction delta",
+        timeout_seconds=30,
+        resume_session_id="durable-session",
+        full_prompt_text="full original prompt",
+        session_result={},
+        strict_same_session=True,
+    )
+
+    assert answer == _valid_call()
+    assert len(calls) == 1
+
+
+def test_normal_conversation_resume_miss_replay_policy_unchanged(monkeypatch) -> None:
+    """Sibling non-strict traffic keeps the existing resume-miss full replay."""
+    _, client, _ = _load(monkeypatch)
+
+    def miss_then_rebuild(prompt_text, *, attempts, **kwargs):
+        if attempts == 1:
+            raise RuntimeError("session not found: durable-session")
+        kwargs["session_result"].update(session_id="fresh-session", resumed=False)
+        return "rebuilt answer", ""
+
+    calls = _strict_transport(monkeypatch, client, miss_then_rebuild)
+
+    answer, _reasoning = client._run_prompt(
+        "delta text",
+        timeout_seconds=30,
+        resume_session_id="durable-session",
+        full_prompt_text="full replay text",
+        session_result={},
+    )
+
+    assert answer == "rebuilt answer"
+    assert len(calls) == 2
+    assert calls[1]["resume"] == ""
+    assert calls[1]["prompt"] == "full replay text"
+
+
+def test_normal_conversation_rate_limit_failover_policy_unchanged(monkeypatch) -> None:
+    """Sibling non-strict traffic keeps the bounded fresh-session failover."""
+    _, client, _ = _load(monkeypatch)
+
+    def limited_then_ok(prompt_text, *, attempts, **kwargs):
+        if attempts == 1:
+            raise RuntimeError("429 too many requests")
+        kwargs["session_result"].update(session_id="failover-session", resumed=False)
+        return "failover answer", ""
+
+    calls = _strict_transport(monkeypatch, client, limited_then_ok)
+
+    answer, _reasoning = client._run_prompt(
+        "delta text",
+        timeout_seconds=30,
+        resume_session_id="durable-session",
+        full_prompt_text="full replay text",
+        session_result={},
+    )
+
+    assert answer == "failover answer"
+    assert len(calls) == 2
+    assert calls[1]["resume"] == ""
+
+
+def test_malformed_regeneration_requests_strict_same_session(monkeypatch) -> None:
+    """Only the malformed regeneration turns pin strict mode; siblings do not."""
+    _, client, _ = _load(monkeypatch)
+    turns: list[dict] = []
+
+    def fake_run_prompt(prompt_text, **kwargs):
+        turns.append(
+            {
+                "prompt": prompt_text,
+                "strict": bool(kwargs.get("strict_same_session", False)),
+            }
+        )
+        kwargs["session_result"].update(
+            session_id="session-re",
+            resumed=bool(kwargs.get("resume_session_id")),
+            native_activity={"native_tool_calls": []},
+        )
+        if len(turns) == 1:
+            return "I inspected router.py:42 and found a race.", ""
+        if len(turns) == 2:
+            return _malformed_call(), ""
+        return _valid_call(), ""
+
+    monkeypatch.setattr(client, "_run_prompt", fake_run_prompt)
+
+    _create(client)
+
+    assert len(turns) == 3
+    assert turns[0]["strict"] is False  # primary generation: existing policy
+    assert turns[1]["strict"] is False  # read-evidence turn: existing policy
+    assert turns[2]["strict"] is True  # malformed regeneration: pinned session
