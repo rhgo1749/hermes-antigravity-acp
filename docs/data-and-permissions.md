@@ -37,11 +37,14 @@ and marked as not observed here — never guessed.
 
 - **Plugin:** reads and writes only its own state files under the selected
   Hermes home (section 3). It requests no credential environment variables.
-- **Hermes-side file tools** invoked through the ACP bridge stay behind
-  Hermes' own policy: absolute-path requirements, path-root containment,
-  credential-root denial, read redaction, and write-denial/approval checks. A
-  policy call that raises is itself a denial, never a fallback
-  (`docs/hermes-compatibility.md`).
+- **ACP file callbacks** enforce absolute paths, path-root containment,
+  credential-root denial, and Hermes read-block/redaction checks for reads.
+  A failing read policy call denies access. All ACP file-write callbacks are
+  denied; ordinary edits use Hermes `write_file` or `patch` tools, whose own
+  policies apply (`docs/hermes-compatibility.md`).
+- **Runtime boundary:** there is no filesystem sandbox. The
+  vendor subprocess runs under the invoking account; this plugin does not
+  observe or prevent direct filesystem operations by that subprocess.
 - **ACP child environment** is narrowed to a minimum enumerated allowlist
   (`PATH`, `HOME`, locale, XDG bases resolving inside the child's own profile
   home, etc.). Ambient provider API keys (`OPENAI_API_KEY`,
@@ -134,9 +137,10 @@ every entry.
   (`agy.disabledTools`) and every native file-mutation or command permission
   frame is answered with the server's own reject option, so the model performs
   shell and file work through Hermes' approval-gated terminal and file tools
-  via the Hermes `<tool_call>` bridge. The harness `fs/read_text_file` and
-  `fs/write_text_file` callbacks stay bridged through Hermes' read-block,
-  redaction, and write-safety checks.
+  via the Hermes `<tool_call>` bridge. The harness `fs/read_text_file` callback
+  applies Hermes read-block and redaction policy. The `fs/write_text_file`
+  callback is disabled and rejects every request, including workspace writes;
+  file mutations must instead use Hermes tools.
   Tool-call replay and duplicate suppression are in `docs/provider-runtime.md`.
 - The provider-mode **web research bridge** only relays function schemas
   Hermes explicitly supplies and returns calls to Hermes' policy/execution

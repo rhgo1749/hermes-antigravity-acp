@@ -263,10 +263,3 @@ def get_file_read_safety() -> tuple[Any, Any]:
     from agent.redact import redact_sensitive_text
 
     return get_read_block_error, redact_sensitive_text
-
-
-def get_file_write_safety() -> tuple[Any, Any]:
-    """Return Hermes write-denial and approval policy, without a local substitute."""
-    from agent.file_safety import get_write_denied_error, is_write_approval_required
-
-    return get_write_denied_error, is_write_approval_required

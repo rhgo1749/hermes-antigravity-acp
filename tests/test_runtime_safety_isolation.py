@@ -721,14 +721,14 @@ def test_fs_write_denied_without_hermes_write_approval(monkeypatch, tmp_path):
     _stub_file_safety(monkeypatch, needs_approval=lambda path: True)
 
     target = workspace / "proposal.py"
-    with pytest.raises(PermissionError, match="requires interactive approval"):
+    with pytest.raises(PermissionError, match="ACP fs/write_text_file is disabled"):
         module._fs_write_text_file({"path": str(target), "content": "x = 1\n"}, str(workspace))
     assert not target.exists()
 
     _stub_file_safety(
         monkeypatch, write_denied=lambda path, **kw: f"denied by policy: {Path(path).name}"
     )
-    with pytest.raises(PermissionError, match="denied by policy"):
+    with pytest.raises(PermissionError, match="ACP fs/write_text_file is disabled"):
         module._fs_write_text_file({"path": str(target), "content": "x = 1\n"}, str(workspace))
     assert not target.exists()
 
@@ -738,12 +738,12 @@ def test_fs_write_fails_closed_when_policy_is_missing_or_broken(monkeypatch, tmp
     target = workspace / "target.py"
 
     monkeypatch.setitem(sys.modules, "agent.file_safety", None)
-    with pytest.raises(PermissionError, match="file-write safety policy is unavailable"):
+    with pytest.raises(PermissionError, match="ACP fs/write_text_file is disabled"):
         module._fs_write_text_file({"path": str(target), "content": "x = 1\n"}, str(workspace))
     assert not target.exists()
 
 
-def test_fs_write_fails_closed_when_approval_policy_raises(monkeypatch, tmp_path):
+def test_fs_write_denied_without_invoking_raising_approval_policy(monkeypatch, tmp_path):
     _, module, _, workspace = _isolation(monkeypatch, tmp_path)
 
     def exploding_approval(path):
@@ -751,7 +751,7 @@ def test_fs_write_fails_closed_when_approval_policy_raises(monkeypatch, tmp_path
 
     _stub_file_safety(monkeypatch, needs_approval=exploding_approval)
     target = workspace / "target.py"
-    with pytest.raises(PermissionError, match="file-write safety policy failed"):
+    with pytest.raises(PermissionError, match="ACP fs/write_text_file is disabled"):
         module._fs_write_text_file({"path": str(target), "content": "x = 1\n"}, str(workspace))
     assert not target.exists()
 

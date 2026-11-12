@@ -471,17 +471,11 @@ def test_subprocess_home_and_scratch_are_profile_scoped_and_fail_closed(
 def test_real_upstream_file_policy_gates_acp_bridge_reads_and_writes(
     monkeypatch, tmp_path
 ):
-    """Gate B.5 (historical reference) scenario coverage: every read/redact/write decision the
-    ACP file bridge makes is delegated to the REAL unmodified upstream policy —
-    there is no local substitute anywhere in these paths.
+    """Check real upstream read policy; ACP writes are denied independently.
 
-    A read inside the plugin's own containment root returns only after upstream
-    redaction; a project ``.env`` inside that same allowed root stays upstream
-    read-blocked; the hard-denied ``~/.ssh`` key and the ``~/.ssh/config``
-    approval gate fail closed without touching bytes; a policy call that raises
-    denies the write outright; a benign workspace write passes both layers.
-    Runs un-skipped at every upstream-venv lane (live ``main``, floor
-    ``v0.21.6``) and was recorded against official ``v0.23.0``.
+    A read inside the plugin's containment root is redacted, while a project
+    ``.env`` remains read-blocked. The ACP write callback refuses even a normal
+    file; the real Hermes file tool can still create it in the workspace.
     """
     client = _load_client(monkeypatch, tmp_path)
     monkeypatch.delenv("HERMES_WRITE_SAFE_ROOT", raising=False)
@@ -511,48 +505,77 @@ def test_real_upstream_file_policy_gates_acp_bridge_reads_and_writes(
     with pytest.raises(PermissionError):
         client._fs_read_text_file({"path": str(env_file)}, str(policy_home))
 
-    # 3) Hard-denied credential write: upstream's verdict denies before any byte.
-    private_key = policy_home / ".ssh" / "id_ed25519"
-    private_key.write_text("synthetic-placeholder-bytes", encoding="utf-8")
-    with pytest.raises(PermissionError):
-        client._fs_write_text_file(
-            {"path": str(private_key), "content": "overwritten"}, str(policy_home)
-        )
-    assert private_key.read_text(encoding="utf-8") == "synthetic-placeholder-bytes"
-
-    # 4) Approval-gated write (``~/.ssh/config``): the non-interactive ACP
-    #    bridge fails closed instead of silently skipping the human prompt.
-    ssh_config = policy_home / ".ssh" / "config"
-    ssh_config.write_text("Host synthetic-example\n", encoding="utf-8")
-    with pytest.raises(PermissionError, match="requires interactive approval"):
-        client._fs_write_text_file(
-            {"path": str(ssh_config), "content": "overwritten"}, str(policy_home)
-        )
-    assert ssh_config.read_text(encoding="utf-8") == "Host synthetic-example\n"
-
-    # 5) A raising upstream policy call is itself a denial, before the write.
-    import agent.file_safety as file_safety
-
-    def raise_denied_error(*args, **kwargs):
-        raise RuntimeError("simulated upstream write policy failure")
-
-    target = policy_home / "project" / "pending.txt"
-    with monkeypatch.context() as failing:
-        failing.setattr(file_safety, "get_write_denied_error", raise_denied_error)
-        with pytest.raises(PermissionError, match="write safety policy failed"):
-            client._fs_write_text_file(
-                {"path": str(target), "content": "never-written"}, str(policy_home)
-            )
-    assert not target.exists()
-
-    # 6) A benign workspace write passes both the plugin root containment and
-    #    the real upstream denial/approval policy unchanged.
+    # 3) ACP callback writes are denied even for a normal workspace file.
     ok = policy_home / "project" / "ok.txt"
-    assert (
+    with pytest.raises(PermissionError, match="ACP fs/write_text_file is disabled"):
         client._fs_write_text_file({"path": str(ok), "content": "written"}, str(policy_home))
-        is None
-    )
+    assert not ok.exists()
+
+    # The real Hermes file tool remains available for a normal new file.
+    from tools.file_tools import write_file_tool
+
+    result = json.loads(write_file_tool(str(ok), "written", task_id="acp-write-test"))
+    assert "error" not in result, result
     assert ok.read_text(encoding="utf-8") == "written"
+
+    # Exercise a real normal coding loop through the Core tools, without a model.
+    workspace = policy_home / "project"
+    source = workspace / "example.py"
+    test_file = workspace / "test_example.py"
+    for path, content in (
+        (source, "def add(a, b):\n    return a - b\n"),
+        (test_file, "import unittest\nfrom example import add\n"
+         "class TestExample(unittest.TestCase):\n"
+         "    def test_add(self):\n        self.assertEqual(add(2, 3), 5)\n"),
+    ):
+        result = json.loads(write_file_tool(str(path), content, task_id="acp-write-test"))
+        assert "error" not in result, result
+    from tools.file_tools import patch_tool
+    from tools.terminal_tool import terminal_tool
+
+    result = json.loads(patch_tool(
+        mode="replace", path=str(source), old_string="return a - b",
+        new_string="return a + b", task_id="acp-write-test",
+    ))
+    assert "error" not in result, result
+    assert "return a + b" in source.read_text(encoding="utf-8")
+    result = json.loads(terminal_tool(
+        "python3 -m unittest test_example -q", task_id="acp-write-test", workdir=str(workspace)
+    ))
+    assert result.get("exit_code") == 0, result
+    assert "OK" in result.get("output", ""), result
+
+
+@pytest.mark.parametrize("surface", ["cli", "gateway", "cron", "subagent"])
+def test_real_upstream_contexts_deny_acp_file_write(monkeypatch, tmp_path, surface):
+    from contextlib import ExitStack
+    from agent.delegation_context import delegated_child_context, is_delegated_child_context
+    from gateway.session_context import get_session_env
+
+    client = _load_client(monkeypatch, tmp_path)
+    target = tmp_path / "AGENTS.md"
+    target.write_text("original", encoding="utf-8")
+    with ExitStack() as stack:
+        if surface in {"gateway", "subagent"}:
+            tokens = set_session_vars(
+                platform="telegram", session_key="parent", session_id="parent-id", cwd=str(tmp_path)
+            )
+            stack.callback(clear_session_vars, tokens)
+            assert get_session_env("HERMES_SESSION_KEY") == "parent"
+        if surface == "subagent":
+            stack.enter_context(delegated_child_context("child-id"))
+            assert is_delegated_child_context()
+            assert get_session_env("HERMES_SESSION_ID") == "child-id"
+        if surface == "cron":
+            from cron.scheduler import _CronRunScope
+
+            scope = _CronRunScope({"workdir": str(tmp_path)}, "acp-test", "run-1")
+            stack.callback(scope.exit)
+            scope.enter()
+            assert get_session_env("HERMES_CRON_SESSION") == "1"
+        with pytest.raises(PermissionError, match="ACP fs/write_text_file is disabled"):
+            client._fs_write_text_file({"path": str(target), "content": "changed"}, str(tmp_path))
+        assert target.read_text(encoding="utf-8") == "original"
 
 
 def test_real_upstream_lane_provenance_separates_affinity_and_fails_closed(
