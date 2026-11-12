@@ -325,7 +325,7 @@ def test_stderr_flood_cannot_deadlock_raw_probe(
     assert status["outcome"] == "PASS"
 
 
-def test_legacy_trusted_analysis_fields_remain_intact(
+def test_legacy_analysis_fields_remain_intact(
     canary, tmp_path
 ):
     recorder = canary.FrameRecorder(
@@ -658,12 +658,11 @@ def test_valid_non_pass_stop_reason_is_preserved_without_fingerprint(
     assert prompt_result["stop_reason"] == "max_tokens"
 
 
-@pytest.mark.parametrize("mode", ["default", "trusted", "trusted-boundary"])
-def test_legacy_modes_pass_lane_gate_without_new_flags(
-    canary, monkeypatch, tmp_path, mode
+def test_legacy_mode_passes_lane_gate_without_new_flags(
+    canary, monkeypatch, tmp_path
 ):
-    """Legacy CLI modes keep their pre-historical reference unattended contract: no lane flag
-    is required, and execution proceeds past argument/lane validation."""
+    """The legacy default CLI mode keeps its pre-historical reference unattended contract: no
+    lane flag is required, and execution proceeds past argument/lane validation."""
     binary = _fake(tmp_path)
     monkeypatch.setenv("ACP_FAKE_SCENARIO", "ok")
     log_path = tmp_path / "requests.jsonl"
@@ -683,16 +682,17 @@ def test_legacy_modes_pass_lane_gate_without_new_flags(
 
     monkeypatch.setattr(canary, "load_client_module", _stop_at_provider_load)
     argv = [
-        "acp_live_canary.py", "--cwd", str(tmp_path), "--mode", mode,
+        "acp_live_canary.py", "--cwd", str(tmp_path), "--mode", "default",
         "--evidence", str(tmp_path / "evidence"), "--command", str(binary),
     ]
-    if mode == "trusted-boundary":
-        argv += ["--escape-target", str(tmp_path / "outside-target.py")]
     monkeypatch.setattr(sys, "argv", argv)
     with pytest.raises(LegacyGatePassed):
         canary.main()
-    # No subprocess may be spawned before the provider stage in legacy modes.
+    # No subprocess may be spawned before the provider stage in legacy mode.
     assert not log_path.exists()
+    # the retired switches are never (re)injected by the canary itself
+    assert os.environ["HERMES_ANTIGRAVITY_ACP_EXECUTION_MODE"] == "preseed"
+    assert os.environ["HERMES_ANTIGRAVITY_ACP_WORKSPACE"] == "preseed"
 
 
 def test_raw_probe_never_persists_server_controlled_primitives_of_any_json_type(
@@ -886,7 +886,7 @@ def test_raw_protocol_sanitizer_fail_closed_primitive_matrix(canary):
     assert _strict(canary, {"params": {"sessionId": INT_SENTINEL}}
                    )["params"]["sessionId"] == "<redacted>"
 
-    # legacy default/trusted sanitizer keeps its numeric pass-through contract
+    # legacy default sanitizer keeps its numeric pass-through contract
     assert canary._sanitize({"x": INT_SENTINEL, "y": True, "z": None},
                             lambda s: s) == {"x": INT_SENTINEL, "y": True, "z": None}
 

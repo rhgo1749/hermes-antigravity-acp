@@ -11,7 +11,7 @@ title: Antigravity ACP (official)
 repo: https://github.com/rhgo1749/hermes-antigravity-acp
 sha: "<40-HEX-AT-SUBMISSION>"
 subdir: hermes-plugin/antigravity-acp
-version: 0.7.9
+version: 0.7.10
 description: >-
   Google Antigravity through Google's official ACP server (ACP v1 JSON-RPC
   over stdio). Disclosure — registers one model provider at import and
@@ -19,9 +19,8 @@ description: >-
   the user's official Antigravity ACP launcher as a child process, and all
   Google sign-in (oauth-personal / oauth-business / gemini-api-key /
   agent-platform) happens inside Google's own runtime, never through keys
-  this plugin reads; the plugin holds no credentials. Operational overrides
-  HERMES_ANTIGRAVITY_ACP_COMMAND/_ARGS (launch target), _WORKSPACE /
-  _EXECUTION_MODE (trusted coding mode), _NATIVE_VIDEO /
+  this plugin reads; the plugin holds no credentials.  Operational overrides
+  HERMES_ANTIGRAVITY_ACP_COMMAND/_ARGS (launch target), _NATIVE_VIDEO /
   _NATIVE_TOKEN_LIMIT / _ROTATION_FRACTION (multimodal and context policy),
   _STATE_FILE / _STATE_TTL_SECONDS / _STATE_MAX_ENTRIES /
   _LIMIT_STATE_FILE / _LIMIT_TTL_SECONDS (session and rate-limit state
@@ -36,11 +35,11 @@ description: >-
   once by the user, never at plugin import) downloads the official
   Antigravity ACP server release from Google's first-party distribution at
   dl.google.com and verifies it against the first-party feed digest
-  (SHA-256, checked before extraction) recorded in the repository. The provider
-  defaults to trusted-coding behavior: it automatically approves supported
-  native edits and commands when its checks pass, and native commands bypass
-  Hermes terminal approval. Workspace path checks are not a sandbox; this
-  behavior may conflict with catalog rule 12 and requires maintainer review.
+  (SHA-256, checked before extraction) recorded in the repository.  The provider never
+  auto-approves native execution: native run_command is disabled at session
+  launch and native file-mutation or command permission frames are rejected,
+  so shell and file work goes through Hermes' own approval-gated terminal and
+  file tools.
   A separately installed opt-in MUX script (never imported by the plugin)
   can run one official ACP server child per signed-in Google account for
   session affinity. The plugin may retain an initialized server child in a
