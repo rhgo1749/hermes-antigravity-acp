@@ -21,3 +21,4 @@ if not "%RESULT%"=="0" (
 echo.
 pause
 exit /b %RESULT%
+rem Scenario probe (issue #9 CI validation): installer change must classify as packaging scope (full matrix).
