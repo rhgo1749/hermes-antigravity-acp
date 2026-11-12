@@ -432,8 +432,8 @@ def main() -> int:
                 pass
 
             if upstream is None:
+                gc_mode = os.environ.get("ACP_MUX_SESSION_GC", "")
                 if not session_gc_run:
-                    gc_mode = os.environ.get("ACP_MUX_SESSION_GC", "")
                     if gc_mode == "1":
                         base.prune_session_stores()
                     elif gc_mode == "dry-run":
@@ -472,7 +472,14 @@ def main() -> int:
                         )
                     session_gc_run = True
                 if not owner_prune_run:
-                    base.prune_session_owners()
+                    if gc_mode == "dry-run":
+                        # dry-run is a census, not a cleanup: expired owner
+                        # records are reported by the inventory, never
+                        # deleted here.
+                        base._log("owner-records prune skipped "
+                                  "(ACP_MUX_SESSION_GC=dry-run)")
+                    else:
+                        base.prune_session_owners()
                     owner_prune_run = True
                 resume_id = os.environ.get("ACP_MUX_SESSION_ID", "")
                 owner = base._resolve_session_owner(resume_id) if resume_id else None

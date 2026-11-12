@@ -125,9 +125,18 @@ operations on different stores, and neither one authorizes the other:
   byte totals, age buckets, checkpoint/owner linkage, and the bundles the
   current GC policy *would* select — and deletes nothing.  Setting
   `ACP_MUX_SESSION_GC=dry-run` for a directly-launched mux logs the same
-  summary at bind time instead of deleting.  The report never contains
-  raw session ids, account labels, homes, or paths; lanes appear only as
-  positional indexes.
+  summary at bind time instead of deleting; it also skips the expired
+  owner-record cleanup, so a dry-run pass mutates neither native bundles
+  nor owner metadata.  The report never contains raw session ids, account
+  labels, homes, or paths; lanes appear only as positional indexes.
+- Inventory locking makes zero filesystem changes: it never creates the
+  lock file or changes any mode.  The report's `lock` field is
+  `"acquired"` when the walk was serialized against GC/owner-prune passes,
+  or `"absent-unserialized"` when no lock file existed — still a sound
+  snapshot, because every pruning pass creates the lock file before
+  deleting, so a lock file still absent after the walk proves no pass ran
+  during it.  A lock file that appears mid-walk, or a contended lock,
+  yields `status: "incomplete"` and no candidate claims.
 - Candidate counts are a policy prediction, **not** a reclamation
   verdict: the current GC has no process lease and no origin tag, so a
   reported candidate may still belong to a live or parked ACP child

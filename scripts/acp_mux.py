@@ -635,16 +635,14 @@ def _active_hermes_session_ids(
     return active
 
 
-@contextmanager
-def _session_gc_lock(blocking: bool = True) -> Iterator[bool]:
-    """Serialize destructive session-store pruning across mux processes.
+def _gc_lock_path() -> str:
+    return STATE_PATH + ".session-gc.lock"
 
-    ``blocking=False`` is the read-only inventory's conservative mode: a
-    contended lock is reported as unavailable immediately instead of
-    queueing behind a deletion pass.  The GC and owner-prune paths keep the
-    original blocking serialization.
-    """
-    lock_path = STATE_PATH + ".session-gc.lock"
+
+@contextmanager
+def _session_gc_lock() -> Iterator[bool]:
+    """Serialize destructive session-store pruning across mux processes."""
+    lock_path = _gc_lock_path()
     directory = os.path.dirname(lock_path)
     if fcntl is None or not hasattr(os, "O_NOFOLLOW"):
         yield False
@@ -669,10 +667,7 @@ def _session_gc_lock(blocking: bool = True) -> Iterator[bool]:
     acquired = False
     try:
         try:
-            fcntl.flock(
-                lock.fileno(),
-                fcntl.LOCK_EX if blocking else (fcntl.LOCK_EX | fcntl.LOCK_NB),
-            )
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
             acquired = True
         except OSError:
             pass
@@ -684,6 +679,53 @@ def _session_gc_lock(blocking: bool = True) -> Iterator[bool]:
             except OSError:
                 pass
         lock.close()
+
+
+@contextmanager
+def _session_gc_lock_probe() -> Iterator[str]:
+    """Non-creating, non-blocking lock probe for the read-only inventory.
+
+    Unlike ``_session_gc_lock`` this never creates the lock file or its
+    parent directory and never changes file modes: the inventory must make
+    zero filesystem changes.  Yields a state token:
+
+    - ``"acquired"``    - the lock is held for the duration of the block;
+      the walk is serialized against GC and owner-prune passes.
+    - ``"absent"``      - no lock file exists.  The caller must re-check
+      existence after the walk: a GC/owner-prune pass always creates the
+      lock file before deleting, so a still-absent file proves no pass
+      started mid-scan; an appeared file makes the snapshot unserialized
+      and the report must be ``incomplete``.
+    - ``"unavailable"`` - contended or unsafe to open; fail closed.
+    - ``"unsupported"`` - no flock support; fail closed.
+    """
+    lock_path = _gc_lock_path()
+    if fcntl is None or not hasattr(os, "O_NOFOLLOW"):
+        yield "unsupported"
+        return
+    try:
+        fd = os.open(lock_path, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        yield "absent"
+        return
+    except OSError:
+        yield "unavailable"
+        return
+    acquired = False
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
+        except OSError:
+            pass
+        yield "acquired" if acquired else "unavailable"
+    finally:
+        if acquired:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+        os.close(fd)
 
 
 def _ownership_accounts() -> list[tuple[str, str, str]] | None:
@@ -1490,6 +1532,15 @@ def session_inventory(
     candidate claims for the affected lane.  ``deletions_performed`` is a
     constant 0 by construction: this code path never calls
     ``_delete_session_bundle``.
+
+    Locking: the inventory never creates the lock file, its parent
+    directory, or changes any mode (see ``_session_gc_lock_probe``).  The
+    ``lock`` field is ``"acquired"`` when the walk was serialized, or
+    ``"absent-unserialized"`` when no lock file existed; the latter is
+    still a sound snapshot because a still-absent lock file after the walk
+    proves no GC/owner-prune pass started during it (every pass creates
+    the lock file before deleting).  A lock file that appears mid-walk
+    makes the report ``incomplete`` with ``gc-lock-appeared-mid-scan``.
     """
     now = time.time() if now is None else now
     report: dict[str, Any] = {
@@ -1516,9 +1567,12 @@ def session_inventory(
         report["status"] = "incomplete"
         return report
 
-    with _session_gc_lock(blocking=False) as locked:
-        if not locked:
+    with _session_gc_lock_probe() as lock_state:
+        if lock_state in ("unavailable", "unsupported"):
             return _incomplete("gc-lock-unavailable")
+        report["lock"] = (
+            "acquired" if lock_state == "acquired" else "absent-unserialized"
+        )
         entries, meta, problem = _load_registry_data()
         if problem not in ("", "missing"):
             return _incomplete(f"registry-{problem}")
@@ -1558,6 +1612,11 @@ def session_inventory(
                 elif totals[key] is not None:
                     totals[key] = int(totals[key]) + int(value)
         report["totals"] = totals
+        if lock_state == "absent" and os.path.exists(_gc_lock_path()):
+            # A GC or owner-prune pass started mid-walk (every pass creates
+            # the lock file first): this snapshot is not serialized against
+            # deletion and must not be reported as ok.
+            return _incomplete("gc-lock-appeared-mid-scan")
     return report
 
 
@@ -2259,8 +2318,8 @@ def main() -> int:
             except (json.JSONDecodeError, ValueError):
                 pass
             if upstream is None:
+                gc_mode = os.environ.get("ACP_MUX_SESSION_GC", "")
                 if not session_gc_run:
-                    gc_mode = os.environ.get("ACP_MUX_SESSION_GC", "")
                     if gc_mode == "1":
                         prune_session_stores()
                     elif gc_mode == "dry-run":
@@ -2299,7 +2358,14 @@ def main() -> int:
                         )
                     session_gc_run = True
                 if not owner_prune_run:
-                    prune_session_owners()
+                    if gc_mode == "dry-run":
+                        # dry-run is a census, not a cleanup: expired owner
+                        # records are reported by the inventory, never
+                        # deleted here.
+                        _log("owner-records prune skipped "
+                             "(ACP_MUX_SESSION_GC=dry-run)")
+                    else:
+                        prune_session_owners()
                     owner_prune_run = True
                 resume_id = os.environ.get("ACP_MUX_SESSION_ID", "")
                 owner = _resolve_session_owner(resume_id) if resume_id else None

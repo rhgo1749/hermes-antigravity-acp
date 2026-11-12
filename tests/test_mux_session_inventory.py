@@ -295,3 +295,140 @@ def test_bind_time_dry_run_logs_summary_and_keeps_bundles(lanes, tmp_path, entry
     assert "session-gc expired" not in log
     assert stale.exists(), "dry-run must never delete"
     assert SID_OLD not in log
+
+
+def _run_bind(lanes, tmp_path, entrypoint, gc_mode=None):
+    """Drive one bind through a fake server; returns the mux log text."""
+    _a, _b, state_file = lanes
+    fake = tmp_path / "fake-server.py"
+    fake.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json,sys\n"
+        "for line in sys.stdin:\n"
+        "    r=json.loads(line)\n"
+        "    print(json.dumps({'jsonrpc':'2.0','id':r.get('id'),'result':{'ok':True}}),flush=True)\n"
+    )
+    fake.chmod(0o755)
+    env = os.environ.copy()
+    env.update({
+        "ACP_MUX_ACCOUNTS": mux.REGISTRY_PATH,
+        "ACP_MUX_STATE": mux.STATE_PATH,
+        "ACP_MUX_LOG": mux.LOG_PATH,
+        "ACP_MUX_PAR": str(fake),
+        "ACP_MUX_DEFAULT_HOME": str(Path(mux.DEFAULT_HOME)),
+        "HERMES_ANTIGRAVITY_ACP_STATE_FILE": str(state_file),
+        "HOME": str(tmp_path),
+    })
+    if gc_mode is None:
+        env.pop("ACP_MUX_SESSION_GC", None)
+    else:
+        env["ACP_MUX_SESSION_GC"] = gc_mode
+    env.pop("HERMES_HOME", None)
+    env.pop("HERMES_REAL_HOME", None)
+    env.pop("ACP_MUX_SESSION_ID", None)
+    request = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize"}) + "\n"
+    completed = subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / entrypoint)],
+        input=request, text=True, capture_output=True, env=env, timeout=30, check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    return Path(mux.LOG_PATH).read_text()
+
+
+def _expired_owner_record(lanes, *, now: float) -> Path:
+    """One owner record whose bundle and checkpoint are gone and past grace."""
+    lane_key = mux._ownership_accounts()[0][2]
+    owners_path = Path(mux.STATE_PATH + ".owners.json")
+    owners_path.write_text(json.dumps({"version": 2, "owners": {
+        mux._owner_hash("gone-session"): {
+            "lane": mux._owner_hash(lane_key),
+            "at": now - 400 * DAY,
+        }
+    }}))
+    return owners_path
+
+
+@pytest.mark.parametrize("entrypoint", ["acp_mux.py", "antigravity-acp-mux.py"])
+def test_dry_run_bind_preserves_expired_owner_records(lanes, tmp_path, entrypoint):
+    """P1: dry-run must not mutate owner metadata either, only census it."""
+    a, _b, state_file = lanes
+    now = time.time()
+    _bundle(a, SID_FRESH, mtime=now - 60)
+    _checkpoints(state_file, [], now=now)
+    owners_path = _expired_owner_record(lanes, now=now)
+    before = owners_path.read_bytes()
+
+    log = _run_bind(lanes, tmp_path, entrypoint, gc_mode="dry-run")
+
+    assert owners_path.read_bytes() == before, (
+        "dry-run must leave ownership records byte-identical"
+    )
+    assert "owner-records kept" not in log, "dry-run must not run the owner prune"
+
+
+def test_normal_bind_still_prunes_expired_owner_records(lanes, tmp_path):
+    """Regression: non-dry-run keeps the existing metadata-only cleanup."""
+    a, _b, state_file = lanes
+    now = time.time()
+    _bundle(a, SID_FRESH, mtime=now - 60)
+    _checkpoints(state_file, [], now=now)
+    owners_path = _expired_owner_record(lanes, now=now)
+
+    log = _run_bind(lanes, tmp_path, "acp_mux.py", gc_mode=None)
+
+    assert "owner-records kept=0 removed=1" in log
+    assert json.loads(owners_path.read_text())["owners"] == {}
+
+
+def test_inventory_absent_lock_creates_no_files(lanes):
+    """P2: a missing lock file must not be created by the inventory probe."""
+    a, _b, state_file = lanes
+    now = time.time()
+    _bundle(a, SID_OLD, mtime=now - 72 * 3600)
+    _checkpoints(state_file, [], now=now)
+    lock_path = Path(mux.STATE_PATH + ".session-gc.lock")
+    assert not lock_path.exists()
+
+    report = _inventory(state_file, now=now)
+
+    assert report["status"] == "ok"
+    assert report["lock"] == "absent-unserialized"
+    assert not lock_path.exists(), "inventory must not create the lock file"
+
+
+def test_inventory_contended_lock_leaves_metadata_untouched(lanes):
+    """P2: a contended probe must not chmod or rewrite the lock file."""
+    _a, _b, state_file = lanes
+    lock_path = Path(mux.STATE_PATH + ".session-gc.lock")
+    with mux._session_gc_lock() as locked:
+        assert locked
+        lock_path.chmod(0o644)
+        mode_before = lock_path.stat().st_mode
+        report = _inventory(state_file, now=time.time())
+    assert report["status"] == "incomplete"
+    assert report["reasons"] == ["gc-lock-unavailable"]
+    assert lock_path.stat().st_mode == mode_before, "probe must not change lock modes"
+
+
+def test_inventory_lock_appeared_mid_scan_is_incomplete(lanes, monkeypatch):
+    """P2: absent-bracket proof fails if a GC pass starts during the walk."""
+    a, _b, state_file = lanes
+    now = time.time()
+    _bundle(a, SID_OLD, mtime=now - 72 * 3600)
+    _checkpoints(state_file, [], now=now)
+    lock_path = Path(mux.STATE_PATH + ".session-gc.lock")
+    real = mux._lane_inventory
+    fired = {"done": False}
+
+    def spy(lane, home, active, owners, *, now):
+        if not fired["done"]:
+            fired["done"] = True
+            lock_path.write_text("")  # simulate a GC pass starting mid-scan
+        return real(lane, home, active, owners, now=now)
+
+    monkeypatch.setattr(mux, "_lane_inventory", spy)
+
+    report = _inventory(state_file, now=now)
+
+    assert report["status"] == "incomplete"
+    assert "gc-lock-appeared-mid-scan" in report["reasons"]
