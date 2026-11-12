@@ -255,6 +255,12 @@ _MALFORMED_TOOL_CALL_CORRECTION = (
     "Do not invent a different action or claim that a setting was changed."
 )
 _MAX_MALFORMED_TOOL_CALL_CORRECTIONS = 1
+# Request-wide hard cap on malformed tool-call regeneration shared by the
+# primary extraction path and the read-evidence correction path (issue #14).
+# The primary path keeps its local cap of 1; the read-evidence path may only
+# spend what the primary path left of this budget, so one request never emits
+# more than two additional generations for a malformed sequence.
+_MAX_MALFORMED_TOOL_CALL_CORRECTIONS_TOTAL = 2
 _ARTIFACT_CLAIM_CORRECTION = (
     "Your previous final answer claimed one or more Hermes scratch artifacts that do not exist on disk. "
     "Do not repeat or invent those paths. If the task still requires those artifacts, emit the exact Hermes tool call "
@@ -4142,54 +4148,29 @@ class AntigravityACPClient:
             )
             tool_calls: list[Any] = []
             cleaned_text = ""
-            for malformed_attempt in range(_MAX_MALFORMED_TOOL_CALL_CORRECTIONS + 1):
-                try:
-                    tool_calls, cleaned_text = _extract_advertised_tool_calls(
-                        response_text, active_tools
-                    )
-                    break
-                except MalformedToolCallError as exc:
-                    if exc.unrecoverable:
-                        if exc.reason == "unadvertised_tool":
-                            raise RuntimeError(str(exc)) from exc
-                        raise RuntimeError(
-                            "Antigravity ACP leaked malformed tool-result protocol data; "
-                            "outcome is UNKNOWN, refusing to replay any action or expose the result."
-                        ) from exc
-                    if malformed_attempt >= _MAX_MALFORMED_TOOL_CALL_CORRECTIONS:
-                        raise RuntimeError(
-                            "Antigravity ACP emitted malformed Hermes tool-call JSON again after one correction; "
-                            "refusing to expose or execute the invalid action."
-                        ) from exc
-                    remaining = timeout_seconds - (time.monotonic() - started)
-                    if remaining <= 0:
-                        raise TimeoutError(
-                            "Timed out while correcting malformed Antigravity ACP tool-call JSON."
-                        ) from exc
-                    prior_session_id = str(session_result.get("session_id") or "").strip()
-                    correction_full_prompt = (
-                        f"{full_prompt_text}\n\nPrevious malformed model output (not executed):\n{response_text}"
-                        f"\n\n{_MALFORMED_TOOL_CALL_CORRECTION}"
-                    )
-                    correction_result: dict[str, Any] = {}
-                    logger.warning(
-                        "Antigravity ACP emitted malformed tool-call JSON%s; requesting one in-session correction.",
-                        f" for {exc.tool_name!r}" if exc.tool_name else "",
-                    )
-                    response_text, reasoning = self._run_prompt(
-                        _MALFORMED_TOOL_CALL_CORRECTION,
-                        timeout_seconds=remaining,
-                        model=model,
-                        affinity_key=affinity_key,
-                        resume_session_id=prior_session_id,
-                        full_prompt_text=correction_full_prompt,
-                        session_result=correction_result,
-                        image_blocks=(),
-                        replay_image_blocks=replay_image_blocks,
-                        thinking_level=requested_thinking_level,
-                    )
-                    session_result = correction_result
-            if malformed_attempt and not tool_calls:
+            # One request-wide malformed-correction budget (issue #14). The
+            # primary path spends at most _MAX_MALFORMED_TOOL_CALL_CORRECTIONS
+            # of it; whatever remains is what the read-evidence correction
+            # path below may still spend, so nested loops never multiply the
+            # regeneration allowance.
+            malformed_budget = [_MAX_MALFORMED_TOOL_CALL_CORRECTIONS]
+            tool_calls, cleaned_text, session_result, reasoning, malformed_corrections_used = (
+                self._extract_with_malformed_recovery(
+                    response_text,
+                    active_tools,
+                    session_result=session_result,
+                    budget=malformed_budget,
+                    model=model,
+                    affinity_key=affinity_key,
+                    full_prompt_text=full_prompt_text,
+                    replay_image_blocks=replay_image_blocks,
+                    thinking_level=requested_thinking_level,
+                    timeout_seconds=timeout_seconds,
+                    started=started,
+                    reasoning=reasoning,
+                )
+            )
+            if malformed_corrections_used and not tool_calls:
                 raise RuntimeError(
                     "Antigravity ACP correction did not produce a valid Hermes tool call; "
                     "refusing to present an unverified task completion."
@@ -4265,6 +4246,17 @@ class AntigravityACPClient:
                 )
                 and not _pending_read_tool_call(tool_calls)
             ):
+                # Issue #14: the read-evidence path may only spend what the
+                # primary path left of the request-wide malformed budget, and
+                # the same list carries consumption across outer iterations so
+                # the loops never multiply the regeneration allowance.
+                read_evidence_malformed_budget = [
+                    max(
+                        0,
+                        _MAX_MALFORMED_TOOL_CALL_CORRECTIONS_TOTAL
+                        - malformed_corrections_used,
+                    )
+                ]
                 for _read_evidence_attempt in range(_MAX_READ_EVIDENCE_CORRECTIONS):
                     remaining = timeout_seconds - (time.monotonic() - started)
                     if remaining <= 0:
@@ -4291,10 +4283,22 @@ class AntigravityACPClient:
                         replay_image_blocks=replay_image_blocks,
                         thinking_level=requested_thinking_level,
                     )
-                    tool_calls, cleaned_text = _extract_advertised_tool_calls(
-                        response_text, active_tools
+                    tool_calls, cleaned_text, session_result, reasoning, _used = (
+                        self._extract_with_malformed_recovery(
+                            response_text,
+                            active_tools,
+                            session_result=correction_result,
+                            budget=read_evidence_malformed_budget,
+                            model=model,
+                            affinity_key=affinity_key,
+                            full_prompt_text=correction_full_prompt,
+                            replay_image_blocks=replay_image_blocks,
+                            thinking_level=requested_thinking_level,
+                            timeout_seconds=timeout_seconds,
+                            started=started,
+                            reasoning=reasoning,
+                        )
                     )
-                    session_result = correction_result
                     if _pending_read_tool_call(tool_calls) or _native_completed_read_evidence(
                         dict(session_result.get("native_activity") or {})
                     ):
@@ -4560,6 +4564,7 @@ class AntigravityACPClient:
         affinity_key: str = "",
         resume_session_id: str = "",
         activity_stats_out: dict[str, Any] | None = None,
+        strict_same_session: bool = False,
     ) -> Iterator[tuple[dict[str, Any], Callable[..., Any], dict[str, Any]]]:
         resume_session_id = str(resume_session_id or "").strip()
         entry = self._warm_acquire(affinity_key, resume_session_id)
@@ -4761,6 +4766,24 @@ class AntigravityACPClient:
                     resume_params["_meta"] = session_meta
                 session = request("session/resume", resume_params) or {}
                 session = dict(session)
+                reported_session_id = str(session.get("sessionId") or "").strip()
+                if (
+                    strict_same_session
+                    and reported_session_id
+                    and reported_session_id != resume_session_id
+                ):
+                    # P1 round 3: a resume response naming a different session
+                    # must never reach session/prompt. A response that legally
+                    # omits sessionId (the shape the official server returns
+                    # and the repo's fake servers emit) is not a mismatch; it
+                    # is accepted via the pinned id below.
+                    raise RuntimeError(
+                        "Antigravity ACP strict same-session recovery refused: "
+                        f"session/resume reported session "
+                        f"{reported_session_id[:12]!r} instead of the pinned "
+                        f"{resume_session_id[:12]!r}; refusing to send "
+                        "session/prompt to an unconfirmed session."
+                    )
                 session.setdefault("sessionId", resume_session_id)
                 session["_hermes_resumed"] = True
             else:
@@ -4833,6 +4856,119 @@ class AntigravityACPClient:
         finally:
             self.close()
 
+    def _extract_with_malformed_recovery(
+        self,
+        response_text: str,
+        tools: list[dict[str, Any]] | None,
+        *,
+        session_result: dict[str, Any],
+        budget: list[int],
+        model: str | None,
+        affinity_key: str,
+        full_prompt_text: str,
+        replay_image_blocks: tuple[dict[str, str], ...],
+        thinking_level: str | None,
+        timeout_seconds: float,
+        started: float,
+        reasoning: str = "",
+    ) -> tuple[list[Any], str, dict[str, Any], str, int]:
+        """Extract advertised tool calls, correcting malformed envelopes in-session.
+
+        Shared by the primary extraction path and the read-evidence correction
+        path so both consume one bounded malformed-correction budget (``budget``
+        is a single-element remaining-count list). Only recoverable
+        ``MalformedToolCallError`` enters the correction loop; unadvertised
+        tools, leaked tool-result protocol data, and every other exception keep
+        their existing fail-closed behavior. The invalid call is never
+        dispatched. Regeneration resumes the same ACP session under
+        ``strict_same_session`` (no resume-miss replay, no fresh-session
+        failover, confirmed session id); when the session identity is
+        unavailable the request terminates instead of silently opening a new
+        session and replaying the prompt.
+
+        Returns ``(tool_calls, cleaned_text, session_result, reasoning,
+        corrections_used)``.
+        """
+        current_session_result = session_result
+        corrections = 0
+        while True:
+            try:
+                tool_calls, cleaned_text = _extract_advertised_tool_calls(
+                    response_text, tools
+                )
+            except MalformedToolCallError as exc:
+                if exc.unrecoverable:
+                    if exc.reason == "unadvertised_tool":
+                        raise RuntimeError(str(exc)) from exc
+                    raise RuntimeError(
+                        "Antigravity ACP leaked malformed tool-result protocol data; "
+                        "outcome is UNKNOWN, refusing to replay any action or expose the result."
+                    ) from exc
+                if budget[0] <= 0:
+                    count_word = {0: "no", 1: "one", 2: "two"}.get(
+                        corrections, str(corrections)
+                    )
+                    raise RuntimeError(
+                        "Antigravity ACP emitted malformed Hermes tool-call JSON again after "
+                        f"{count_word} correction{'' if corrections == 1 else 's'}; the "
+                        "request-wide malformed budget is exhausted, refusing to expose or "
+                        "execute the invalid action."
+                    ) from exc
+                remaining = timeout_seconds - (time.monotonic() - started)
+                if remaining <= 0:
+                    raise TimeoutError(
+                        "Timed out while correcting malformed Antigravity ACP tool-call JSON."
+                    ) from exc
+                prior_session_id = str(
+                    current_session_result.get("session_id") or ""
+                ).strip()
+                if not prior_session_id:
+                    raise RuntimeError(
+                        "Antigravity ACP cannot recover a malformed tool call: the ACP session "
+                        "id is unavailable, so same-session regeneration cannot be confirmed; "
+                        "refusing to open a new session or replay the request."
+                    ) from exc
+                budget[0] -= 1
+                corrections += 1
+                correction_full_prompt = (
+                    f"{full_prompt_text}\n\nPrevious malformed model output (not executed):\n{response_text}"
+                    f"\n\n{_MALFORMED_TOOL_CALL_CORRECTION}"
+                )
+                correction_result: dict[str, Any] = {}
+                logger.warning(
+                    "Antigravity ACP emitted malformed tool-call JSON%s; requesting in-session "
+                    "correction %d (request-wide malformed budget remaining %d).",
+                    f" for {exc.tool_name!r}" if exc.tool_name else "",
+                    corrections,
+                    budget[0],
+                )
+                response_text, reasoning = self._run_prompt(
+                    _MALFORMED_TOOL_CALL_CORRECTION,
+                    timeout_seconds=remaining,
+                    model=model,
+                    affinity_key=affinity_key,
+                    resume_session_id=prior_session_id,
+                    full_prompt_text=correction_full_prompt,
+                    session_result=correction_result,
+                    image_blocks=(),
+                    replay_image_blocks=replay_image_blocks,
+                    thinking_level=thinking_level,
+                    strict_same_session=True,
+                )
+                current_session_result = correction_result
+                continue
+            if corrections:
+                logger.info(
+                    "Antigravity ACP malformed tool-call recovery produced a valid extraction "
+                    "after %d in-session correction(s).",
+                    corrections,
+                )
+            else:
+                logger.debug(
+                    "Antigravity ACP tool-call extraction succeeded on the first pass."
+                )
+            return tool_calls, cleaned_text, current_session_result, reasoning, corrections
+
     def _run_prompt(
         self,
         prompt_text: str,
@@ -4847,12 +4983,26 @@ class AntigravityACPClient:
         image_blocks: tuple[dict[str, str], ...] = (),
         replay_image_blocks: tuple[dict[str, str], ...] = (),
         thinking_level: str | None = None,
+        strict_same_session: bool = False,
     ) -> tuple[str, str]:
-        """Run a prompt with native resume, resume-miss replay, and bounded failover."""
+        """Run a prompt with native resume, resume-miss replay, and bounded failover.
+
+        ``strict_same_session`` pins this generation to the resumed session
+        (issue #14 P1 rework): a resume miss or any failover-eligible error
+        raises a classified refusal instead of rebuilding on a fresh session,
+        and a response reported under a different session id than pinned is
+        rejected. Used only by malformed tool-call regeneration; the ordinary
+        conversation transport policy is untouched.
+        """
         deadline = time.monotonic() + timeout_seconds
         replay_text = full_prompt_text or prompt_text
         next_text = prompt_text
         next_resume = str(resume_session_id or "").strip()
+        if strict_same_session and not next_resume:
+            raise RuntimeError(
+                "Antigravity ACP strict same-session recovery refused: no session id "
+                "was supplied to pin the regeneration to."
+            )
         next_image_blocks = image_blocks
         resume_miss_replayed = False
         failovers = 0
@@ -4864,7 +5014,7 @@ class AntigravityACPClient:
                 raise TimeoutError("Timed out before Antigravity ACP prompt could complete.")
             attempt_activity: dict[str, Any] = {}
             try:
-                return self._run_prompt_once(
+                outcome = self._run_prompt_once(
                     next_text,
                     timeout_seconds=remaining,
                     model=model,
@@ -4874,6 +5024,7 @@ class AntigravityACPClient:
                     session_result=session_result,
                     activity_out=attempt_activity,
                     image_blocks=next_image_blocks,
+                    strict_same_session=strict_same_session,
                 )
             except RuntimeError as exc:
                 # A checkpoint error after the prompt has started may follow partial
@@ -4900,6 +5051,18 @@ class AntigravityACPClient:
                     model,
                     inferred_upper_bound=native_token_hint if next_resume else 0,
                 )
+                if strict_same_session:
+                    # Issue #14 P1: malformed tool-call regeneration never
+                    # leaves the pinned session. Rebuilding or rotating would
+                    # full-replay the prompt and could duplicate native side
+                    # effects, so refuse with a classified error instead.
+                    raise RuntimeError(
+                        "Antigravity ACP strict same-session recovery refused: the "
+                        "regeneration turn failed on the pinned session and neither "
+                        "resume-miss replay nor fresh-session failover is permitted "
+                        "for malformed tool-call correction; refusing to replay the "
+                        "prompt outside the original session."
+                    ) from exc
                 if next_resume and not resume_miss_replayed and _resume_session_missing(exc):
                     logger.info(
                         "Antigravity ACP session %s is unavailable; rebuilding with one full replay.",
@@ -4952,6 +5115,22 @@ class AntigravityACPClient:
                 next_text = replay_text
                 next_resume = ""
                 next_image_blocks = replay_image_blocks
+                continue
+            if strict_same_session:
+                # The server confirms the session it actually answered under;
+                # anything other than the pinned id means the response came
+                # from a session this correction contract cannot vouch for.
+                issued_session_id = str(
+                    (session_result or {}).get("session_id") or ""
+                ).strip()
+                if issued_session_id != next_resume:
+                    raise RuntimeError(
+                        "Antigravity ACP strict same-session recovery refused: the "
+                        f"regeneration reported session {issued_session_id[:12]!r} "
+                        f"instead of the pinned session {next_resume[:12]!r}; refusing "
+                        "to trust a response from an unconfirmed session."
+                    )
+            return outcome
 
     def _run_prompt_once(
         self,
@@ -4965,6 +5144,7 @@ class AntigravityACPClient:
         activity_out: dict[str, Any] | None = None,
         image_blocks: tuple[dict[str, str], ...] = (),
         thinking_level: str | None = None,
+        strict_same_session: bool = False,
     ) -> tuple[str, str]:
         requested_model = str(model or "").strip()
         with self._session(
@@ -4972,6 +5152,7 @@ class AntigravityACPClient:
             affinity_key=affinity_key,
             resume_session_id=resume_session_id,
             activity_stats_out=activity_out,
+            strict_same_session=strict_same_session,
         ) as (session, request, activity_stats):
             session_id = str(session.get("sessionId") or "").strip()
             resumed = bool(session.get("_hermes_resumed"))
