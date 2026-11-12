@@ -48,7 +48,6 @@ from .hermes_compat import (
     build_hermes_subprocess_env,
     get_current_write_origin,
     get_file_read_safety,
-    get_file_write_safety,
     get_hermes_home,
     get_hermes_home_for_video,
     get_nt_namespace_error,
@@ -277,7 +276,7 @@ _READ_TOOL_NAME_RE = re.compile(
 )
 _INITIALIZE_PARAMS = {
     "protocolVersion": 1,
-    "clientCapabilities": {"fs": {"readTextFile": True, "writeTextFile": True}},
+    "clientCapabilities": {"fs": {"readTextFile": True, "writeTextFile": False}},
     "clientInfo": {
         "name": "hermes-antigravity-acp",
         "title": "Hermes Antigravity ACP",
@@ -1962,27 +1961,10 @@ def _fs_read_text_file(params: dict[str, Any], cwd: str) -> Any:
 
 
 def _fs_write_text_file(params: dict[str, Any], cwd: str) -> Any:
-    try:
-        get_write_denied_error, is_write_approval_required = get_file_write_safety()
-    except Exception as exc:
-        raise PermissionError("Hermes file-write safety policy is unavailable.") from exc
-    path = _safe_path(str(params.get("path") or ""), cwd, verb="Write")
-    try:
-        denied = get_write_denied_error(str(path))
-        needs_approval = is_write_approval_required(str(path))
-    except Exception as exc:
-        raise PermissionError(
-            "Hermes file-write safety policy failed; ACP file write denied."
-        ) from exc
-    if denied:
-        raise PermissionError(denied)
-    if needs_approval:
-        raise PermissionError(
-            f"Write denied: '{path}' requires interactive approval and cannot be written through the ACP file bridge."
-        )
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(str(params.get("content") or ""), encoding="utf-8")
-    return None
+    """Refuse ACP writes; only Hermes tool dispatch can enforce the full policy."""
+    raise PermissionError(
+        "ACP fs/write_text_file is disabled; use Hermes write_file or patch tools."
+    )
 
 
 _FS_HANDLERS = {
@@ -2121,8 +2103,8 @@ _NATIVE_PERMISSION_TOOL_NAMES = _KNOWN_NATIVE_READ_TOOLS | {"run_command"}
 # Hermes' own approval-gated terminal and file tools, which the model reaches
 # through the Hermes <tool_call> bridge (see _PROMPT_PREAMBLE).  The only
 # permission auto-allow that remains is the read-only Hermes scratch-area
-# route in _safe_read_permission_option, and harness fs/read/fs/write
-# callbacks keep enforcing the full Hermes write-safety chain.  The former
+# route in _safe_read_permission_option. ACP fs/read remains policy-checked;
+# ACP fs/write is denied and edits use Hermes tools instead. The former
 # "trusted coding" auto-approval (HERMES_ANTIGRAVITY_ACP_EXECUTION_MODE /
 # HERMES_ANTIGRAVITY_ACP_WORKSPACE) was removed after the Hermes catalog
 # review; both environment variables are now inert.

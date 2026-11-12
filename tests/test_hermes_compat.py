@@ -469,7 +469,7 @@ def test_missing_write_approval_api_denies_without_creating_file(monkeypatch, tm
     monkeypatch.setitem(sys.modules, "agent.file_safety", file_safety)
 
     target = workspace / "not-created.txt"
-    with pytest.raises(PermissionError, match="file-write safety policy is unavailable"):
+    with pytest.raises(PermissionError, match="ACP fs/write_text_file is disabled"):
         client_module._fs_write_text_file(
             {"path": str(target), "content": "blocked"}, str(workspace)
         )
@@ -533,7 +533,7 @@ def test_redaction_call_failure_never_returns_content(monkeypatch, tmp_path):
     assert "do not reveal" not in str(caught.value)
 
 
-def test_write_policy_call_failure_denies_without_creating_file(monkeypatch, tmp_path):
+def test_write_denied_without_invoking_raising_write_policy(monkeypatch, tmp_path):
     client_module, _ = _compat(monkeypatch)
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -548,7 +548,7 @@ def test_write_policy_call_failure_denies_without_creating_file(monkeypatch, tmp
     monkeypatch.setitem(sys.modules, "agent.file_safety", file_safety)
 
     target = workspace / "not-created.txt"
-    with pytest.raises(PermissionError, match="file-write safety policy failed"):
+    with pytest.raises(PermissionError, match="ACP fs/write_text_file is disabled"):
         client_module._fs_write_text_file(
             {"path": str(target), "content": "blocked"}, str(workspace)
         )

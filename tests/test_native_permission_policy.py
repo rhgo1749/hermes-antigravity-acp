@@ -11,14 +11,11 @@ Hermes catalog review requires before listing:
   auto-approval machinery no longer exists;
 - Hermes' original terminal-tool instruction is restored byte-identically in
   the prompt preamble (no "pre-approved" replacement text);
-- the read-only Hermes scratch permission route and the harness fs/read and
-  fs/write write-safety chain are preserved;
+- the read-only Hermes scratch permission route is preserved; ACP fs/write
+  callbacks are denied and file modifications use Hermes tools;
 - ``session/new`` always pins ``agy.disabledTools=[run_command]``;
-- a full fake-ACP coding loop: native frames are rejected exactly once each
-  (no retry loop, no hang), the model still completes workspace work through
-  the harness fs/write callback, out-of-workspace writes stay blocked, and the
-  model continues shell work by emitting a Hermes <tool_call> for the
-  approval-gated terminal tool.
+- a scripted fake-ACP loop checks native and callback denial and emits Hermes
+  tool calls; it does not claim a real model autonomously falls back.
 """
 
 from __future__ import annotations
@@ -390,21 +387,74 @@ def test_140_rejected_by_user_echo_requires_correlation(policy_env, caplog):
     assert by_id[module._opaque_permission_id("edit-echo", "tool-call")] == "harness_denial_echo"
 
 
-# --- fs/write write-safety chain preserved ----------------------------------
+# --- ACP callback writes are always refused ---------------------------------
 
-def test_fs_write_workspace_allowed_but_approval_gated_still_blocked(policy_env):
+@pytest.mark.parametrize("surface", ["cli", "gateway", "cron", "subagent"])
+@pytest.mark.parametrize("name", [
+    "AGENTS.md", "CLAUDE.md", "SOUL.md", ".cursorrules", ".hermes/config.yaml",
+    "config.yaml", "ordinary.py", "../outside.py",
+])
+def test_fs_write_callback_denied_for_all_paths_and_surfaces(policy_env, monkeypatch, surface, name):
+    client, module, workspace = policy_env
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", surface)
+    if surface == "cron":
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+    if surface == "subagent":
+        monkeypatch.setenv("HERMES_DELEGATED_CHILD_CONTEXT", "1")
+    target = workspace / name
+    # Both raw relative and absolute paths are rejected, including existing files.
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("original", encoding="utf-8")
+    for path in (name, str(target.resolve())):
+        process = FakeProcess()
+        client._handle_server_message(
+            {"jsonrpc": "2.0", "id": 91, "method": "fs/write_text_file",
+             "params": {"path": path, "content": "changed"}},
+            process=process, cwd=str(workspace), text_parts=None, reasoning_parts=None,
+        )
+        assert "error" in process.responses()[0]
+        assert target.read_text(encoding="utf-8") == "original"
+    link = workspace / "link-to-target"
+    try:
+        link.symlink_to(target.resolve())
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks unavailable")
+    with pytest.raises(PermissionError):
+        module._fs_write_text_file({"path": str(link), "content": "changed"}, str(workspace))
+    assert target.read_text(encoding="utf-8") == "original"
+
+
+def test_active_config_write_and_symlink_are_denied(policy_env, monkeypatch, tmp_path):
+    client, _, workspace = policy_env
+    hermes_home = tmp_path / "active-hermes-home"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    active_config = hermes_home / "config.yaml"
+    active_config.write_text("original: true\n", encoding="utf-8")
+    link = workspace / "active-config-link.yaml"
+    try:
+        link.symlink_to(active_config)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks unavailable")
+    for path in (str(active_config), str(link)):
+        process = FakeProcess()
+        client._handle_server_message(
+            {"jsonrpc": "2.0", "id": 92, "method": "fs/write_text_file",
+             "params": {"path": path, "content": "changed"}},
+            process=process, cwd=str(workspace), text_parts=None, reasoning_parts=None,
+        )
+        assert "error" in process.responses()[0]
+        assert active_config.read_text(encoding="utf-8") == "original: true\n"
+
+
+# --- Workspace writes are also denied ---------------------------------------
+
+def test_fs_write_workspace_is_also_blocked(policy_env):
     _, module, workspace = policy_env
     target = workspace / "sub" / "new_file.py"
-    module._fs_write_text_file(
-        {"path": str(target), "content": "print(1)\n"}, str(workspace)
-    )
-    assert target.read_text(encoding="utf-8") == "print(1)\n"
-    ssh_config = Path.home() / ".ssh" / "config"
-    with pytest.raises(PermissionError):
-        module._fs_write_text_file({"path": str(ssh_config), "content": "x"}, str(workspace))
-    outside = Path("/etc/definitely_outside_workspace.py")
-    with pytest.raises(PermissionError):
-        module._fs_write_text_file({"path": str(outside), "content": "x"}, str(workspace))
+    with pytest.raises(PermissionError, match="ACP fs/write_text_file is disabled"):
+        module._fs_write_text_file({"path": str(target), "content": "print(1)\n"}, str(workspace))
+    assert not target.exists()
 
 
 # --- full fake-ACP coding loop under the fail-closed policy ----------------
@@ -494,20 +544,25 @@ for line in sys.stdin:
             permission("edit-outside-1", None, kinds,
                        diff_paths=["/tmp/outside_workspace_write.py"])
             permission("run-1", {"command": "python3 -m unittest test_calc -q"}, kinds)
-            # the model's surviving workarounds, exactly as the preamble
-            # instructs: harness fs/write for workspace files, Hermes
-            # <tool_call> for shell work, and nothing outside the workspace
+            # A scripted server attempts callback writes even though initialization
+            # advertises no write capability. Each must be refused.
             harness_write(os.path.join(workspace, "helpers.py"),
                           "def add2(a, b):\n    return a + b\n")
             harness_write(os.path.join(workspace, "calc.py"),
                           "from helpers import add2\n\n\ndef add(a, b):\n    return add2(a, b)\n")
             harness_write("/tmp/outside_workspace_write.py", "x")
-            answer = (
-                'Running the suite through Hermes: <tool_call>{"id": "call-term-1", '
-                '"type": "function", "function": {"name": "terminal", '
-                '"arguments": "{\\"command\\": \\"python3 -m unittest test_calc -q\\"}"}}'
-                '</tool_call>'
-            )
+            # The server emits ordinary Hermes tool calls instead; the caller,
+            # not this ACP fixture, owns tool execution and approvals.
+            calls = [
+                {"id": "call-write-1", "type": "function", "function": {
+                    "name": "write_file", "arguments": json.dumps({
+                        "path": os.path.join(workspace, "helpers.py"),
+                        "content": "def add2(a, b):\n    return a + b\n"})}},
+                {"id": "call-term-1", "type": "function", "function": {
+                    "name": "terminal", "arguments": json.dumps({
+                        "command": "python3 -m unittest test_calc -q"})}},
+            ]
+            answer = "".join("<tool_call>" + json.dumps(call) + "</tool_call>" for call in calls)
             emit({"jsonrpc": "2.0", "method": "session/update", "params": {"update": {
                 "sessionUpdate": "agent_message_chunk", "toolCallId": "answer-1",
                 "content": {"type": "text", "text": answer}}}})
@@ -538,6 +593,20 @@ def _prepare_coding_fixture(workspace: Path) -> None:
         ["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "fixture"],
         cwd=workspace, check=True,
     )
+
+
+WRITE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "write_file",
+        "description": "Write a file through Hermes.",
+        "parameters": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+            "required": ["path", "content"],
+        },
+    },
+}
 
 
 TERMINAL_TOOL = {
@@ -577,7 +646,7 @@ def test_fail_closed_coding_loop_end_to_end(monkeypatch, tmp_path):
 
     completion = client.chat.completions.create(
         messages=[{"role": "user", "content": "coding-loop"}],
-        tools=[TERMINAL_TOOL],
+        tools=[WRITE_TOOL, TERMINAL_TOOL],
         timeout=90,
         stream=False,
     )
@@ -585,6 +654,10 @@ def test_fail_closed_coding_loop_end_to_end(monkeypatch, tmp_path):
     rows = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
 
     # 1. session launch pins the native run_command disable
+    initialize = next(row for row in rows if row.get("method") == "initialize")
+    assert initialize["params"]["clientCapabilities"]["fs"] == {
+        "readTextFile": True, "writeTextFile": False,
+    }
     session_new = next(row for row in rows if row.get("method") == "session/new")
     assert session_new["params"]["_meta"] == {"agy": {"disabledTools": ["run_command"]}}
 
@@ -597,22 +670,21 @@ def test_fail_closed_coding_loop_end_to_end(monkeypatch, tmp_path):
         assert outcome["outcome"] == "selected", tool_call_id
         assert outcome["optionId"] == f"{tool_call_id}-reject_once", tool_call_id
 
-    # 3. workspace work still completes through the harness fs/write callback
-    assert (workspace / "helpers.py").is_file()
-    calc_text = (workspace / "calc.py").read_text(encoding="utf-8")
-    assert "from helpers import add2" in calc_text
+    # 3. All three callback writes were refused, including ordinary workspace files.
+    writes = [row["fs_write"] for row in rows if "fs_write" in row]
+    assert len(writes) == 3
+    assert all(write["error"] is not None for write in writes)
+    assert not (workspace / "helpers.py").exists()
+    assert (workspace / "calc.py").read_text(encoding="utf-8") == (
+        "def add(a, b):\n    return a + b\n"
+    )
 
-    # 4. the out-of-workspace write was refused by the harness write-safety chain
-    outside_writes = [row for row in rows if "fs_write" in row
-                      and row["fs_write"]["path"] == "/tmp/outside_workspace_write.py"]
-    assert outside_writes and outside_writes[0]["fs_write"]["error"] is not None
-    assert not Path("/tmp/outside_workspace_write.py").exists()
-
-    # 5. the model continues shell work via the Hermes approval-gated tool bridge
+    # 4. The scripted server emitted Hermes write_file and terminal calls.
+    # This proves the bridge, not execution of the tools by Hermes.
     message = completion.choices[0].message
     assert completion.choices[0].finish_reason == "tool_calls"
-    assert len(message.tool_calls) == 1
-    call = message.tool_calls[0]
-    assert call.function.name == "terminal"
-    assert "unittest" in json.loads(call.function.arguments)["command"]
+    calls = {call.function.name: call for call in message.tool_calls}
+    assert set(calls) == {"write_file", "terminal"}
+    assert json.loads(calls["write_file"].function.arguments)["path"] == str(workspace / "helpers.py")
+    assert "unittest" in json.loads(calls["terminal"].function.arguments)["command"]
     del module

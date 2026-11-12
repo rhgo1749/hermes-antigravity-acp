@@ -68,13 +68,14 @@ prompt preamble again instructs the model to use Hermes' approval-gated
 terminal tool through the `<tool_call>` bridge. The former
 `HERMES_ANTIGRAVITY_ACP_EXECUTION_MODE` / `HERMES_ANTIGRAVITY_ACP_WORKSPACE`
 switches are inert and no configuration re-enables native auto-approval.
-Preserved unchanged: the read-only Hermes scratch permission route, the
-harness `fs/read`/`fs/write` callbacks bridged through Hermes' write-safety
-chain, and the v0.7.9 session-ownership, delegated-child, and usage
-accounting contracts. The coding-loop evidence in
-`tests/test_native_permission_policy.py` is a **scripted fake-ACP loop**: the
-fallback `fs/write` calls and the Hermes `terminal` `<tool_call>` are emitted
-by the test's fake server, so they prove the harness protocol path only.
+Preserved unchanged: the read-only Hermes scratch permission route and the
+v0.7.9 session-ownership, delegated-child, and usage accounting contracts.
+ACP `fs/read_text_file` remains guarded by Hermes read policy and redaction.
+ACP `fs/write_text_file` is disabled: even ordinary workspace writes must use
+Hermes `write_file` or `patch` tools. The coding-loop evidence in
+`tests/test_native_permission_policy.py` is a **scripted fake-ACP loop**: it
+checks callback denials and emits Hermes tool calls; it does not prove that a
+real Google model autonomously changes tools after a refusal.
 Whether the real Google model autonomously chooses Hermes tools after its
 native requests are rejected is **NOT RUN** until a supervised live canary
 executes it. See `docs/data-and-permissions.md` §5 and
@@ -556,8 +557,8 @@ The plugin keeps **Hermes tools in Hermes**. The official ACP child's native
 coding tools are not auto-approved: native `run_command` is disabled at session
 launch and native file-mutation permission frames are rejected, so the model
 performs shell and file work through Hermes' own approval-gated terminal and
-file tools (the harness `fs/read`/`fs/write` callbacks remain bridged through
-Hermes' write-safety checks). Review
+file tools. The harness `fs/read` callback enforces Hermes read policy and
+redaction; `fs/write` callbacks are denied. Review
 [`docs/data-and-permissions.md`](docs/data-and-permissions.md)
 before use.
 
