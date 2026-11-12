@@ -211,6 +211,7 @@ def test_reviewed_neutral_tests_do_not_pull_extended_arm(path, with_plugin) -> N
     "tests/test_generic_install.py",
     "tests/test_clean_env_e2e_smoke.py",
     "tests/test_acp_interactive_login.py",
+    "tests/test_issue23_request_cancel.py",
     "tests/test_hosted_clean_room_ci.py",
     "tests/test_mux_packaging.py",
     "tests/test_acp_mux.py",
@@ -232,6 +233,7 @@ def test_unreviewed_and_native_tests_keep_full_matrix(path) -> None:
     "scripts/install_acp.py",
     "scripts/install_official.py",
     "scripts/install_mux.py",
+    "scripts/verify_process_tree_teardown.py",
     "scripts/acp_mux.py",
     "scripts/antigravity-acp-mux.py",
     "scripts/antigravity-acp-mux",
@@ -334,6 +336,30 @@ def test_os_only_scope_accepts_only_the_two_unrequired_arm_skips() -> None:
     assert gate_mod.evaluate(expected, results)[0]
     for lane in gate_mod.OS_LANES:
         assert not gate_mod.evaluate(expected, {**results, lane: {"result": "skipped"}})[0]
+
+
+def test_windows_x64_retains_issue31_process_tree_verification(ci: str) -> None:
+    block = _job_block(ci, "windows-x64")
+    step = re.search(
+        r"^      - name: Verify process-tree teardown reaps the ACP child tree \(x64\)\n"
+        r"(?:(?!^      - ).*\n)*",
+        block, re.M,
+    )
+    assert step, "PR #31's native Windows x64 tree verification must remain"
+    text = step.group(0)
+    assert "shell: pwsh" in text
+    assert "& $python scripts/verify_process_tree_teardown.py" in text
+    assert "if ($LASTEXITCODE -ne 0) { throw 'Process-tree teardown verification failed' }" in text
+    assert not re.search(r"^\s+if:", text, re.M), "required step must not be conditionally skipped"
+
+
+def test_process_teardown_runtime_keeps_all_three_os_lanes() -> None:
+    scope = scope_mod.classify_paths([
+        "hermes-plugin/antigravity-acp/process_teardown.py",
+        *REVIEWED_NEUTRAL_TESTS,
+    ])
+    assert (scope.os_lanes, scope.extended_arm) == (True, False)
+    assert scope.unknown_paths == ()
 
 
 # -- change classifier: widen-only ---------------------------------------

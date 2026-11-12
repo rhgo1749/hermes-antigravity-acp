@@ -1,8 +1,10 @@
 # CI cost: Issue #28 Phase A
 
-Scope: PR changed-path classification only. Baseline `origin/main`:
-`f298c28ff52dc1d5a1d193d1243124d2be3563b0`.
-This is not a release gate or a Gateway/eval replacement. No merge, tag,
+Scope: PR changed-path classification only. Current integration base `origin/main`:
+`4fbebe9ddec91bba2df10a6ddf69caec09140bce` (PR #31 merged). The original
+cost sample below was collected at `f298c28ff52dc1d5a1d193d1243124d2be3563b0`
+and is retained as a historical baseline, not a fresh cost measurement.
+This is not a release gate or a Gateway/eval replacement. No PR merge, tag,
 release, production deployment, required-check or ruleset change is included.
 
 ## Policy and review boundary
@@ -23,7 +25,8 @@ putting platform-sensitive assertions into a listed file. A path list cannot
 prove semantic neutrality of future edits; this remains a code-review boundary.
 
 This list controls **lane applicability, never pytest discovery**. The workflow
-and gate implementation are unchanged. All tests still auto-discover in `fake-acp`
+and gate implementation are byte-unchanged relative to the integration base,
+including PR #31's native Windows x64 process-tree check. All tests still auto-discover in `fake-acp`
 with the same single documented upstream-runtime-only exclusion, which still runs
 in the strict Core jobs. Unknown `tests/` paths are checked before Markdown globs,
 so a new Markdown test fixture no longer silently counts as documentation.
@@ -59,6 +62,9 @@ run for every case. Delete/rename/move uses real `git diff --no-renames` tests.
 | CI workflow | F+OS+ARM | F+OS+ARM |
 | Gate script | F+OS | F+OS |
 | CI contract test | F+OS+ARM | F+OS+ARM |
+| #31 cancellation regression test | F+OS+ARM | F+OS+ARM |
+| #31 process-tree verification driver | F+OS+ARM | F+OS+ARM |
+| #31 process-teardown plugin runtime | F+OS | F+OS |
 | Unknown new test | F+OS+ARM | F+OS+ARM |
 | Unknown path | F+OS+ARM | F+OS+ARM |
 | Unreviewed test Markdown fixture | F | F+OS+ARM |
@@ -77,7 +83,7 @@ run for every case. Delete/rename/move uses real `git diff --no-renames` tests.
 | `fake-acp` | Automatic credential-free regression discovery, Ruff and public-tree/security/distribution audit; fake archives/transport are not native execution. |
 | `upstream-hermes-compat`, `catalog-floor-gate` | Unconditional official catalog admission and strict real-Core provider/runtime/delegate-affinity seams on latest upstream `main` and floor `v0.21.6`; fake ACP, no vendor inference. |
 | Linux x64 | Official pinned binary lifecycle in a dedicated-UID clean room, Hermes provider selection/discovery entry and fail-closed diagnostics. The clean-room Core ref is its existing pin, not the latest-Core lane. |
-| Windows x64 / ARM64 | Actual Windows installer, native-architecture assertion, enabled Hermes provider registration, unauthenticated ACP `initialize`, login-helper execution-path probes without login. Not identical to the Linux clean-room isolation contract. |
+| Windows x64 / ARM64 | Actual Windows installer, native-architecture assertion, enabled Hermes provider registration, unauthenticated ACP `initialize`, login-helper execution-path probes without login; x64 also retains PR #31's standalone parent/grandchild teardown check (not substituted by ARM). Not identical to the Linux clean-room isolation contract. |
 | macOS ARM64 / Linux aarch64 | Native-arch assertion, publisher-pinned download + SHA-256, install/status/verify/unauthenticated initialize/uninstall/absence. No Hermes provider registration on either lane, no dedicated-UID isolation. |
 
 SHA-256 verification and all five registry targets are unchanged. No lane proves
@@ -197,9 +203,61 @@ reduces resource use/latency, not a demonstrated paid runner bill. Account invoi
 storage/cache charges and larger runners were not measured. No private-repository
 rate multiplier or estimated dollars are presented as actual spend.
 
-## Regression evidence and remaining risk
+## Integrated main revalidation (PR #31)
 
-The pre-change CI contract suite passed 42 tests. Adding the Phase A regression
+The latest main `4fbebe9ddec91bba2df10a6ddf69caec09140bce` was merged into
+PR #36 without a conflict or history rewrite. No ACP runtime, installer, gate
+implementation or workflow changes are made relative to that base. In particular,
+`process_teardown.py`, `verify_process_tree_teardown.py`, the x64 PowerShell step,
+client/MUX changes, deployment projection and public-tree fileset additions from
+#31 are retained. The 18 cancellation test functions are AST-identical to main;
+only their leaking fixture/harness setup and teardown is repaired.
+
+Fresh full discovery initially exposed a genuine isolation defect in #31's
+`agy` fixture: it replaced `sys.modules["providers"]` and `providers.base`
+without restoration. A later real-Core registry load then saw a fake
+`ProviderProfile`, causing 13 strict-seam failures (1156 passed). The minimal
+ordered cancellation-hook + vanilla-seam reproduction was **1 failed, 1 passed**.
+The fix binds fake modules and environment changes to pytest's existing
+`monkeypatch` fixture and shuts down only the harness's own warm pool/unloads its
+plugin modules on teardown. No production behavior, test assertion, discovery
+scope, skip policy or execution order was changed. The same ordered reproduction
+then produced **2 passed**, and fresh full discovery produced **1169 passed**.
+
+Fresh local receipts on the integrated candidate, not reused old results:
+
+| Check | Result |
+|---|---|
+| Complete pytest discovery, real Core source + strict mode | 1169 passed |
+| Workflow-parity fake lane, same one documented upstream-only ignore | 1148 passed, 8 existing Core-dependent skips |
+| CI classifier/gate/workflow contracts | 128 passed |
+| #31 cancellation and process-tree regressions | 18 passed |
+| Standalone process-tree verification on local POSIX | PASS; verified owned process-group sweep, parent and grandchild dead |
+| Ruff, public-tree audit, diff whitespace | PASS |
+
+The unchanged local Core source is `2bd378ed1b8d6bf2192cb26e0a55ff3091e6bd19`;
+latest/floor freshness and native Windows execution require the new hosted run.
+The final PR body binds those receipts to the exact integrated HEAD and run URL.
+The previous candidate run
+[43261992247](https://github.com/rhgo1749/hermes-antigravity-acp/actions/runs/43261992247)
+at `a2144be6c0e5f5718c2df19af4b589e6852e5161` passed all ten jobs but is
+**historical only**, not acceptance for the integrated HEAD.
+
+For comparison, main run
+[43272682231](https://github.com/rhgo1749/hermes-antigravity-acp/actions/runs/43272682231)
+at `4fbebe9ddec91bba2df10a6ddf69caec09140bce` had an attempt-1 macOS
+cancellation: job `131373069429`, `runner_id=0`, empty runner name, `steps=[]`.
+This is unassigned/not-started evidence, **not an observed test failure**; the
+cause of cancellation is not inferred. `CI gate` correctly failed in that attempt
+(job `131384218596`). Attempt 2 on the same main SHA reports ten successful jobs,
+including macOS `131388566386` and gate `131388800621`. A retry's success does not
+turn the original cancellation into success and does not justify weakening the
+gate. No other PR or Issue is modified by this integration.
+
+## Historical pre-integration evidence and remaining risk
+
+The following results belong to `a2144be6c0e5f5718c2df19af4b589e6852e5161`,
+not the integrated HEAD. The pre-change CI contract suite passed 42 tests. Adding the Phase A regression
 cases against unchanged baseline production code produced **9 failed, 115 passed**
 (exit 1): four neutral-test classification cases, four real Git add/modify/delete/
 move cases, and the unreviewed Markdown fixture tripwire. After the classifier
