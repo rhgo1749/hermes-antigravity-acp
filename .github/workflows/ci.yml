@@ -445,9 +445,6 @@ jobs:
     if: needs.change-scope.outputs.os_lanes == 'true'
     permissions:
       contents: read
-    env:
-      ACP_PREFIX: ${{ runner.temp }}/acp-native
-      ACP_BIN: ${{ runner.temp }}/acp-bin
     steps:
       - uses: actions/checkout@v4
         with:
@@ -468,17 +465,17 @@ jobs:
           print(f"darwin/arm64 publisher digest: {dist.sha256}")
           PY
       - name: Install official ACP binary into isolated prefixes
-        run: python scripts/install_official.py --prefix "$ACP_PREFIX" --bin-dir "$ACP_BIN"
+        run: python scripts/install_official.py --prefix "$RUNNER_TEMP/acp-native" --bin-dir "$RUNNER_TEMP/acp-bin"
       - name: Status and integrity verification
         run: |
-          python scripts/install_official.py --prefix "$ACP_PREFIX" --bin-dir "$ACP_BIN" --status
-          python scripts/install_official.py --prefix "$ACP_PREFIX" --bin-dir "$ACP_BIN" --verify
+          python scripts/install_official.py --prefix "$RUNNER_TEMP/acp-native" --bin-dir "$RUNNER_TEMP/acp-bin" --status
+          python scripts/install_official.py --prefix "$RUNNER_TEMP/acp-native" --bin-dir "$RUNNER_TEMP/acp-bin" --verify
       - name: Unauthenticated ACP initialize handshake
-        run: python scripts/acp_probe.py --timeout 60 -- "$ACP_BIN/antigravity-acp-official"
+        run: python scripts/acp_probe.py --timeout 60 -- "$RUNNER_TEMP/acp-bin/antigravity-acp-official"
       - name: Uninstall and confirm absence
         run: |
-          python scripts/install_official.py --prefix "$ACP_PREFIX" --bin-dir "$ACP_BIN" --uninstall
-          if python scripts/install_official.py --prefix "$ACP_PREFIX" --bin-dir "$ACP_BIN" --status; then
+          python scripts/install_official.py --prefix "$RUNNER_TEMP/acp-native" --bin-dir "$RUNNER_TEMP/acp-bin" --uninstall
+          if python scripts/install_official.py --prefix "$RUNNER_TEMP/acp-native" --bin-dir "$RUNNER_TEMP/acp-bin" --status; then
             echo "installed state survived uninstall" >&2
             exit 1
           fi
@@ -505,9 +502,6 @@ jobs:
     if: needs.change-scope.outputs.extended_arm == 'true'
     permissions:
       contents: read
-    env:
-      ACP_PREFIX: ${{ runner.temp }}/acp-native
-      ACP_BIN: ${{ runner.temp }}/acp-bin
     steps:
       - uses: actions/checkout@v4
         with:
@@ -528,17 +522,17 @@ jobs:
           print(f"linux/aarch64 publisher digest: {dist.sha256}")
           PY
       - name: Install official ACP binary into isolated prefixes
-        run: python scripts/install_official.py --prefix "$ACP_PREFIX" --bin-dir "$ACP_BIN"
+        run: python scripts/install_official.py --prefix "$RUNNER_TEMP/acp-native" --bin-dir "$RUNNER_TEMP/acp-bin"
       - name: Status and integrity verification
         run: |
-          python scripts/install_official.py --prefix "$ACP_PREFIX" --bin-dir "$ACP_BIN" --status
-          python scripts/install_official.py --prefix "$ACP_PREFIX" --bin-dir "$ACP_BIN" --verify
+          python scripts/install_official.py --prefix "$RUNNER_TEMP/acp-native" --bin-dir "$RUNNER_TEMP/acp-bin" --status
+          python scripts/install_official.py --prefix "$RUNNER_TEMP/acp-native" --bin-dir "$RUNNER_TEMP/acp-bin" --verify
       - name: Unauthenticated ACP initialize handshake
-        run: python scripts/acp_probe.py --timeout 60 -- "$ACP_BIN/antigravity-acp-official"
+        run: python scripts/acp_probe.py --timeout 60 -- "$RUNNER_TEMP/acp-bin/antigravity-acp-official"
       - name: Uninstall and confirm absence
         run: |
-          python scripts/install_official.py --prefix "$ACP_PREFIX" --bin-dir "$ACP_BIN" --uninstall
-          if python scripts/install_official.py --prefix "$ACP_PREFIX" --bin-dir "$ACP_BIN" --status; then
+          python scripts/install_official.py --prefix "$RUNNER_TEMP/acp-native" --bin-dir "$RUNNER_TEMP/acp-bin" --uninstall
+          if python scripts/install_official.py --prefix "$RUNNER_TEMP/acp-native" --bin-dir "$RUNNER_TEMP/acp-bin" --status; then
             echo "installed state survived uninstall" >&2
             exit 1
           fi
