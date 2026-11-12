@@ -23,6 +23,13 @@ def test_process_args_pin_official_wrapper_contract() -> None:
     assert '"antigravity-acp-mux"' not in PLUGIN_SOURCE
 
 
+def test_provider_label_does_not_imply_official_hermes_tier(monkeypatch) -> None:
+    profile = _load_plugin(monkeypatch).antigravity_acp
+    assert profile.display_name == "Antigravity ACP"
+    assert "Google's official ACP" in profile.description
+    assert "antigravity-official-acp" in profile.aliases
+
+
 def test_picker_has_no_hardcoded_model_floor() -> None:
     # Dynamic-listing contract (operator directive 2026-11-09): every offered
     # model id must come from the signed-in account's live server surfaces.

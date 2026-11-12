@@ -340,7 +340,7 @@ antigravity_acp = AntigravityACPProfile(
         "agy-acp",
         "antigravity-official-acp",
     ),
-    display_name="Antigravity ACP (official)",
+    display_name="Antigravity ACP",
     description="Google Antigravity through Google's official ACP v1 stdio server",
     api_mode="chat_completions",
     env_vars=(),
