@@ -111,7 +111,7 @@ def main() -> int:
             return 1
         gpid = int(grand_pid.read_text())
         t0 = time.monotonic()
-        teardown.terminate_process_tree(proc)
+        guaranteed = teardown.terminate_process_tree(proc)
         parent_dead = _wait_for(lambda: not _pid_alive(proc.pid), 10)
         grand_dead = _wait_for(lambda: not _pid_alive(gpid), 10)
         elapsed = round(time.monotonic() - t0, 3)
@@ -122,10 +122,18 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 1
+        if guaranteed is not True:
+            print(
+                f"FAIL: teardown did not report a verified tree sweep "
+                f"(returned {guaranteed!r}); reaping must not be assumed",
+                file=sys.stderr,
+            )
+            return 1
         print(json.dumps({
             "result": "PASS",
             "platform": os.name,
-            "mechanism": "taskkill /T /F" if os.name == "nt" else "process-group kill",
+            "mechanism": "taskkill /T /F" if os.name == "nt" else "process-group kill + sweep",
+            "verified_sweep": guaranteed,
             "parent_pid": proc.pid,
             "grandchild_pid": gpid,
             "elapsed_seconds": elapsed,

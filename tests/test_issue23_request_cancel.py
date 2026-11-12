@@ -664,3 +664,172 @@ def test_terminate_process_tree_reaps_sigterm_ignoring_grandchild(tmp_path):
             else:
                 with contextlib.suppress(OSError):
                     os.kill(gpid, signal.SIGKILL)
+
+
+# ---------------------------------------------------------------------------
+# P1 rework round 2 (independent re-review of PR #31): proc.wait() only
+# guarantees the DIRECT child; the group SIGKILL escalation ran only when the
+# direct child outlived the grace.  A leader that exits immediately on SIGTERM
+# while its grandchild ignores SIGTERM returned from the teardown with the
+# group still alive.  The fix separates "direct child reaped" from "owned
+# process group swept", verifies group ownership while the leader is still
+# resolvable, and refuses indiscriminate group signals when ownership cannot
+# be established.
+# ---------------------------------------------------------------------------
+
+
+_TREE_PARENT_EXIT_ON_TERM = (
+    "import os, signal, subprocess, sys, time\n"
+    "def bye(*a):\n"
+    "    os._exit(0)\n"
+    "signal.signal(signal.SIGTERM, bye)\n"
+    "child = subprocess.Popen([sys.executable, sys.argv[2], sys.argv[3]])\n"
+    "with open(sys.argv[1], 'w', encoding='utf-8') as fh:\n"
+    "    fh.write(str(os.getpid()))\n"
+    "child.wait()\n"
+)
+_TREE_PARENT_EXIT_NOW = (
+    "import os, subprocess, sys\n"
+    "child = subprocess.Popen([sys.executable, sys.argv[2], sys.argv[3]])\n"
+    "with open(sys.argv[1], 'w', encoding='utf-8') as fh:\n"
+    "    fh.write(str(os.getpid()))\n"
+    "sys.exit(0)\n"
+)
+
+
+def _spawn_tree(tmp_path, parent_source, *, session=True):
+    parent_pid = tmp_path / "parent.pid"
+    grand_pid = tmp_path / "grand.pid"
+    parent_script = tmp_path / "parent.py"
+    grand_script = tmp_path / "grand.py"
+    parent_script.write_text(parent_source, encoding="utf-8")
+    grand_script.write_text(_TREE_GRANDCHILD, encoding="utf-8")
+    proc = subprocess.Popen(
+        [sys.executable, str(parent_script), str(parent_pid),
+         str(grand_script), str(grand_pid)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True,
+        start_new_session=(session and os.name != "nt"))
+    assert _wait_for(lambda: parent_pid.exists() and grand_pid.exists(), timeout=15)
+    return proc, int(grand_pid.read_text())
+
+
+@posix_only
+def test_tree_teardown_reaps_group_when_leader_exits_immediately(tmp_path):
+    """P1 round 2: leader dies instantly on SIGTERM, grandchild ignores it.
+
+    proc.wait() succeeds at once; the teardown must still sweep the owned
+    group instead of returning with a live orphaned grandchild.
+    """
+    teardown = _load_process_teardown()
+    proc, gpid = _spawn_tree(
+        tmp_path, _TREE_PARENT_EXIT_ON_TERM)
+    try:
+        result = teardown.terminate_process_tree(proc)
+        assert _wait_for(lambda: not _pid_alive(proc.pid), timeout=10)
+        assert _wait_for(lambda: not _pid_alive(gpid), timeout=10), (
+            "the grandchild must not outlive a leader that exited immediately"
+        )
+        assert result is True, (
+            "an owned-group sweep that verified emptiness must report success"
+        )
+    finally:
+        _cleanup_tree(proc, gpid)
+
+
+@posix_only
+def test_teardown_after_parent_death_sweeps_unreaped_group(tmp_path):
+    """Teardown starting with the (zombie) parent already dead must sweep.
+
+    The plugin hits this whenever the mux dies on its own and the release
+    path tears the process down afterwards: the official-server grandchild is
+    still in the group and must not be left running.
+    """
+    teardown = _load_process_teardown()
+    proc, gpid = _spawn_tree(tmp_path, _TREE_PARENT_EXIT_NOW)
+    time.sleep(0.5)  # parent has exited; nobody has reaped it yet (zombie)
+    try:
+        result = teardown.terminate_process_tree(proc)
+        assert _wait_for(lambda: not _pid_alive(gpid), timeout=10), (
+            "a group whose ownership was verifiable at entry must be swept"
+        )
+        assert result is True
+    finally:
+        _cleanup_tree(proc, gpid)
+
+
+@posix_only
+def test_teardown_never_signals_a_foreign_group(tmp_path, monkeypatch):
+    """A non-leader process must never trigger a group signal at all."""
+    teardown = _load_process_teardown()
+    calls = []
+    real_killpg = os.killpg
+
+    def spy(pgid, sig):
+        calls.append((pgid, sig))
+        return real_killpg(pgid, sig)
+
+    monkeypatch.setattr(os, "killpg", spy)
+    # Shares THIS process's group — the caller's own group.
+    proc, gpid = _spawn_tree(tmp_path, _TREE_PARENT, session=False)
+    try:
+        result = teardown.terminate_process_tree(proc)
+        assert _wait_for(lambda: not _pid_alive(proc.pid), timeout=15), (
+            "the direct child must still be killed individually"
+        )
+        own_pgid = os.getpgid(os.getpid())
+        assert all(pgid != own_pgid for pgid, _ in calls), (
+            f"group signal against the caller's own group: {calls}"
+        )
+        assert result is not True, (
+            "a non-owned process must never report a guaranteed tree sweep"
+        )
+    finally:
+        _cleanup_tree(proc, gpid)
+
+
+@posix_only
+def test_teardown_after_reap_refuses_unverifiable_group_sweep(
+    tmp_path, monkeypatch
+):
+    """Once the leader is reaped, ownership is unverifiable: no group signal.
+
+    PID/PGID reuse means a killpg against a long-dead leader's pgid can hit a
+    stranger's group.  The teardown must decline the sweep (and not claim
+    success) rather than signal blindly.
+    """
+    teardown = _load_process_teardown()
+    calls = []
+    real_killpg = os.killpg
+
+    def spy(pgid, sig):
+        calls.append((pgid, sig))
+        return real_killpg(pgid, sig)
+
+    monkeypatch.setattr(os, "killpg", spy)
+    proc, gpid = _spawn_tree(tmp_path, _TREE_PARENT_EXIT_NOW)
+    time.sleep(0.5)
+    proc.poll()  # reap the zombie leader: getpgid can no longer verify
+    try:
+        result = teardown.terminate_process_tree(proc)
+        assert calls == [], f"blind group signal after reap: {calls}"
+        assert result is not True, (
+            "an unverifiable sweep must not report guaranteed reaping"
+        )
+    finally:
+        _cleanup_tree(proc, gpid)
+
+
+def _cleanup_tree(proc, gpid):
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True)
+        if gpid:
+            subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(gpid)], capture_output=True)
+        return
+    for pid in (proc.pid, gpid):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
