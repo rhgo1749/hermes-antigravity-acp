@@ -30,7 +30,7 @@ through Hermes' own approval-gated terminal and file tools.
 | Topic | Current status |
 |---|---|
 | Hermes version | `plugin.yaml` declares `requires_hermes: ">=0.21.6"` — a CI-proven floor re-run on every change (`catalog-floor-gate`); the latest upstream Hermes release is `v0.23.1`. |
-| OS support | **Ubuntu 24.04 x86_64** is the only OS with real-binary, dedicated-OS-UID clean-room execution evidence (GitHub-hosted CI; see [OS support and verification tiers](#os-support-and-verification-tiers)). **Windows x64 and Windows arm64** have real-binary hosted-CI execution evidence (actual installer + provider registration + unauthenticated ACP `initialize` on `windows-2022`/`windows-11-arm` runners) — one tier below clean-room, still executed. **Linux aarch64 and macOS arm64** are registry-pinned with publisher digests but **NOT RUN** — pinned-only, not executed support. |
+| OS support | **Ubuntu 24.04 x86_64** is the only OS with real-binary, dedicated-OS-UID clean-room execution evidence (GitHub-hosted CI; see [OS support and verification tiers](#os-support-and-verification-tiers)). **Windows x64 and Windows arm64** have real-binary hosted-CI execution evidence (actual installer + provider registration + unauthenticated ACP `initialize` on `windows-2022`/`windows-11-arm` runners) — one tier below clean-room, still executed. **Linux aarch64 and macOS arm64** are registry-pinned with publisher digests and now have native hosted CI lifecycle lanes implemented (issue #9), but remain **NOT RUN** — pinned-only, not executed support, until a green native run is cited below. |
 | Public plugin catalog | **Not registered yet.** `hermes plugins install antigravity-acp-provider` does not resolve today (upstream `plugin-catalog/` contains no entry for this provider as of 2026-11-12). The catalog submission PR ([NousResearch/hermes-agent#153182](https://github.com/NousResearch/hermes-agent/pull/153182)) is open and pending upstream review; registration is not approved or merged as of this writing. The only currently reproducible install path is the standalone installer below. |
 | Official server binary | Pinned `1.4.4`, fetched **only during an explicit install command** over HTTPS from `dl.google.com`; the publisher-pinned SHA-256 digest is verified **before** the archive is opened, extracted, or installed. No self-update; no redistribution. |
 | Authentication & first model call | Credential-free CI does not validate authentication or real inference. A supervised one-prompt canary produced a real response on an earlier client version; the current release has not been verified end-to-end in that same way. This observation does not establish terms compliance for other uses. |
@@ -467,28 +467,62 @@ verification tier:
   and install-mechanics coverage continues to run against a credential-free
   fake ACP server: that credential-free `fake-acp` registry/regression job
   performs no live feed fetch, no authentication, and no real-binary
-  execution. Real-binary execution in CI belongs exclusively to the
-  dedicated-UID `acp-clean-room` job described above — it fetches the
-  official 1.4.4 binary under the reviewed publisher pin and runs only
-  credential-free unauthenticated `initialize` probes, never an
-  authentication frame or a model prompt. An earlier initialize-only
+  execution. Real-binary execution in CI belongs to the dedicated-UID
+  `acp-clean-room` job described above and to the platform install lanes
+  (the Windows jobs and the macOS arm64 / Linux aarch64 lifecycle lanes) —
+  each fetches the official 1.4.4 binary under the reviewed publisher pin
+  and runs only credential-free unauthenticated `initialize` probes, never
+  an authentication frame or a model prompt. An earlier initialize-only
   operational observation is not a substitute for dedicated-UID CI evidence.
 - **Real-binary hosted-CI executed tier (not dedicated-UID clean-room) —
-  Windows x64, Windows arm64.** The `windows-install` job runs the actual
+  Windows x64, Windows arm64.** The Windows install jobs run the actual
   Windows installer on `windows-2022` (x64) and `windows-11-arm` (arm64)
   hosted runners against the real Google-distributed official server binary,
-  then verifies native architecture, provider registration/enabled state, and
+  then verify native architecture, provider registration/enabled state, and
   an unauthenticated ACP `initialize` (`install_acp.py verify`). This is
   executed evidence one tier below the dedicated-UID clean-room class: no
   dedicated OS UID isolation, and no authentication frame or model prompt is
-  ever sent.
+  ever sent. Since issue #9 the x64 lane runs on every main push, every
+  manual full-matrix dispatch, and install-surface PRs; the arm64 lane is
+  an extended-ARM lane (main pushes, dispatch, packaging-surface PRs) —
+  its executed status for a given change is whatever the latest cited
+  green run on the relevant scope shows, never an assumption.
 - **Registry-pinned but NOT RUN tier — macOS arm64, Linux aarch64.** These
   targets are registry-pinned with
   publisher digests and are covered by a credential-free CI install smoke
   (fake-ACP archive + lifecycle mechanics in
   `tests/test_clean_env_e2e_smoke.py`), but the real Google binary on
   those operating systems has **not** been executed by this repository's
-  CI. Treat their support claims as spec-pinned, not executed.
+  CI. Treat their support claims as spec-pinned, not executed. Native
+  hosted lifecycle lanes (`macos-15` and `ubuntu-24.04-arm`: download under
+  the publisher pin → install → status → verify → unauthenticated
+  `initialize` → uninstall → confirmed absence) are implemented as of
+  issue #9; neither platform is promoted out of this tier until a green
+  native run is cited here, and the macOS lanes do not cover Hermes
+  provider registration on macOS.
+
+### CI tier structure (issue #9)
+
+`.github/workflows/ci.yml` is risk-tiered; the always-running **`CI gate`**
+job is the single required verdict:
+
+- **Fast PR (every event):** `fake-acp` (auto-discovered credential-free
+  regressions, Ruff, repository hygiene), `upstream-hermes-compat`
+  (official Hermes `main`), `catalog-floor-gate` (minimum supported Hermes
+  `v0.21.6`).
+- **Release / full OS:** `acp-clean-room` (Ubuntu x86_64 dedicated-UID),
+  `windows-x64`, `macos-arm64` — every main push, every manual
+  `workflow_dispatch` (full matrix, tested SHA recorded), and PRs that
+  touch the install surface.
+- **Extended ARM:** `windows-arm64`, `linux-aarch64` — every main push,
+  every dispatch, and packaging-surface PRs only; removed from the
+  ordinary PR critical path.
+- **Change detection is widen-only:** `scripts/ci_change_scope.py`
+  classifies paths; unknown paths, empty diffs, or detection failures
+  fall back to the strongest scope. `scripts/ci_gate_check.py` fails the
+  gate when any lane the scope required failed, was skipped, or never
+  reported — a skipped or missing check is never a pass. Branch
+  protection should require `CI gate`, never a conditional lane name.
 
 ### Four distinct evidence classes (never conflated)
 

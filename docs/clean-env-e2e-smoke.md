@@ -72,11 +72,15 @@ uninstall → reinstall lifecycle was executed by the hosted dedicated-UID
 observation log only and remains **NOT EXECUTED** as clean-room acceptance
 evidence; it must not be retroactively promoted. This
 suite still never executes the real binary.
-macOS arm64, Windows x64,
-Windows arm64, and Linux aarch64 are registry-pinned with first-party
-digests and covered only by the credential-free CI install mechanics smoke;
-on all four the real Google binary lifecycle remains **NOT EXECUTED in CI
-and not live-verified**.
+Windows x64 and Windows arm64 have
+real-binary hosted-CI execution evidence (installer + provider registration
++ unauthenticated `initialize`), one tier below clean-room; since issue #9
+the arm64 lane is extended-ARM scope (main pushes, dispatch, packaging
+PRs). macOS arm64 and Linux aarch64 are registry-pinned with first-party
+digests, covered by the credential-free CI install mechanics smoke, and
+have native lifecycle CI lanes implemented (issue #9); on both the real
+Google binary lifecycle remains **NOT RUN in CI and not live-verified**
+until a green native run is cited in the README.
 
 ## Standing boundaries
 
