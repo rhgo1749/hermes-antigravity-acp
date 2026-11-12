@@ -42,10 +42,13 @@ Environment:
   ACP_MUX_AFFINITY_MAX_ENTRIES  affinity assignment cap; defaults to the ACP
                           continuation-state cap (512)
   ACP_MUX_SESSION_GC      set to 1 to run the destructive native session-store
-                          GC once at bind time.  The Hermes provider only sets
-                          this when HERMES_ANTIGRAVITY_ACP_NATIVE_GC=1; the GC
-                          is opt-in until the native session lifetime contract
-                          is finished (issue #3 follow-up).
+                          GC once at bind time.  Set to dry-run to log a
+                          read-only inventory summary (counts and byte totals
+                          only) at bind time instead; dry-run never deletes.
+                          The Hermes provider only sets 1 when
+                          HERMES_ANTIGRAVITY_ACP_NATIVE_GC=1; the GC is
+                          opt-in until the native session lifetime contract
+                          is finished (issue #24).
   ACP_MUX_OWNER_GRACE_SECONDS  minimum age before an ownership record whose
                           native bundle and checkpoint are both gone may be
                           retired; defaults to the affinity retention TTL
@@ -61,9 +64,17 @@ Diagnostics: ``python3 acp_mux.py doctor`` prints the fully resolved path
 contract (control home, registry, state, log, default home, per-account lane
 existence, alias/symlink/collision findings).  It writes nothing and never
 prints labels or credentials.  Exit 0 = clean, 1 = findings to review,
-2 = registry present but unusable.  The portable contract (precedence,
-registry schema, migration, Docker bind-mount topologies) is documented in
-docs/acp-path-contract.md (historical reference).
+2 = registry present but unusable.  ``python3 acp_mux.py inventory`` prints
+a read-only JSON inventory of native session bundles (per-lane counts, byte
+totals, age buckets, checkpoint/owner linkage, and the bundles the opt-in
+native GC would select under current policy).  It deletes nothing and never
+prints raw session ids, account labels, homes, or paths; lanes appear only
+as positional indexes.  Candidate counts are a policy prediction, not a
+reclamation verdict: the current GC has no process lease, so a candidate
+may still belong to a live or parked ACP child (issue #24).  The portable
+contract (precedence, registry schema, migration, Docker bind-mount
+topologies) is documented in docs/acp-path-contract.md (historical
+reference).
 """
 
 from __future__ import annotations
@@ -82,7 +93,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Iterator, Mapping
+from typing import Any, Iterator, Mapping
 
 try:  # POSIX deployment gets cross-process state serialization; other OSes degrade safely.
     import fcntl
@@ -624,10 +635,14 @@ def _active_hermes_session_ids(
     return active
 
 
+def _gc_lock_path() -> str:
+    return STATE_PATH + ".session-gc.lock"
+
+
 @contextmanager
 def _session_gc_lock() -> Iterator[bool]:
     """Serialize destructive session-store pruning across mux processes."""
-    lock_path = STATE_PATH + ".session-gc.lock"
+    lock_path = _gc_lock_path()
     directory = os.path.dirname(lock_path)
     if fcntl is None or not hasattr(os, "O_NOFOLLOW"):
         yield False
@@ -664,6 +679,53 @@ def _session_gc_lock() -> Iterator[bool]:
             except OSError:
                 pass
         lock.close()
+
+
+@contextmanager
+def _session_gc_lock_probe() -> Iterator[str]:
+    """Non-creating, non-blocking lock probe for the read-only inventory.
+
+    Unlike ``_session_gc_lock`` this never creates the lock file or its
+    parent directory and never changes file modes: the inventory must make
+    zero filesystem changes.  Yields a state token:
+
+    - ``"acquired"``    - the lock is held for the duration of the block;
+      the walk is serialized against GC and owner-prune passes.
+    - ``"absent"``      - no lock file exists.  The caller must re-check
+      existence after the walk: a GC/owner-prune pass always creates the
+      lock file before deleting, so a still-absent file proves no pass
+      started mid-scan; an appeared file makes the snapshot unserialized
+      and the report must be ``incomplete``.
+    - ``"unavailable"`` - contended or unsafe to open; fail closed.
+    - ``"unsupported"`` - no flock support; fail closed.
+    """
+    lock_path = _gc_lock_path()
+    if fcntl is None or not hasattr(os, "O_NOFOLLOW"):
+        yield "unsupported"
+        return
+    try:
+        fd = os.open(lock_path, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        yield "absent"
+        return
+    except OSError:
+        yield "unavailable"
+        return
+    acquired = False
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
+        except OSError:
+            pass
+        yield "acquired" if acquired else "unavailable"
+    finally:
+        if acquired:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+        os.close(fd)
 
 
 def _ownership_accounts() -> list[tuple[str, str, str]] | None:
@@ -1082,6 +1144,72 @@ def _delete_session_bundle(store: Path, record: dict) -> tuple[bool, int]:
     return True, size + brain_size
 
 
+def _session_gc_activities(records: dict[str, dict], *, now: float) -> dict[str, float]:
+    """Latest activity per bundle; unreadable records are marked unsafe and skipped.
+
+    An unsafe record gets a synthetic future activity so both the GC and the
+    read-only inventory treat it as untouchable rather than as expired.
+    """
+    activities: dict[str, float] = {}
+    for session_id, record in records.items():
+        activity = _session_record_mtime(record)
+        if activity is None:
+            record["unsafe"] = True
+            activities[session_id] = now + AFFINITY_TTL_SECONDS
+        else:
+            activities[session_id] = activity
+    return activities
+
+
+def _expired_gc_candidates(
+    records: dict[str, dict],
+    activities: dict[str, float],
+    active_session_ids: set[str],
+    *,
+    now: float,
+) -> list[str]:
+    """Session IDs the native GC selects as TTL-expired, in store order.
+
+    Shared by ``_prune_session_store`` (deletes) and ``session_inventory``
+    (reports only) so the dry-run prediction cannot drift from the policy.
+    """
+    cutoff = now - AFFINITY_TTL_SECONDS
+    return [
+        session_id
+        for session_id, record in records.items()
+        if not (
+            record["unsafe"]
+            or session_id in active_session_ids
+            or activities[session_id] > now + AFFINITY_TTL_SECONDS
+            or activities[session_id] >= cutoff
+        )
+    ]
+
+
+def _capacity_gc_candidates(
+    remaining: list[tuple[str, dict]],
+    activities: dict[str, float],
+    active_session_ids: set[str],
+    *,
+    cap: int,
+) -> list[str]:
+    """Session IDs above the per-store cap the native GC evicts, oldest first.
+
+    Shared by ``_prune_session_store`` (deletes) and ``session_inventory``
+    (reports only); unsafe and checkpoint-active records are never evictable.
+    """
+    excess = max(0, len(remaining) - cap)
+    evictable = sorted(
+        (
+            (session_id, record)
+            for session_id, record in remaining
+            if not record["unsafe"] and session_id not in active_session_ids
+        ),
+        key=lambda item: activities[item[0]],
+    )
+    return [session_id for session_id, _ in evictable[:excess]]
+
+
 def _prune_session_store(
     home: str,
     active_session_ids: set[str],
@@ -1097,34 +1225,19 @@ def _prune_session_store(
         result["failed"] += 1
         return result
 
-    cutoff = now - AFFINITY_TTL_SECONDS
-    activities: dict[str, float] = {}
-    for session_id, record in records.items():
-        activity = _session_record_mtime(record)
-        if activity is None:
-            record["unsafe"] = True
-            result["failed"] += 1
-            activities[session_id] = now + AFFINITY_TTL_SECONDS
-        else:
-            activities[session_id] = activity
+    activities = _session_gc_activities(records, now=now)
 
     removed: set[str] = set()
-    for session_id, record in records.items():
-        activity = activities[session_id]
-        if (
-            record["unsafe"]
-            or session_id in active_session_ids
-            or activity > now + AFFINITY_TTL_SECONDS
-            or activity >= cutoff
-        ):
-            continue
-        deleted, freed = _delete_session_bundle(store, record)
+    for session_id in _expired_gc_candidates(
+        records, activities, active_session_ids, now=now
+    ):
+        deleted, freed = _delete_session_bundle(store, records[session_id])
         if deleted:
             removed.add(session_id)
             result["expired"] += 1
             result["bytes"] += freed
         else:
-            record["unsafe"] = True
+            records[session_id]["unsafe"] = True
             result["failed"] += 1
 
     remaining = [
@@ -1132,23 +1245,16 @@ def _prune_session_store(
         for session_id, record in records.items()
         if session_id not in removed
     ]
-    excess = max(0, len(remaining) - AFFINITY_MAX_ENTRIES)
-    evictable = sorted(
-        (
-            (session_id, record)
-            for session_id, record in remaining
-            if not record["unsafe"] and session_id not in active_session_ids
-        ),
-        key=lambda item: activities[item[0]],
-    )
-    for session_id, record in evictable[:excess]:
-        deleted, freed = _delete_session_bundle(store, record)
+    for session_id in _capacity_gc_candidates(
+        remaining, activities, active_session_ids, cap=AFFINITY_MAX_ENTRIES
+    ):
+        deleted, freed = _delete_session_bundle(store, records[session_id])
         if deleted:
             removed.add(session_id)
             result["capacity"] += 1
             result["bytes"] += freed
         else:
-            record["unsafe"] = True
+            records[session_id]["unsafe"] = True
             result["failed"] += 1
     return result
 
@@ -1296,6 +1402,250 @@ def prune_session_stores(*, now: float | None = None) -> dict[str, int] | None:
             )
         )
     return totals
+
+
+_AGE_BUCKET_SECONDS = (3600, 86400, 259200, 604800)
+_AGE_BUCKET_LABELS = ("lt_1h", "1h_24h", "1_3d", "3_7d", "gt_7d")
+
+
+def _lane_bundle_bytes(store: Path, records: dict[str, dict]) -> int | None:
+    """Exact on-disk bytes (store files + brain trees); None if anything is unreadable.
+
+    Mirrors what ``_delete_session_bundle`` would free, so the inventory's
+    byte totals match a future GC pass instead of the file-only log figure.
+    """
+    total = 0
+    for record in records.values():
+        if record["unsafe"]:
+            # Irregular members were excluded from record["files"]; their
+            # footprint is unknowable, so a partial sum would present an
+            # unknown capacity as a (smaller) real number.  Fail closed.
+            return None
+        for path in record["files"]:
+            try:
+                total += path.lstat().st_size
+            except OSError:
+                return None
+        brain = record["brain"]
+        if brain is not None:
+            if brain.is_symlink():
+                return None
+            if brain.exists():
+                measured = _safe_tree_size(brain)
+                if measured is None:
+                    return None
+                total += measured
+    return total
+
+
+def _lane_inventory(
+    lane: int, home: str, active: set[str], owners: dict[str, dict], *, now: float
+) -> dict:
+    """Read-only per-lane bundle census; deletes nothing; reports no identifiers."""
+    out: dict[str, Any] = {
+        "lane": lane,
+        "status": "ok",
+        "bundles": 0,
+        "bytes": 0,
+        "age_buckets": {label: 0 for label in _AGE_BUCKET_LABELS},
+        "checkpoint_protected": 0,
+        "owner_linked": 0,
+        "unowned_unprotected": 0,
+        "gc_candidate_expired": 0,
+        "gc_candidate_capacity": 0,
+        "gc_candidate_bytes": 0,
+        "unsafe": 0,
+    }
+    store_dir = Path(home) / ".gemini" / "antigravity-acp"
+    try:
+        store_dir.lstat()
+    except FileNotFoundError:
+        return out  # no store yet: legitimately zero bundles
+    except OSError:
+        out["status"] = "store-probe-failed"
+        out["bytes"] = None
+        return out
+    store = _session_store_root(home)
+    if store is None:
+        out["status"] = "store-layout-refused"
+        out["bytes"] = None
+        return out
+    records = _session_store_records(store)
+    if records is None:
+        out["status"] = "store-inventory-failed"
+        out["bytes"] = None
+        return out
+
+    activities = _session_gc_activities(records, now=now)
+    expired = _expired_gc_candidates(records, activities, active, now=now)
+    expired_set = set(expired)
+    remaining = [
+        (session_id, record)
+        for session_id, record in records.items()
+        if session_id not in expired_set
+    ]
+    capacity = _capacity_gc_candidates(
+        remaining, activities, active, cap=AFFINITY_MAX_ENTRIES
+    )
+    capacity_set = set(capacity)
+
+    out["bundles"] = len(records)
+    out["bytes"] = _lane_bundle_bytes(store, records)
+    out["gc_candidate_expired"] = len(expired_set)
+    out["gc_candidate_capacity"] = len(capacity_set)
+    out["gc_candidate_bytes"] = _lane_bundle_bytes(
+        store, {sid: records[sid] for sid in expired_set | capacity_set}
+    )
+    for session_id, record in records.items():
+        if record["unsafe"]:
+            out["unsafe"] += 1
+            continue
+        age = max(0.0, now - activities[session_id])
+        for index, bound in enumerate(_AGE_BUCKET_SECONDS):
+            if age < bound:
+                out["age_buckets"][_AGE_BUCKET_LABELS[index]] += 1
+                break
+        else:
+            out["age_buckets"][_AGE_BUCKET_LABELS[-1]] += 1
+        protected = session_id in active
+        linked = _owner_hash(session_id) in owners
+        out["checkpoint_protected"] += int(protected)
+        out["owner_linked"] += int(linked)
+        out["unowned_unprotected"] += int(not protected and not linked)
+    return out
+
+
+def session_inventory(
+    *, now: float | None = None, env: Mapping[str, str] | None = None
+) -> dict:
+    """Read-only native session-store inventory (issue #24 Phase 1, F1).
+
+    Deletes nothing and never will: this walks the same inventories and
+    applies the same decision helpers as ``prune_session_stores`` and only
+    reports what the opt-in native GC *would* select under current policy.
+    A candidate is NOT a reclamation verdict: the current GC has no process
+    lease and no origin tag, so a candidate may still belong to a live or
+    parked ACP child (issue #24 C1/C4; F2/F3/F4 are separate phases).
+
+    Privacy: raw session ids, account labels, homes, and paths never
+    appear; lanes are positional indexes and every value is a count, a
+    byte total, or a machine-readable reason token.
+
+    Fail-closed: an unavailable cross-process lock, an unusable registry,
+    an unreadable checkpoint inventory or ownership ledger, or a refused
+    lane store yields status ``incomplete`` with machine reasons and no
+    candidate claims for the affected lane.  ``deletions_performed`` is a
+    constant 0 by construction: this code path never calls
+    ``_delete_session_bundle``.
+
+    Locking: the inventory never creates the lock file, its parent
+    directory, or changes any mode (see ``_session_gc_lock_probe``).  The
+    ``lock`` field is ``"acquired"`` when the walk was serialized, or
+    ``"absent-unserialized"`` when no lock file existed; the latter is
+    still a sound snapshot because a still-absent lock file after the walk
+    proves no GC/owner-prune pass started during it (every pass creates
+    the lock file before deleting).  A lock file that appears mid-walk
+    makes the report ``incomplete`` with ``gc-lock-appeared-mid-scan``.
+    """
+    now = time.time() if now is None else now
+    report: dict[str, Any] = {
+        "schema": "acp-mux-session-inventory-v1",
+        "status": "ok",
+        "reasons": [],
+        "policy": {
+            "ttl_seconds": AFFINITY_TTL_SECONDS,
+            "cap_per_lane": AFFINITY_MAX_ENTRIES,
+            "owner_grace_seconds": OWNER_GRACE_SECONDS,
+        },
+        "deletions_performed": 0,
+        "reclaim_certainty": (
+            "gc_candidate_prediction_only; no process lease, origin tag, or "
+            "bounded-deletion checks exist yet (issue #24 C1-C4)"
+        ),
+        "lanes": [],
+        "totals": {},
+    }
+    reasons: list[str] = report["reasons"]
+
+    def _incomplete(reason: str) -> dict:
+        reasons.append(reason)
+        report["status"] = "incomplete"
+        return report
+
+    with _session_gc_lock_probe() as lock_state:
+        if lock_state in ("unavailable", "unsupported"):
+            return _incomplete("gc-lock-unavailable")
+        report["lock"] = (
+            "acquired" if lock_state == "acquired" else "absent-unserialized"
+        )
+        entries, meta, problem = _load_registry_data()
+        if problem not in ("", "missing"):
+            return _incomplete(f"registry-{problem}")
+        default_home, _explicit = _effective_default_home(meta)
+        homes = {os.path.abspath(os.path.expanduser(default_home))}
+        for entry in entries or []:
+            home, _label, _priority, _key = _account(entry, default_home)
+            if home:
+                homes.add(os.path.abspath(os.path.expanduser(home)))
+        active = _active_hermes_session_ids(now=now, env=env)
+        if active is None:
+            return _incomplete("checkpoint-inventory-unavailable")
+        owners = _read_session_owners()
+        if owners is None:
+            return _incomplete("ownership-ledger-unavailable")
+        totals: dict[str, Any] = {
+            "bundles": 0,
+            "bytes": 0,
+            "checkpoint_protected": 0,
+            "owner_linked": 0,
+            "unowned_unprotected": 0,
+            "gc_candidate_expired": 0,
+            "gc_candidate_capacity": 0,
+            "gc_candidate_bytes": 0,
+            "unsafe": 0,
+        }
+        for lane, home in enumerate(sorted(homes)):
+            lane_report = _lane_inventory(lane, home, active, owners, now=now)
+            report["lanes"].append(lane_report)
+            if lane_report["status"] != "ok":
+                reasons.append(f"lane-{lane}-{lane_report['status']}")
+                report["status"] = "incomplete"
+            for key in totals:
+                value = lane_report.get(key)
+                if value is None:
+                    totals[key] = None  # never present an unknown as zero
+                elif totals[key] is not None:
+                    totals[key] = int(totals[key]) + int(value)
+        report["totals"] = totals
+        if lock_state == "absent" and os.path.exists(_gc_lock_path()):
+            # A GC or owner-prune pass started mid-walk (every pass creates
+            # the lock file before deleting): this snapshot is not serialized
+            # against deletion.  Census counts stay as walked, but candidate
+            # figures are invalidated (None, lanes and totals alike) so a
+            # raced report never presents a reclamation prediction as
+            # trustworthy.
+            for key in (
+                "gc_candidate_expired",
+                "gc_candidate_capacity",
+                "gc_candidate_bytes",
+            ):
+                totals[key] = None
+                for lane_report in report["lanes"]:
+                    lane_report[key] = None
+            return _incomplete("gc-lock-appeared-mid-scan")
+    return report
+
+
+def run_inventory(env: Mapping[str, str] | None = None) -> int:
+    """Print the read-only session inventory as one JSON line; delete nothing.
+
+    Exit codes follow ``doctor``: 0 = complete, 1 = incomplete findings to
+    review.  The report itself contains only counts, byte totals, age
+    buckets, policy numbers, and machine reason tokens.
+    """
+    report = session_inventory(env=env)
+    print(json.dumps(report, sort_keys=True, separators=(",", ":")))
+    return 0 if report["status"] == "ok" else 1
 
 
 @contextmanager
@@ -1900,6 +2250,8 @@ def run_doctor(env: Mapping[str, str] | None = None) -> int:
 def main() -> int:
     if sys.argv[1:2] in (["doctor"], ["--doctor"]):
         return run_doctor()
+    if sys.argv[1:2] in (["inventory"], ["--inventory"]):
+        return run_inventory()
     if not PAR or not os.path.exists(PAR):
         sys.stderr.write("antigravity-acp-mux: set ACP_MUX_PAR to the official agy_acp_server.par\n")
         return 2
@@ -1982,14 +2334,54 @@ def main() -> int:
             except (json.JSONDecodeError, ValueError):
                 pass
             if upstream is None:
+                gc_mode = os.environ.get("ACP_MUX_SESSION_GC", "")
                 if not session_gc_run:
-                    if os.environ.get("ACP_MUX_SESSION_GC") == "1":
+                    if gc_mode == "1":
                         prune_session_stores()
+                    elif gc_mode == "dry-run":
+                        report = session_inventory()
+                        totals = report.get("totals") or {}
+                        _log(
+                            "session-inventory status={status} "
+                            "bundles={bundles} bytes={bytes} "
+                            "protected={checkpoint_protected} "
+                            "owner-linked={owner_linked} "
+                            "unowned={unowned_unprotected} "
+                            "candidates-expired={gc_candidate_expired} "
+                            "candidates-capacity={gc_candidate_capacity} "
+                            "unsafe={unsafe} deletions=0".format(
+                                status=report["status"],
+                                **{
+                                    key: totals.get(key, 0)
+                                    for key in (
+                                        "bundles",
+                                        "bytes",
+                                        "checkpoint_protected",
+                                        "owner_linked",
+                                        "unowned_unprotected",
+                                        "gc_candidate_expired",
+                                        "gc_candidate_capacity",
+                                        "unsafe",
+                                    )
+                                }
+                            )
+                        )
                     else:
-                        _log("native session GC disabled (opt in: ACP_MUX_SESSION_GC=1)")
+                        _log(
+                            "native session GC disabled (opt in: "
+                            "ACP_MUX_SESSION_GC=1; read-only audit: "
+                            "ACP_MUX_SESSION_GC=dry-run)"
+                        )
                     session_gc_run = True
                 if not owner_prune_run:
-                    prune_session_owners()
+                    if gc_mode == "dry-run":
+                        # dry-run is a census, not a cleanup: expired owner
+                        # records are reported by the inventory, never
+                        # deleted here.
+                        _log("owner-records prune skipped "
+                             "(ACP_MUX_SESSION_GC=dry-run)")
+                    else:
+                        prune_session_owners()
                     owner_prune_run = True
                 resume_id = os.environ.get("ACP_MUX_SESSION_ID", "")
                 owner = _resolve_session_owner(resume_id) if resume_id else None

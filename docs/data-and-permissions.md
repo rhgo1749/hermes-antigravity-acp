@@ -104,6 +104,46 @@ the native bundle and any Hermes continuation checkpoint reference are gone;
 any unreadable registry, ledger, checkpoint inventory, or session store keeps
 every entry.
 
+### Native store lifecycle vs Hermes session pruning
+
+`hermes sessions prune` and the ACP native session-store GC are different
+operations on different stores, and neither one authorizes the other:
+
+- `hermes sessions prune` is Hermes Core's own session-record cleanup
+  (its session database rows and Hermes session directories).  It never
+  touches Google's native session bundles, and running it is **not**
+  authorization to delete anything under a `.gemini/antigravity-acp/`
+  store.
+- The native bundles are Google's server-owned state.  The mux's native
+  GC (`ACP_MUX_SESSION_GC=1`, which the Hermes provider sets only when
+  `HERMES_ANTIGRAVITY_ACP_NATIVE_GC=1`) is the only component in this
+  project that deletes them.  It is opt-in, runs once at bind time, and
+  preserves every bundle that an unexpired Hermes continuation checkpoint
+  references; any unreadable inventory fails the whole pass closed.
+- Read-only audit (issue #24 Phase 1): `python3 acp_mux.py inventory`
+  prints a JSON census of the native stores — per-lane bundle counts,
+  byte totals, age buckets, checkpoint/owner linkage, and the bundles the
+  current GC policy *would* select — and deletes nothing.  Setting
+  `ACP_MUX_SESSION_GC=dry-run` for a directly-launched mux logs the same
+  summary at bind time instead of deleting; it also skips the expired
+  owner-record cleanup, so a dry-run pass mutates neither native bundles
+  nor owner metadata.  The report never contains raw session ids, account
+  labels, homes, or paths; lanes appear only as positional indexes.
+- Inventory locking makes zero filesystem changes: it never creates the
+  lock file or changes any mode.  The report's `lock` field is
+  `"acquired"` when the walk was serialized against GC/owner-prune passes,
+  or `"absent-unserialized"` when no lock file existed — still a sound
+  snapshot, because every pruning pass creates the lock file before
+  deleting, so a lock file still absent after the walk proves no pass ran
+  during it.  A lock file that appears mid-walk, or a contended lock,
+  yields `status: "incomplete"` and no candidate claims.
+- Candidate counts are a policy prediction, **not** a reclamation
+  verdict: the current GC has no process lease and no origin tag, so a
+  reported candidate may still belong to a live or parked ACP child
+  (issue #24 counterexamples C1/C4).  Enabling the GC is a separately
+  reviewed decision with its own bounds and rollback evidence (issue #24
+  Phases 2-3).
+
 ## 4. Telemetry
 
 - **This plugin sends no telemetry.** Nothing is reported to this repository

@@ -217,6 +217,9 @@ def main() -> int:
     if sys.argv[1:2] in (["doctor"], ["--doctor"]):
         # Same resolved contract report as scripts/acp_mux.py doctor.
         return base.run_doctor()
+    if sys.argv[1:2] in (["inventory"], ["--inventory"]):
+        # Same read-only inventory report as scripts/acp_mux.py inventory.
+        return base.run_inventory()
     if not base.PAR or not os.path.exists(base.PAR):
         sys.stderr.write(
             "antigravity-acp-mux: set ACP_MUX_PAR to the official agy_acp_server.par\n"
@@ -429,14 +432,54 @@ def main() -> int:
                 pass
 
             if upstream is None:
+                gc_mode = os.environ.get("ACP_MUX_SESSION_GC", "")
                 if not session_gc_run:
-                    if os.environ.get("ACP_MUX_SESSION_GC") == "1":
+                    if gc_mode == "1":
                         base.prune_session_stores()
+                    elif gc_mode == "dry-run":
+                        report = base.session_inventory()
+                        totals = report.get("totals") or {}
+                        base._log(
+                            "session-inventory status={status} "
+                            "bundles={bundles} bytes={bytes} "
+                            "protected={checkpoint_protected} "
+                            "owner-linked={owner_linked} "
+                            "unowned={unowned_unprotected} "
+                            "candidates-expired={gc_candidate_expired} "
+                            "candidates-capacity={gc_candidate_capacity} "
+                            "unsafe={unsafe} deletions=0".format(
+                                status=report["status"],
+                                **{
+                                    key: totals.get(key, 0)
+                                    for key in (
+                                        "bundles",
+                                        "bytes",
+                                        "checkpoint_protected",
+                                        "owner_linked",
+                                        "unowned_unprotected",
+                                        "gc_candidate_expired",
+                                        "gc_candidate_capacity",
+                                        "unsafe",
+                                    )
+                                }
+                            )
+                        )
                     else:
-                        base._log("native session GC disabled (opt in: ACP_MUX_SESSION_GC=1)")
+                        base._log(
+                            "native session GC disabled (opt in: "
+                            "ACP_MUX_SESSION_GC=1; read-only audit: "
+                            "ACP_MUX_SESSION_GC=dry-run)"
+                        )
                     session_gc_run = True
                 if not owner_prune_run:
-                    base.prune_session_owners()
+                    if gc_mode == "dry-run":
+                        # dry-run is a census, not a cleanup: expired owner
+                        # records are reported by the inventory, never
+                        # deleted here.
+                        base._log("owner-records prune skipped "
+                                  "(ACP_MUX_SESSION_GC=dry-run)")
+                    else:
+                        base.prune_session_owners()
                     owner_prune_run = True
                 resume_id = os.environ.get("ACP_MUX_SESSION_ID", "")
                 owner = base._resolve_session_owner(resume_id) if resume_id else None
