@@ -152,12 +152,12 @@ class _Worker(threading.Thread):
 class AcpHarness:
     """Fresh plugin module (fresh global warm pool) + fake-server plumbing."""
 
-    def __init__(self, tmp_path: Path):
+    def __init__(self, tmp_path: Path, monkeypatch):
         self.dir = tmp_path / "agy"
         self.dir.mkdir()
         (self.dir / "fake_acp_server.py").write_text(FAKE_SERVER, encoding="utf-8")
-        os.environ["HERMES_ANTIGRAVITY_ACP_STATE_FILE"] = str(self.dir / "conv-state.json")
-        os.environ.pop("HERMES_ANTIGRAVITY_ACP_NATIVE_GC", None)
+        monkeypatch.setenv("HERMES_ANTIGRAVITY_ACP_STATE_FILE", str(self.dir / "conv-state.json"))
+        monkeypatch.delenv("HERMES_ANTIGRAVITY_ACP_NATIVE_GC", raising=False)
         registered = []
 
         class FakeProviderProfile:
@@ -168,11 +168,8 @@ class AcpHarness:
         providers.register_provider = registered.append
         providers_base = types.ModuleType("providers.base")
         providers_base.ProviderProfile = FakeProviderProfile
-        self._saved = {
-            name: sys.modules.get(name) for name in ("providers", "providers.base")
-        }
-        sys.modules["providers"] = providers
-        sys.modules["providers.base"] = providers_base
+        monkeypatch.setitem(sys.modules, "providers", providers)
+        monkeypatch.setitem(sys.modules, "providers.base", providers_base)
         name = f"agy_issue23_{abs(hash(str(tmp_path)))}"
         spec = importlib.util.spec_from_file_location(
             name, PLUGIN_DIR / "__init__.py", submodule_search_locations=[str(PLUGIN_DIR)])
@@ -209,8 +206,19 @@ class AcpHarness:
 
 
 @pytest.fixture()
-def agy(tmp_path):
-    return AcpHarness(tmp_path)
+def agy(tmp_path, monkeypatch):
+    harness = AcpHarness(tmp_path, monkeypatch)
+    try:
+        yield harness
+    finally:
+        # Keep the fake registry and this harness's pool local to the test.
+        # Otherwise later real-Core seam tests can import fake ProviderProfile.
+        try:
+            harness.client_module._shutdown_warm_pool()
+        finally:
+            for name in tuple(sys.modules):
+                if name == harness._module_name or name.startswith(harness._module_name + "."):
+                    del sys.modules[name]
 
 
 def _wait_prompt_received(log_path: Path, timeout=10.0):

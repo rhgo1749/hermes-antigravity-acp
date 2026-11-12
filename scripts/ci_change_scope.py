@@ -4,7 +4,10 @@
 The workflow's ``change-scope`` job runs this once per run; every conditional
 lane reads its outputs. The classifier is deliberately conservative:
 
-* documentation-only changes take the fast route;
+* documentation-only changes and exact, reviewed platform-neutral tests
+  take the fast route (issue #28 Phase A); ordinary plugin changes still
+  require Linux x64, Windows x64 and macOS ARM64, never Extended ARM just
+  because one of those reviewed tests changed;
 * install-surface changes (registry, installers, plugin payload, scripts,
   CI itself) additionally trigger the real-binary OS lanes;
 * packaging-surface changes additionally trigger the extended ARM lanes
@@ -105,6 +108,17 @@ PACKAGING_NAME_PATTERNS = (
     "*publish*",
 )
 
+# Exact, content-reviewed protocol regressions. These exercise model selection
+# and thinking-level mapping using Python fake ACP children + stub providers;
+# neither selects native distributions, installs payloads, nor asserts OS/ABI
+# behavior. This is ONLY a changed-path policy, NEVER a pytest selection list.
+# New files (even similarly named ones), fixtures and helpers remain unknown
+# until separately reviewed. Re-review entries if their responsibility changes.
+REVIEWED_NEUTRAL_TESTS_EXACT = frozenset({
+    "tests/test_acp_thinking_level.py",
+    "tests/test_model_surface_selection.py",
+})
+
 # Documentation-only surface. fnmatch semantics: ``*`` crosses ``/``.
 FAST_ONLY_PATTERNS = (
     "*.md",
@@ -157,6 +171,14 @@ def classify_paths(paths: list[str]) -> Scope:
                 acc.unknown.append(path)
         elif path.startswith(OS_TRIGGER_PREFIXES) or path in OS_TRIGGER_EXACT:
             acc.os_lanes = True
+        elif path in REVIEWED_NEUTRAL_TESTS_EXACT:
+            continue
+        elif path.startswith("tests/"):
+            # Evaluate before documentation globs: unreviewed test data and
+            # helpers (including .md fixtures) must never become docs-only.
+            acc.os_lanes = True
+            acc.extended_arm = True
+            acc.unknown.append(path)
         elif any(fnmatch.fnmatch(path, pattern) for pattern in FAST_ONLY_PATTERNS):
             continue
         else:
