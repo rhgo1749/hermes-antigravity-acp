@@ -22,7 +22,10 @@ conclusions — is the single honest verdict:
   or ``false``. A missing key, empty string, typo, null, or wrong type
   fails the gate even when every lane is green — a malformed scope may
   never read as "not required". ``extended_arm=true`` with
-  ``os_lanes=false`` is contradictory and also fails.
+  ``os_lanes=false`` is contradictory and also fails;
+* any job wired into ``ci-gate`` that is NOT part of this script's tier
+  policy fails the gate regardless of its result — the gate refuses to
+  certify an outcome it never audited.
 
 Input is the Actions ``needs`` context serialized with ``toJSON`` plus the
 ``change-scope`` outputs; the verdict is exit code 0/1 and a summary table.
@@ -90,6 +93,19 @@ def evaluate(expected: dict[str, object], results: dict[str, dict]) -> tuple[boo
     else:
         expected_os = flags["os_lanes"]
         expected_arm = flags["extended_arm"]
+
+    # ``results`` is toJSON(needs): every job wired into ci-gate appears
+    # here. A job outside the tier policy is never certified — whatever
+    # its result — so a newly added lane cannot ride to green (or hide a
+    # failure) until the policy above is deliberately extended to cover
+    # it. The contract test keeps workflow jobs and this policy in sync.
+    known = {"change-scope", *FAST_LANES, *OS_LANES, *ARM_LANES}
+    for lane in sorted(set(results) - known):
+        ok = False
+        lines.append(
+            f"FAIL {lane}: wired into ci-gate needs but unknown to the gate "
+            f"policy; an unaudited job is never a pass"
+        )
 
     def check(lane: str, required: bool, tier: str) -> None:
         nonlocal ok

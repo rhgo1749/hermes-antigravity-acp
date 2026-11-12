@@ -378,6 +378,40 @@ def test_gate_accepts_every_valid_scope_combination() -> None:
         assert ok, (os_value, arm_value, report)
 
 
+# -- P1-1 runtime half (2nd review): jobs the policy does not know --------
+#
+# `results` is toJSON(needs): every job wired into ci-gate appears here.
+# A job that is not in the gate's tier policy must fail the gate no
+# matter what its result is — the gate refuses to certify an outcome it
+# never audited. This closes the fail-open path where a new failing job
+# (e.g. security-audit) rides to green on the strength of the known
+# lanes alone.
+
+
+def test_gate_fails_on_unknown_job_that_failed() -> None:
+    results = {**ALL_SUCCESS, "security-audit": {"result": "failure"}}
+    ok, report = gate_mod.evaluate(FULL, results)
+    assert not ok
+    assert any(line.startswith("FAIL") and "security-audit" in line for line in report)
+
+
+def test_gate_fails_on_unknown_job_even_when_it_succeeded() -> None:
+    for result in ("success", "skipped", "cancelled"):
+        results = {**ALL_SUCCESS, "security-audit": {"result": result}}
+        ok, report = gate_mod.evaluate(FULL, results)
+        assert not ok, result
+        assert any(
+            line.startswith("FAIL") and "security-audit" in line for line in report
+        ), result
+
+
+def test_gate_lane_policy_covers_every_contract_lane() -> None:
+    policy = set(gate_mod.FAST_LANES) | set(gate_mod.OS_LANES) | set(gate_mod.ARM_LANES)
+    assert policy == set(ALL_LANES) - {"change-scope"}, (
+        "gate tier policy drifted from the workflow lanes; sync ci_gate_check.py"
+    )
+
+
 # -- P0-2 (issue #9 rework): renames may never narrow the scope -----------
 #
 # `git diff --name-only` with rename detection reports only the NEW path,
