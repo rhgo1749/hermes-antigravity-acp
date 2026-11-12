@@ -37,7 +37,7 @@ sys.path.insert(0, str(REPO / "scripts"))
 
 import install_acp  # noqa: E402  (stdlib-only closure: redaction contract)
 
-DISPLAY_NAME = "Antigravity ACP (official)"
+DISPLAY_NAME = "Antigravity ACP"
 BASE_URL = "acp://antigravity"
 AUTH_TYPE = "external_process"
 LAUNCHER_NAME = "antigravity-acp-official"
