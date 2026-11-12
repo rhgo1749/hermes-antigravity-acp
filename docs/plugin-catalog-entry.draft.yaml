@@ -11,7 +11,7 @@ title: Antigravity ACP (official)
 repo: https://github.com/rhgo1749/hermes-antigravity-acp
 sha: "<40-HEX-AT-SUBMISSION>"
 subdir: hermes-plugin/antigravity-acp
-version: 0.7.10
+version: 0.7.11
 description: >-
   Google Antigravity through Google's official ACP server (ACP v1 JSON-RPC
   over stdio). Disclosure — registers one model provider at import and
@@ -44,9 +44,9 @@ description: >-
   can run one official ACP server child per signed-in Google account for
   session affinity. The plugin may retain an initialized server child in a
   warm pool for reuse and discards it on incompatible identity or error.
-  The validator's seven rule-9 warnings are guarded imports of
-  core helpers in hermes_compat.py, each behind a public-surface fallback
-  for older and newer Hermes. Lineage: not a derivative of any listed
+  Some Core helper and session-context dependencies remain private and
+  security-sensitive; their compatibility risks and fail-closed behavior are
+  documented in docs/hermes-compatibility.md. Lineage: not a derivative of any listed
   antigravity plugin; different transport and architecture (Google's official
   ACP stdio server, not an agy CLI wrapper).
 maintainer: rhgo1749
