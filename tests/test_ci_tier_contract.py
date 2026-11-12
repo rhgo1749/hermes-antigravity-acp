@@ -334,3 +334,221 @@ def test_registry_keeps_all_five_native_targets() -> None:
         ("windows", "amd64"),
         ("windows", "arm64"),
     }
+
+
+# -- P0-1 (issue #9 rework): scope outputs are validated strictly ---------
+#
+# A malformed `change-scope` output must never read as "false" (that would
+# silently narrow validation). Only the exact strings "true"/"false" are
+# valid; anything else fails the gate even when every lane is green.
+
+
+def test_gate_fails_when_scope_flags_are_missing_even_with_all_green_lanes() -> None:
+    ok, report = gate_mod.evaluate({}, ALL_SUCCESS)
+    assert not ok
+    assert any(line.startswith("FAIL") and "os_lanes" in line for line in report)
+    assert any(line.startswith("FAIL") and "extended_arm" in line for line in report)
+
+
+def test_gate_fails_on_malformed_scope_flag_values() -> None:
+    for bad in ("", "True", "TRUE", "yes", "1", "tru", None, True, False, 1, ["true"], {}):
+        for key in ("os_lanes", "extended_arm"):
+            expected: dict[str, object] = {
+                "os_lanes": "true", "extended_arm": "true", "reason": "x",
+            }
+            expected[key] = bad
+            ok, report = gate_mod.evaluate(expected, ALL_SUCCESS)
+            assert not ok, (key, bad)
+            assert any(line.startswith("FAIL") and key in line for line in report), (key, bad)
+
+
+def test_gate_fails_on_contradictory_scope_combination() -> None:
+    ok, report = gate_mod.evaluate(
+        {"os_lanes": "false", "extended_arm": "true", "reason": "x"}, ALL_SUCCESS
+    )
+    assert not ok
+    assert any("contradict" in line.lower() for line in report)
+
+
+def test_gate_accepts_every_valid_scope_combination() -> None:
+    for os_value, arm_value in (("true", "true"), ("true", "false"), ("false", "false")):
+        ok, report = gate_mod.evaluate(
+            {"os_lanes": os_value, "extended_arm": arm_value, "reason": "x"}, ALL_SUCCESS
+        )
+        assert ok, (os_value, arm_value, report)
+
+
+# -- P0-2 (issue #9 rework): renames may never narrow the scope -----------
+#
+# `git diff --name-only` with rename detection reports only the NEW path,
+# so scripts/install_acp.py -> docs/install_acp.md would read as a docs
+# change and drop the ARM lanes. The classifier must see both sides.
+
+
+def _make_scratch_repo(tmp_path) -> Path:
+    import subprocess
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def git(*args: str) -> None:
+        subprocess.run(
+            ["git", *args], cwd=repo, check=True, capture_output=True, text=True
+        )
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "ci-contract@example.invalid")
+    git("config", "user.name", "ci-contract")
+    (repo / "scripts").mkdir()
+    (repo / "scripts" / "install_acp.py").write_text("print('installer')\n", encoding="utf-8")
+    (repo / "README.md").write_text("# base\n", encoding="utf-8")
+    git("add", "-A")
+    git("commit", "-q", "-m", "base")
+    return repo
+
+
+def _repo_diff_paths(tmp_path, repo: Path, mutate) -> list[str]:
+    import subprocess
+
+    def git(*args: str) -> str:
+        return subprocess.run(
+            ["git", *args], cwd=repo, check=True, capture_output=True, text=True
+        ).stdout
+
+    base = git("rev-parse", "HEAD").strip()
+    mutate(repo)
+    git("add", "-A")
+    git("commit", "-q", "-m", "change")
+    head = git("rev-parse", "HEAD").strip()
+    import os
+
+    old_cwd = os.getcwd()
+    os.chdir(repo)
+    try:
+        return scope_mod._changed_files(base, head)
+    finally:
+        os.chdir(old_cwd)
+
+
+def test_rename_of_an_installer_keeps_both_paths_and_arm_scope(tmp_path) -> None:
+    repo = _make_scratch_repo(tmp_path)
+
+    def mutate(repo_path: Path) -> None:
+        import subprocess
+
+        (repo_path / "docs").mkdir()
+        subprocess.run(
+            ["git", "mv", "scripts/install_acp.py", "docs/install_acp.md"],
+            cwd=repo_path, check=True, capture_output=True,
+        )
+
+    paths = _repo_diff_paths(tmp_path, repo, mutate)
+    assert "scripts/install_acp.py" in paths, paths
+    assert "docs/install_acp.md" in paths, paths
+    scope = scope_mod.classify_paths(paths)
+    assert (scope.os_lanes, scope.extended_arm) == (True, True), scope
+
+
+def test_deletion_of_an_installer_keeps_arm_scope(tmp_path) -> None:
+    repo = _make_scratch_repo(tmp_path)
+
+    def mutate(repo_path: Path) -> None:
+        (repo_path / "scripts" / "install_acp.py").unlink()
+
+    paths = _repo_diff_paths(tmp_path, repo, mutate)
+    assert "scripts/install_acp.py" in paths, paths
+    scope = scope_mod.classify_paths(paths)
+    assert (scope.os_lanes, scope.extended_arm) == (True, True), scope
+
+
+def test_docs_only_diff_in_a_real_repo_stays_fast(tmp_path) -> None:
+    repo = _make_scratch_repo(tmp_path)
+
+    def mutate(repo_path: Path) -> None:
+        (repo_path / "README.md").write_text("# changed docs only\n", encoding="utf-8")
+
+    paths = _repo_diff_paths(tmp_path, repo, mutate)
+    assert paths == ["README.md"], paths
+    scope = scope_mod.classify_paths(paths)
+    assert (scope.os_lanes, scope.extended_arm) == (False, False), scope
+
+
+# -- P1-1 (issue #9 rework): gate needs stay synced with workflow jobs ----
+
+
+def _top_level_job_ids(ci: str) -> set[str]:
+    jobs_section = ci.split("\njobs:\n", 1)[1]
+    return set(re.findall(r"^  ([a-z][a-z0-9_-]*):", jobs_section, re.M))
+
+
+def _gate_needs(ci: str) -> set[str]:
+    block = _job_block(ci, "ci-gate")
+    match = re.search(r"needs:\s*\[([^\]]+)\]", block)
+    assert match, "ci-gate must declare a needs list"
+    return {item.strip() for item in match.group(1).split(",")}
+
+
+def test_gate_needs_stay_in_sync_with_the_workflow_jobs(ci: str) -> None:
+    jobs = _top_level_job_ids(ci)
+    assert "ci-gate" in jobs, "workflow job discovery is broken"
+    needs = _gate_needs(ci)
+    missing = jobs - {"ci-gate"} - needs
+    stale = needs - jobs
+    assert not missing, f"jobs missing from ci-gate needs: {sorted(missing)}"
+    assert not stale, f"ci-gate needs reference unknown jobs: {sorted(stale)}"
+    assert set(ALL_LANES) == jobs - {"ci-gate"}, (
+        "ALL_LANES drifted from the workflow; sync the contract test"
+    )
+
+
+def test_gate_needs_sync_detects_a_new_unlisted_job(ci: str) -> None:
+    sabotaged = ci.replace(
+        "  ci-gate:\n",
+        "  synth-new-lane:\n"
+        "    name: Synthetic lane\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps: []\n"
+        "  ci-gate:\n",
+        1,
+    )
+    jobs = _top_level_job_ids(sabotaged)
+    needs = _gate_needs(sabotaged)
+    assert "synth-new-lane" in jobs - needs, (
+        "the sync check must notice a new job that the gate does not wait for"
+    )
+
+
+# -- P1-2 (issue #9 rework): scripts/ packaging classification ------------
+
+
+def test_new_packaging_scripts_trigger_arm() -> None:
+    for path in (
+        "scripts/arm_packager.py",
+        "scripts/package_artifacts.py",
+        "scripts/build_native_payload.py",
+        "scripts/install_platform_thing.py",
+        "scripts/win_mux_helper.py",
+        "scripts/release_bundle.py",
+    ):
+        scope = scope_mod.classify_paths([path])
+        assert (scope.os_lanes, scope.extended_arm) == (True, True), path
+
+
+def test_new_unclassified_script_fails_closed_to_full_matrix() -> None:
+    scope = scope_mod.classify_paths(["scripts/mystery_tool.py"])
+    assert (scope.os_lanes, scope.extended_arm) == (True, True), scope
+    assert scope.unknown_paths == ("scripts/mystery_tool.py",)
+
+
+def test_verified_non_packaging_scripts_stay_os_only() -> None:
+    for path in (
+        "scripts/acp_probe.py",
+        "scripts/audit_public_tree.py",
+        "scripts/deploy_hermes_profiles.py",
+        "scripts/ci_change_scope.py",
+        "scripts/ci_gate_check.py",
+        "scripts/publication_gate.py",
+        "scripts/hosted_clean_room_ci.py",
+    ):
+        scope = scope_mod.classify_paths([path])
+        assert (scope.os_lanes, scope.extended_arm) == (True, False), path

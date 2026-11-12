@@ -16,7 +16,13 @@ conclusions — is the single honest verdict:
   stale, missing) is a failure — only ``success`` and, for unrequired
   lanes, ``skipped`` are acceptable;
 * if ``change-scope`` itself did not succeed, nothing is trustworthy and
-  the gate fails.
+  the gate fails;
+* the ``change-scope`` OUTPUTS are validated strictly: ``os_lanes`` and
+  ``extended_arm`` must be present and be exactly the strings ``true``
+  or ``false``. A missing key, empty string, typo, null, or wrong type
+  fails the gate even when every lane is green — a malformed scope may
+  never read as "not required". ``extended_arm=true`` with
+  ``os_lanes=false`` is contradictory and also fails.
 
 Input is the Actions ``needs`` context serialized with ``toJSON`` plus the
 ``change-scope`` outputs; the verdict is exit code 0/1 and a summary table.
@@ -32,7 +38,38 @@ OS_LANES = ("acp-clean-room", "windows-x64", "macos-arm64")
 ARM_LANES = ("windows-arm64", "linux-aarch64")
 
 
-def evaluate(expected: dict[str, str], results: dict[str, dict]) -> tuple[bool, list[str]]:
+def _strict_scope_flags(expected: dict) -> tuple[dict[str, bool], list[str]]:
+    """Parse scope flags with zero tolerance; return (flags, problems).
+
+    Only the exact strings ``"true"``/``"false"`` are valid. Everything
+    else (missing, empty, typo, null, non-string) is a problem the caller
+    must fail the gate on — never a silent ``False``.
+    """
+    flags: dict[str, bool] = {}
+    problems: list[str] = []
+    for key in ("os_lanes", "extended_arm"):
+        if key not in expected:
+            problems.append(f"{key} is missing from change-scope outputs")
+            continue
+        value = expected[key]
+        if not isinstance(value, str):
+            problems.append(
+                f"{key} must be the exact string 'true'/'false'; "
+                f"got {type(value).__name__} {value!r}"
+            )
+            continue
+        if value not in ("true", "false"):
+            problems.append(f"{key}={value!r} is not exactly 'true' or 'false'")
+            continue
+        flags[key] = value == "true"
+    if flags.get("extended_arm") and flags.get("os_lanes") is False:
+        problems.append(
+            "contradictory scope: extended_arm=true requires os_lanes=true"
+        )
+    return flags, problems
+
+
+def evaluate(expected: dict[str, object], results: dict[str, dict]) -> tuple[bool, list[str]]:
     """Return (ok, report_lines). Pure; unit-tested in tests/."""
     lines: list[str] = []
     ok = True
@@ -41,8 +78,18 @@ def evaluate(expected: dict[str, str], results: dict[str, dict]) -> tuple[bool, 
     if scope_result != "success":
         ok = False
         lines.append(f"FAIL change-scope: result={scope_result!r} (scope detection is mandatory)")
-    expected_os = str(expected.get("os_lanes", "")).lower() == "true"
-    expected_arm = str(expected.get("extended_arm", "")).lower() == "true"
+
+    flags, scope_problems = _strict_scope_flags(expected)
+    for problem in scope_problems:
+        ok = False
+        lines.append(f"FAIL scope: {problem}")
+    if scope_problems:
+        # Fail closed for lane reporting: assume the strongest scope so
+        # every lane that could have been required is inspected.
+        expected_os = expected_arm = True
+    else:
+        expected_os = flags["os_lanes"]
+        expected_arm = flags["extended_arm"]
 
     def check(lane: str, required: bool, tier: str) -> None:
         nonlocal ok

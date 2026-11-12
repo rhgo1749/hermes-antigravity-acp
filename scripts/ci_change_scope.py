@@ -8,11 +8,16 @@ lane reads its outputs. The classifier is deliberately conservative:
 * install-surface changes (registry, installers, plugin payload, scripts,
   CI itself) additionally trigger the real-binary OS lanes;
 * packaging-surface changes additionally trigger the extended ARM lanes
-  (Windows ARM64, Linux aarch64);
+  (Windows ARM64, Linux aarch64); under ``scripts/`` only reviewed
+  non-packaging scripts (``NON_PACKAGING_SCRIPTS_EXACT``) or clearly
+  non-packaging names stay off the ARM lanes — packaging-named or
+  unreviewed scripts pull them;
 * ANY path the classifier does not recognize, an empty diff, a missing
   base commit, or a git failure falls back to the STRONGEST scope
   (os_lanes + extended_arm true). A change detector can only ever widen
   validation, never narrow it below what an unknown change deserves.
+  Renames are disabled in the diff so both sides of every move are
+  classified (see ``_changed_files``).
 
 Scope semantics consumed by ``scripts/ci_gate_check.py``:
   os_lanes=true      -> acp-clean-room, windows-x64, macos-arm64 required
@@ -57,6 +62,49 @@ ARM_TRIGGER_EXACT = (
     ".python-version",
 )
 
+# scripts/ reviewed and confirmed NOT to produce or select platform
+# binaries: they keep the OS lanes but never pull the slow ARM lanes.
+# Adding a path here is a deliberate, reviewable act — anything under
+# scripts/ that is neither listed here nor packaging-named (below) fails
+# closed to the full matrix.
+NON_PACKAGING_SCRIPTS_EXACT = (
+    "scripts/acp_gate_c_turn.py",
+    "scripts/acp_live_canary.py",
+    "scripts/acp_login.py",
+    "scripts/acp_probe.py",
+    "scripts/acp_session_model_probe.py",
+    "scripts/acp_surface_dump.py",
+    "scripts/audit_exposure.py",
+    "scripts/audit_public_tree.py",
+    "scripts/ci_change_scope.py",
+    "scripts/ci_gate_check.py",
+    "scripts/clean_room_provider_probe.py",
+    "scripts/deploy_hermes_profiles.py",
+    "scripts/hermes_canary_env.py",
+    "scripts/hosted_clean_room_ci.py",
+    "scripts/publication_gate.py",
+)
+
+# Name heuristics for packaging/installer surface under scripts/: a NEW
+# script whose name looks like packaging triggers the ARM lanes without
+# waiting for a manual classification pass.
+PACKAGING_NAME_PATTERNS = (
+    "install_*",
+    "package_*",
+    "*packag*",
+    "bundle_*",
+    "*bundle*",
+    "build_*",
+    "*build*",
+    "release_*",
+    "*release*",
+    "*wheel*",
+    "*sdist*",
+    "*mux*",
+    "publish_*",
+    "*publish*",
+)
+
 # Documentation-only surface. fnmatch semantics: ``*`` crosses ``/``.
 FAST_ONLY_PATTERNS = (
     "*.md",
@@ -90,9 +138,23 @@ def classify_paths(paths: list[str]) -> Scope:
         return Scope(True, True, "empty-diff-fail-closed")
     acc = _Accumulator()
     for path in paths:
+        name = path.rsplit("/", 1)[-1]
         if path in ARM_TRIGGER_EXACT:
             acc.os_lanes = True
             acc.extended_arm = True
+        elif path.startswith("scripts/"):
+            if path in NON_PACKAGING_SCRIPTS_EXACT:
+                acc.os_lanes = True
+            elif any(
+                fnmatch.fnmatchcase(name, pattern) for pattern in PACKAGING_NAME_PATTERNS
+            ):
+                acc.os_lanes = True
+                acc.extended_arm = True
+            else:
+                # Unreviewed script: packaging-relevant until proven not.
+                acc.os_lanes = True
+                acc.extended_arm = True
+                acc.unknown.append(path)
         elif path.startswith(OS_TRIGGER_PREFIXES) or path in OS_TRIGGER_EXACT:
             acc.os_lanes = True
         elif any(fnmatch.fnmatch(path, pattern) for pattern in FAST_ONLY_PATTERNS):
@@ -125,8 +187,13 @@ def _commit_exists(rev: str) -> bool:
 
 
 def _changed_files(base: str, head: str) -> list[str]:
+    # --no-renames: with rename detection Git reports only the NEW path,
+    # so "moving" scripts/install_acp.py into docs/ would classify as a
+    # docs change and silently drop the ARM lanes. Listing deletions and
+    # additions separately makes the classifier see both sides of every
+    # rename, move, or copy and take the most dangerous classification.
     diff = subprocess.run(
-        ["git", "diff", "--name-only", f"{base}...{head}"],
+        ["git", "diff", "--no-renames", "--name-only", f"{base}...{head}"],
         check=True,
         capture_output=True,
         text=True,
