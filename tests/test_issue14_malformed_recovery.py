@@ -18,6 +18,7 @@ bounded recovery contract:
 from __future__ import annotations
 
 import json
+import sys
 
 import pytest
 
@@ -474,3 +475,184 @@ def test_malformed_regeneration_requests_strict_same_session(monkeypatch) -> Non
     assert turns[0]["strict"] is False  # primary generation: existing policy
     assert turns[1]["strict"] is False  # read-evidence turn: existing policy
     assert turns[2]["strict"] is True  # malformed regeneration: pinned session
+
+
+# --- P1 round 3 (independent re-review of PR #29): pre-prompt wire blocking ---
+#
+# The strict session-id equality check ran after _run_prompt_once() completed,
+# but a session/resume response carrying a foreign sessionId would already
+# have been used as the target of session/prompt inside that call.  Strict
+# mode must block the mismatch at the resume response, before any prompt
+# crosses the wire.  A resume response that legally omits sessionId (the ACP
+# shape the repo's own fake servers emit) stays accepted via the pinned id.
+
+_WIRE_FAKE_SERVER = r'''
+import json
+import os
+import sys
+
+log_path = sys.argv[1]
+counter_path = sys.argv[2]
+
+MODEL_CONFIG = {
+    "configOptions": [{
+        "id": "model",
+        "category": "model",
+        "currentValue": "gemini-3.1-pro",
+        "options": [{"value": "gemini-3.1-pro"}],
+    }],
+}
+
+MALFORMED = (
+    "<tool_call>"
+    + json.dumps({
+        "id": "call-bad",
+        "type": "function",
+        "function": {"name": "read_state", "arguments": '{"path":"unterminated"'},
+    })
+    + "</tool_call>"
+)
+VALID = (
+    "<tool_call>"
+    + json.dumps({
+        "id": "call-good",
+        "type": "function",
+        "function": {
+            "name": "read_state",
+            "arguments": json.dumps({"path": "x"}),
+        },
+    })
+    + "</tool_call>"
+)
+
+
+def emit(payload):
+    sys.stdout.write(json.dumps(payload) + "\n")
+    sys.stdout.flush()
+
+
+def log(payload):
+    with open(log_path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(payload) + "\n")
+
+
+def issued():
+    try:
+        n = int(open(counter_path, encoding="utf-8").read().strip())
+    except (OSError, ValueError):
+        n = 0
+    n += 1
+    with open(counter_path, "w", encoding="utf-8") as fh:
+        fh.write(str(n))
+    return f"wire-session-{os.getpid()}-{n}"
+
+
+for line in sys.stdin:
+    msg = json.loads(line)
+    method = msg.get("method")
+    params = msg.get("params") or {}
+    row = {"id": msg.get("id"), "method": method, "params": params}
+    if method == "initialize":
+        log(row)
+        emit({"jsonrpc": "2.0", "id": msg["id"], "result": {}})
+    elif method == "session/new":
+        sid = issued()
+        row["issued_session_id"] = sid
+        log(row)
+        emit({
+            "jsonrpc": "2.0",
+            "id": msg["id"],
+            "result": {"sessionId": sid, **MODEL_CONFIG},
+        })
+    elif method == "session/resume":
+        row["resumed_session_id"] = str(params.get("sessionId") or "")
+        log(row)
+        result = dict(MODEL_CONFIG)
+        if MODE == "wrong_id":
+            # An explicitly different id is a protocol anomaly strict mode must
+            # refuse; a legal omission is the else branch (no sessionId key).
+            result["sessionId"] = "usurper-session-999"
+        emit({"jsonrpc": "2.0", "id": msg["id"], "result": result})
+    elif method == "session/prompt":
+        text = ((params.get("prompt") or [{}])[0].get("text") or "")
+        log(row)
+        response = VALID if "malformed JSON" in text else MALFORMED
+        emit({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": response},
+                }
+            },
+        })
+        emit({"jsonrpc": "2.0", "id": msg["id"], "result": {}})
+    elif msg.get("id") is not None:
+        log(row)
+        emit({"jsonrpc": "2.0", "id": msg["id"], "result": {}})
+    else:
+        log(row)
+'''
+
+
+def _write_wire_server(tmp_path, mode: str):
+    script = tmp_path / "wire_acp_server.py"
+    script.write_text(f"MODE = {mode!r}\n" + _WIRE_FAKE_SERVER, encoding="utf-8")
+    return script
+
+
+def _wire_client(module, tmp_path, mode: str):
+    return module.antigravity_acp.create_client(
+        command=sys.executable,
+        args=[
+            str(_write_wire_server(tmp_path, mode)),
+            str(tmp_path / "wire_acp_log.jsonl"),
+            str(tmp_path / "wire_counter"),
+        ],
+        acp_cwd=str(tmp_path),
+        rate_limit_retries=0,
+    )
+
+
+def _wire_rows(tmp_path):
+    log_path = tmp_path / "wire_acp_log.jsonl"
+    if not log_path.exists():
+        return []
+    return [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+
+
+def _wire_create(client):
+    return client.chat.completions.create(
+        model="gemini-3.1-pro",
+        messages=[{"role": "user", "content": "inspect state"}],
+        tools=[_tool_schema()],
+    )
+
+
+def test_strict_regeneration_wire_never_prompts_foreign_session(monkeypatch, tmp_path) -> None:
+    """A resume response with a foreign sessionId is refused before any prompt."""
+    module, _, _ = _load(monkeypatch)
+    client = _wire_client(module, tmp_path, "wrong_id")
+
+    with pytest.raises(RuntimeError, match="strict same-session"):
+        _wire_create(client)
+
+    rows = _wire_rows(tmp_path)
+    assert len([row for row in rows if row["method"] == "session/resume"]) == 1
+    # The only prompt ever sent is the original malformed generation; the
+    # strict regeneration was blocked before session/prompt crossed the wire.
+    assert len([row for row in rows if row["method"] == "session/prompt"]) == 1
+
+
+def test_strict_regeneration_wire_accepts_resume_omitting_session_id(monkeypatch, tmp_path) -> None:
+    """The legal ACP resume shape without sessionId stays accepted via the pin."""
+    module, _, _ = _load(monkeypatch)
+    client = _wire_client(module, tmp_path, "omit_id")
+
+    completion = _wire_create(client)
+
+    assert completion.choices[0].message.tool_calls[0].id == "call-good"
+    rows = _wire_rows(tmp_path)
+    assert len([row for row in rows if row["method"] == "session/prompt"]) == 2
+    assert len([row for row in rows if row["method"] == "session/resume"]) == 1

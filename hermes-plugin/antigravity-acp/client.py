@@ -4564,6 +4564,7 @@ class AntigravityACPClient:
         affinity_key: str = "",
         resume_session_id: str = "",
         activity_stats_out: dict[str, Any] | None = None,
+        strict_same_session: bool = False,
     ) -> Iterator[tuple[dict[str, Any], Callable[..., Any], dict[str, Any]]]:
         resume_session_id = str(resume_session_id or "").strip()
         entry = self._warm_acquire(affinity_key, resume_session_id)
@@ -4765,6 +4766,24 @@ class AntigravityACPClient:
                     resume_params["_meta"] = session_meta
                 session = request("session/resume", resume_params) or {}
                 session = dict(session)
+                reported_session_id = str(session.get("sessionId") or "").strip()
+                if (
+                    strict_same_session
+                    and reported_session_id
+                    and reported_session_id != resume_session_id
+                ):
+                    # P1 round 3: a resume response naming a different session
+                    # must never reach session/prompt. A response that legally
+                    # omits sessionId (the shape the official server returns
+                    # and the repo's fake servers emit) is not a mismatch; it
+                    # is accepted via the pinned id below.
+                    raise RuntimeError(
+                        "Antigravity ACP strict same-session recovery refused: "
+                        f"session/resume reported session "
+                        f"{reported_session_id[:12]!r} instead of the pinned "
+                        f"{resume_session_id[:12]!r}; refusing to send "
+                        "session/prompt to an unconfirmed session."
+                    )
                 session.setdefault("sessionId", resume_session_id)
                 session["_hermes_resumed"] = True
             else:
@@ -5005,6 +5024,7 @@ class AntigravityACPClient:
                     session_result=session_result,
                     activity_out=attempt_activity,
                     image_blocks=next_image_blocks,
+                    strict_same_session=strict_same_session,
                 )
             except RuntimeError as exc:
                 # A checkpoint error after the prompt has started may follow partial
@@ -5124,6 +5144,7 @@ class AntigravityACPClient:
         activity_out: dict[str, Any] | None = None,
         image_blocks: tuple[dict[str, str], ...] = (),
         thinking_level: str | None = None,
+        strict_same_session: bool = False,
     ) -> tuple[str, str]:
         requested_model = str(model or "").strip()
         with self._session(
@@ -5131,6 +5152,7 @@ class AntigravityACPClient:
             affinity_key=affinity_key,
             resume_session_id=resume_session_id,
             activity_stats_out=activity_out,
+            strict_same_session=strict_same_session,
         ) as (session, request, activity_stats):
             session_id = str(session.get("sessionId") or "").strip()
             resumed = bool(session.get("_hermes_resumed"))
