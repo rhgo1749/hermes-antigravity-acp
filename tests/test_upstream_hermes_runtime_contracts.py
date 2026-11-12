@@ -740,3 +740,37 @@ def test_public_session_context_persists_model_deltas_and_rejects_bad_frames(
     updated = json.loads(state_path.read_text(encoding="utf-8"))
     assert set(updated["usage_totals"]) == {hermes_session_id}
     assert "session-key-only-must-not-be-used" not in json.dumps(updated["usage_totals"])
+
+
+def test_credential_free_namespace_snapshot_covers_installed_core() -> None:
+    """Sync check for the credential-free inventory enforcer (issue #12).
+
+    `tests/test_plugin_manifest.py` classifies Hermes-owned namespaces with
+    `HERMES_TOP_LEVEL_SNAPSHOT`, a snapshot of the official Core definitions
+    taken without a Core checkout. This lane is the authoritative side: every
+    Hermes-owned top-level namespace the installed Core reports through its
+    own official functions must already be inside that snapshot. A failure
+    means upstream added a namespace: move the snapshot and the
+    docs/hermes-compatibility.md register in the same change — never widen
+    the plugin's documented import surface here.
+    """
+    from hermes_cli.plugin_validate_core_override import _hermes_top_level
+
+    from test_plugin_manifest import HERMES_TOP_LEVEL_SNAPSHOT
+
+    computed = {
+        "plugin_validate_core_override._hermes_top_level": set(_hermes_top_level()),
+    }
+    try:
+        from hermes_cli.plugin_validate_private_imports import _hermes_packages
+    except ImportError:
+        pass  # floor refs (v0.21.6) ship without the private-imports catalog
+    else:
+        computed["plugin_validate_private_imports._hermes_packages"] = set(_hermes_packages())
+
+    for name, namespaces in computed.items():
+        unknown = namespaces - HERMES_TOP_LEVEL_SNAPSHOT
+        assert not unknown, (
+            f"official Core {name} reports top-level namespaces outside the "
+            f"credential-free snapshot: {sorted(unknown)}"
+        )
