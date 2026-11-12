@@ -30,7 +30,7 @@ through Hermes' own approval-gated terminal and file tools.
 | Topic | Current status |
 |---|---|
 | Hermes version | `plugin.yaml` declares `requires_hermes: ">=0.21.6"` — a CI-proven floor re-run on every change (`catalog-floor-gate`); the latest upstream Hermes release is `v0.23.1`. |
-| OS support | **Ubuntu 24.04 x86_64** is the only OS with real-binary, dedicated-OS-UID clean-room execution evidence (GitHub-hosted CI; see [OS support and verification tiers](#os-support-and-verification-tiers)). **Windows x64 and Windows arm64** have real-binary hosted-CI execution evidence (actual installer + provider registration + unauthenticated ACP `initialize` on `windows-2022`/`windows-11-arm` runners) — one tier below clean-room, still executed. **Linux aarch64 and macOS arm64** are registry-pinned with publisher digests and now have native hosted CI lifecycle lanes implemented (issue #9), but remain **NOT RUN** — pinned-only, not executed support, until a green native run is cited below. |
+| OS support | **Ubuntu 24.04 x86_64** is the only OS with real-binary, dedicated-OS-UID clean-room execution evidence (GitHub-hosted CI; see [OS support and verification tiers](#os-support-and-verification-tiers)). **Windows x64 and Windows arm64** have real-binary hosted-CI execution evidence (actual installer + provider registration + unauthenticated ACP `initialize` on `windows-2022`/`windows-11-arm` runners) — one tier below clean-room, still executed. **Linux aarch64 and macOS arm64** are registry-pinned with publisher digests and have executed native hosted-CI lifecycle evidence (Actions run [43198795406](https://github.com/rhgo1749/hermes-antigravity-acp/actions/runs/43198795406) at `8c054be1eaa4230a87b4e5f9f23a56e3fe74ae09`: native-arch assert, publisher-pinned download + SHA-256, install → status → verify, unauthenticated ACP `initialize`, uninstall → confirmed absence) — promoted from pinned-only, still below the clean-room tier, with no provider-registration, authentication, or model-inference coverage. |
 | Public plugin catalog | **Not registered yet.** `hermes plugins install antigravity-acp-provider` does not resolve today (upstream `plugin-catalog/` contains no entry for this provider as of 2026-11-12). The catalog submission PR ([NousResearch/hermes-agent#153182](https://github.com/NousResearch/hermes-agent/pull/153182)) is open and pending upstream review; registration is not approved or merged as of this writing. The only currently reproducible install path is the standalone installer below. |
 | Official server binary | Pinned `1.4.4`, fetched **only during an explicit install command** over HTTPS from `dl.google.com`; the publisher-pinned SHA-256 digest is verified **before** the archive is opened, extracted, or installed. No self-update; no redistribution. |
 | Authentication & first model call | Credential-free CI does not validate authentication or real inference. A supervised one-prompt canary produced a real response on an earlier client version; the current release has not been verified end-to-end in that same way. This observation does not establish terms compliance for other uses. |
@@ -487,19 +487,29 @@ verification tier:
   an extended-ARM lane (main pushes, dispatch, packaging-surface PRs) —
   its executed status for a given change is whatever the latest cited
   green run on the relevant scope shows, never an assumption.
-- **Registry-pinned but NOT RUN tier — macOS arm64, Linux aarch64.** These
-  targets are registry-pinned with
-  publisher digests and are covered by a credential-free CI install smoke
-  (fake-ACP archive + lifecycle mechanics in
-  `tests/test_clean_env_e2e_smoke.py`), but the real Google binary on
-  those operating systems has **not** been executed by this repository's
-  CI. Treat their support claims as spec-pinned, not executed. Native
-  hosted lifecycle lanes (`macos-15` and `ubuntu-24.04-arm`: download under
-  the publisher pin → install → status → verify → unauthenticated
-  `initialize` → uninstall → confirmed absence) are implemented as of
-  issue #9; neither platform is promoted out of this tier until a green
-  native run is cited here, and the macOS lanes do not cover Hermes
-  provider registration on macOS.
+- **Native-lifecycle hosted-CI executed tier (not dedicated-UID
+  clean-room, no provider registration) — macOS arm64, Linux aarch64.**
+  These targets are registry-pinned with publisher digests, and their
+  real Google binary lifecycle has been executed on native hosted
+  runners (`macos-15` and `ubuntu-24.04-arm:`): native-architecture
+  assert → publisher-pinned download with SHA-256 verification → install
+  → status → integrity verify → unauthenticated ACP `initialize` →
+  uninstall → confirmed absence. Cited green evidence: Actions run
+  [43198795406](https://github.com/rhgo1749/hermes-antigravity-acp/actions/runs/43198795406)
+  at commit `8c054be1eaa4230a87b4e5f9f23a56e3fe74ae09` (jobs
+  `macOS arm64 install and unauthenticated ACP` and `Linux aarch64
+  install and unauthenticated ACP`, both `success`, `CI gate` green;
+  first green native executions of these lanes occurred at run
+  43184922860, `e9eb1c4`). This tier proves none of: authentication
+  success, real model inference, Hermes provider registration on macOS
+  (the lanes never register a provider), or dedicated-UID clean-room
+  isolation.
+- **Registry-pinned but NOT RUN tier — currently empty.** macOS arm64
+  and Linux aarch64 were promoted out of this tier only by the cited
+  green native runs above; promotion is per-platform, executed, and
+  never retroactive. Any registry-pinned target without a cited green
+  native lifecycle run belongs here, and its support claims must be
+  treated as spec-pinned, not executed.
 
 ### CI tier structure (issue #9)
 

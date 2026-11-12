@@ -78,9 +78,15 @@ real-binary hosted-CI execution evidence (installer + provider registration
 the arm64 lane is extended-ARM scope (main pushes, dispatch, packaging
 PRs). macOS arm64 and Linux aarch64 are registry-pinned with first-party
 digests, covered by the credential-free CI install mechanics smoke, and
-have native lifecycle CI lanes implemented (issue #9); on both the real
-Google binary lifecycle remains **NOT RUN in CI and not live-verified**
-until a green native run is cited in the README.
+have executed native lifecycle evidence: Actions run
+[43198795406](https://github.com/rhgo1749/hermes-antigravity-acp/actions/runs/43198795406)
+at commit `8c054be1eaa4230a87b4e5f9f23a56e3fe74ae09` executed, green with
+`CI gate`, on `macos-15` and `ubuntu-24.04-arm:` the native-arch assert →
+publisher-pinned download + SHA-256 → install → status → verify →
+unauthenticated `initialize` → uninstall → confirmed absence lifecycle.
+Executed scope only: no authentication success, no real model inference,
+no Hermes provider registration on macOS, no dedicated-UID clean-room
+isolation.
 
 ## Standing boundaries
 
