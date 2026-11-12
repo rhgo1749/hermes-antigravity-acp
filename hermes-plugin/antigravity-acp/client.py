@@ -58,6 +58,7 @@ from .hermes_compat import (
     windows_hide_flags,
 )
 from .native_limit_state import native_limit_registry
+from .process_teardown import terminate_process_tree
 from .bridge import (
     MalformedToolCallError,
     advertised_tool_names,
@@ -3802,12 +3803,10 @@ _warm_pool_atexit_armed = False
 
 
 def _terminate_parked(proc: subprocess.Popen[str]) -> None:
-    try:
-        proc.terminate()
-        proc.wait(timeout=2)
-    except Exception:
-        with contextlib.suppress(Exception):
-            proc.kill()
+    # A parked process has no active writer, so the cooperative stdin-EOF
+    # shutdown is safe here; the tree escalation guarantees a parked mux never
+    # leaves its bound official-server child behind (issue #23 P1 review).
+    terminate_process_tree(proc, graceful_stdin=True)
 
 
 def _shutdown_warm_pool() -> None:
@@ -3915,13 +3914,14 @@ class AntigravityACPClient:
         self._cancel_epoch = 0
 
     @staticmethod
-    def _terminate_process(proc: subprocess.Popen[str]) -> None:
-        try:
-            proc.terminate()
-            proc.wait(timeout=2)
-        except Exception:
-            with contextlib.suppress(Exception):
-                proc.kill()
+    def _terminate_process(
+        proc: subprocess.Popen[str], *, graceful_stdin: bool = False
+    ) -> None:
+        # Platform-guaranteed tree teardown (process-group kill on POSIX,
+        # taskkill /T /F on Windows): a mux force-killed here can never leave
+        # its official-server child running (issue #23 P1 review).  Closing
+        # stdin first is only safe for the thread that owns the request pipe.
+        terminate_process_tree(proc, graceful_stdin=graceful_stdin)
 
     def _release_process(self, proc: subprocess.Popen[str]) -> None:
         with self._active_process_lock:
@@ -3929,8 +3929,9 @@ class AntigravityACPClient:
         # A poisoned or failed child is terminated here; a healthy session's
         # child is parked for reuse by ``_session``'s warm-pool release path
         # instead. The facade itself must remain open so Hermes can reuse its
-        # durable ACP continuation state.
-        self._terminate_process(proc)
+        # durable ACP continuation state.  Owner-thread path: stdin close is
+        # the cooperative first step.
+        self._terminate_process(proc, graceful_stdin=True)
 
     def _warm_acquire(
         self, affinity_key: str, resume_session_id: str
@@ -4010,7 +4011,8 @@ class AntigravityACPClient:
             procs, self._active_processes = tuple(self._active_processes), set()
         self.is_closed = True
         for proc in procs:
-            self._terminate_process(proc)
+            # Owner/lifecycle path: cooperative stdin EOF first.
+            self._terminate_process(proc, graceful_stdin=True)
 
     def cancel(self) -> None:
         """Stop this instance's in-flight ACP session(s) (issue #23).
@@ -4594,6 +4596,9 @@ class AntigravityACPClient:
                 cwd=self._acp_cwd,
                 env=child_env,
                 creationflags=_windows_hide_flags(),
+                # Own process group so teardown can signal the whole tree
+                # (mux + official-server child) — see process_teardown.
+                start_new_session=(os.name != "nt"),
             )
         except FileNotFoundError as exc:
             raise RuntimeError(

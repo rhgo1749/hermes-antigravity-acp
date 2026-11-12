@@ -21,6 +21,7 @@ tests/agent/test_provider_client_cancel.py).
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import json
 import os
@@ -454,3 +455,212 @@ def test_mux_stdin_close_tears_down_inflight_child(tmp_path):
     assert _wait_for(lambda: not _alive(pid), timeout=8)
     events = [e["event"] for e in _events(child_log)]
     assert "sigterm" in events and "prompt_answered" not in events
+
+
+# ---------------------------------------------------------------------------
+# P1 rework (independent review of PR #31): the plugin -> mux -> official-server
+# child teardown boundary.  The plugin's terminate grace (2 s) was shorter than
+# the mux's own bounded child teardown (worst case ~5.25 s), so a child that
+# ignores the mux's stdin-EOF cooperative path could be orphaned when the
+# plugin force-killed the mux.  The fix is a platform-guaranteed tree teardown:
+# POSIX process-group kill (managed processes are spawned with
+# start_new_session=True) and Windows ``taskkill /T /F``.  These tests pin the
+# whole plugin -> mux -> child path, not just the mux in isolation.
+# ---------------------------------------------------------------------------
+
+
+def _client_mux_setup(agy, tmp_path: Path, tag: str, prompt_delay: float):
+    """Fake official server on PATH + mux control home under tmp.
+
+    The client's child-env filter strips every ACP_MUX_* key, so a
+    client-spawned mux must resolve its layout through the allow-listed
+    PATH / HERMES_REAL_HOME variables — exactly like a production install.
+    """
+    tmpbin = tmp_path / f"{tag}_bin"
+    tmpbin.mkdir()
+    control = tmp_path / f"{tag}_control"
+    (control / ".hermes").mkdir(parents=True)
+    shim = tmpbin / "antigravity-acp-official"
+    shim.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        f"sys.argv = ['par', {str(tmp_path / f'{tag}_child.jsonl')!r},"
+        f" {str(tmp_path / f'{tag}_child.pid')!r}, '{prompt_delay}', '0']\n"
+        + FAKE_SERVER,
+        encoding="utf-8")
+    shim.chmod(0o755)
+    saved = {key: os.environ.get(key) for key in ("PATH", "HERMES_REAL_HOME")}
+    os.environ["PATH"] = f"{tmpbin}{os.pathsep}{os.environ['PATH']}"
+    os.environ["HERMES_REAL_HOME"] = str(control)
+
+    def restore():
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    client = agy.module.antigravity_acp.create_client(
+        command="/bin/sh",
+        args=[str(REPO / "scripts" / "antigravity-acp-mux")],
+        acp_cwd=str(agy.dir),
+        rate_limit_retries=0)
+    return (
+        client,
+        tmp_path / f"{tag}_child.jsonl",
+        tmp_path / f"{tag}_child.pid",
+        restore,
+    )
+
+
+@posix_only
+def test_client_cancel_reaps_mux_child_that_ignores_stdin_eof(agy, tmp_path):
+    """A stop must reap the whole plugin -> mux -> child tree (P1).
+
+    The child sleeps 30 s inside the prompt, so it ignores the mux's
+    stdin-EOF cooperative path; only the plugin's teardown boundary can save
+    it.  The old boundary (terminate + wait 2 s + kill) killed the mux before
+    its own terminate escalation (~2.25 s) and orphaned the child.
+    """
+    client, child_log, child_pid, restore = _client_mux_setup(
+        agy, tmp_path, "canceltree", 30)
+    try:
+        worker = _Worker(client)
+        worker.start()
+        assert _wait_prompt_received(child_log)
+        mux_pid = next(iter(client._active_processes)).pid
+        pid = int(child_pid.read_text())
+        t0 = time.monotonic()
+        client.cancel()
+        worker.join(timeout=8)
+        assert not worker.is_alive()
+        assert worker.error is not None and worker.result is None
+        assert _wait_for(lambda: not _alive(mux_pid), timeout=8), "mux must exit"
+        assert _wait_for(lambda: not _alive(pid), timeout=8), (
+            "the official-server child must not outlive the cancelled request"
+        )
+        assert time.monotonic() - t0 < 10
+        events = [e["event"] for e in _events(child_log)]
+        assert "prompt_answered" not in events, f"abandoned prompt completed: {events}"
+    finally:
+        restore()
+
+
+@posix_only
+def test_warm_pool_shutdown_reaps_bound_mux_child(agy, tmp_path):
+    """A parked mux holds a live bound child; pool shutdown must reap both."""
+    client, child_log, child_pid, restore = _client_mux_setup(
+        agy, tmp_path, "parktree", 0)
+    try:
+        worker = _Worker(client)
+        worker.start()
+        worker.join(timeout=30)
+        assert worker.error is None, worker.error
+        assert _wait_for(child_pid.exists, timeout=10)
+        entries = [
+            entry
+            for pool in agy.client_module._warm_pool.values()
+            for entry in pool
+        ]
+        assert entries, "the mux must have been parked for warm reuse"
+        mux_pid = entries[0]["proc"].pid
+        pid = int(child_pid.read_text())
+        agy.client_module._shutdown_warm_pool()
+        assert _wait_for(lambda: not _alive(mux_pid), timeout=8), "parked mux must exit"
+        assert _wait_for(lambda: not _alive(pid), timeout=8), (
+            "the bound child must not outlive its parked mux"
+        )
+    finally:
+        restore()
+
+
+_TREE_PARENT = (
+    "import os, signal, subprocess, sys, time\n"
+    "signal.signal(signal.SIGTERM, lambda *a: None)\n"
+    "child = subprocess.Popen([sys.executable, sys.argv[2], sys.argv[3]])\n"
+    "with open(sys.argv[1], 'w', encoding='utf-8') as fh:\n"
+    "    fh.write(str(os.getpid()))\n"
+    "child.wait()\n"
+)
+_TREE_GRANDCHILD = (
+    "import os, signal, sys, time\n"
+    "signal.signal(signal.SIGTERM, lambda *a: None)\n"
+    "with open(sys.argv[1], 'w', encoding='utf-8') as fh:\n"
+    "    fh.write(str(os.getpid()))\n"
+    "time.sleep(120)\n"
+)
+
+
+def _load_process_teardown():
+    spec = importlib.util.spec_from_file_location(
+        "process_teardown_issue23", PLUGIN_DIR / "process_teardown.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _pid_alive(pid: int) -> bool:
+    if os.name == "nt":
+        # os.kill(pid, 0) TERMINATES the target on Windows — never use it there.
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED
+        if not handle:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return False
+            return code.value == 259  # STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    return _alive(pid)
+
+
+def test_terminate_process_tree_reaps_sigterm_ignoring_grandchild(tmp_path):
+    """Forced teardown must reach the whole tree on every platform (P1).
+
+    POSIX: process-group kill after the SIGTERM grace.  Windows:
+    ``taskkill /T /F`` — ``TerminateProcess`` (what ``Popen.terminate()``
+    calls) reaches only the direct child, and the mux's SIGTERM handler never
+    runs there.  The hosted windows-x64 job runs the same check standalone via
+    scripts/verify_process_tree_teardown.py.
+    """
+    teardown = _load_process_teardown()
+    parent_pid = tmp_path / "parent.pid"
+    grand_pid = tmp_path / "grand.pid"
+    parent_script = tmp_path / "parent.py"
+    grand_script = tmp_path / "grand.py"
+    parent_script.write_text(_TREE_PARENT, encoding="utf-8")
+    grand_script.write_text(_TREE_GRANDCHILD, encoding="utf-8")
+    proc = subprocess.Popen(
+        [sys.executable, str(parent_script), str(parent_pid),
+         str(grand_script), str(grand_pid)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True,
+        # Same contract as the plugin's _spawn: managed processes lead their
+        # own session so group teardown cannot reach the caller's processes.
+        start_new_session=(os.name != "nt"))
+    gpid = None
+    try:
+        assert _wait_for(lambda: parent_pid.exists() and grand_pid.exists(), timeout=15)
+        gpid = int(grand_pid.read_text())
+        assert _pid_alive(proc.pid) and _pid_alive(gpid)
+        teardown.terminate_process_tree(proc)
+        assert _wait_for(lambda: not _pid_alive(proc.pid), timeout=10), (
+            "the direct child must die"
+        )
+        assert _wait_for(lambda: not _pid_alive(gpid), timeout=10), (
+            "the grandchild must not survive a forced tree teardown"
+        )
+    finally:
+        teardown.terminate_process_tree(proc)
+        if gpid is not None and _pid_alive(gpid):
+            if os.name == "nt":
+                subprocess.run(
+                    ["taskkill", "/T", "/F", "/PID", str(gpid)],
+                    capture_output=True)
+            else:
+                with contextlib.suppress(OSError):
+                    os.kill(gpid, signal.SIGKILL)

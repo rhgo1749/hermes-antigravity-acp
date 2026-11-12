@@ -278,6 +278,18 @@ jobs:
           }
           & $python scripts/install_acp.py verify
           if ($LASTEXITCODE -ne 0) { throw 'Unauthenticated ACP initialization failed' }
+      - name: Verify process-tree teardown reaps the ACP child tree (x64)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $python = Get-ChildItem "$env:HERMES_HOME\tools\python-*\python.exe" | Select-Object -Last 1 -ExpandProperty FullName
+          if (-not $python) { throw 'Hermes managed Python is missing' }
+          # Issue #23 P1: TerminateProcess reaches only the direct child; the
+          # forced teardown must walk the whole mux -> official-server tree.
+          # This is the x64 process-tree verification and is not substituted
+          # by the ARM lane.
+          & $python scripts/verify_process_tree_teardown.py
+          if ($LASTEXITCODE -ne 0) { throw 'Process-tree teardown verification failed' }
       - name: Verify the login helper execution path without authenticating
         shell: pwsh
         run: |
