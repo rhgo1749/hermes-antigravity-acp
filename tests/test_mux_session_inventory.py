@@ -90,7 +90,7 @@ def test_inventory_counts_protection_linkage_and_candidates(lanes):
     assert report["schema"] == "acp-mux-session-inventory-v1"
     assert "process lease" in report["reclaim_certainty"]
 
-    lane_a = next(l for l in report["lanes"] if l["bundles"] == 3)
+    lane_a = next(row for row in report["lanes"] if row["bundles"] == 3)
     assert lane_a["checkpoint_protected"] == 1
     assert lane_a["owner_linked"] == 1
     assert lane_a["unowned_unprotected"] == 1  # SID_OLD only
@@ -102,7 +102,7 @@ def test_inventory_counts_protection_linkage_and_candidates(lanes):
     assert lane_a["gc_candidate_bytes"] > 0
     assert lane_a["gc_candidate_bytes"] < lane_a["bytes"]
 
-    lane_b = next(l for l in report["lanes"] if l["lane"] != lane_a["lane"])
+    lane_b = next(row for row in report["lanes"] if row["lane"] != lane_a["lane"])
     assert lane_b["status"] == "ok" and lane_b["bundles"] == 0
     assert report["totals"]["bundles"] == 3
     assert report["totals"]["gc_candidate_expired"] == 1
