@@ -120,3 +120,66 @@ def test_no_secret_environment_reads_outside_declared_surface() -> None:
             ):
                 offenders.add(f"{source.name}:{literal}")
     assert not offenders, f"undeclared environment reads (declare or remove): {sorted(offenders)}"
+
+
+# --- hermes_compat.py core-import inventory (issue #12) ----------------------
+# docs/hermes-compatibility.md (module dependency register + Public API
+# promotion record, 2026-11-12) is the register; this test is its enforcer in
+# the credential-free lane. The PRIVATE set is the documented fail-closed
+# allowlist of imports with NO published plugin-API route as of the 2026-11-12
+# audit (upstream main 67664e236d); adding an entry means a new private
+# dependency, a register row, and a fail-closed contract — all in one change.
+# Removing an entry (upstream promotion, or a migration) must land with the
+# register update too: this inventory is exact, not a ceiling.
+
+_HERMES_TOP_LEVEL = frozenset({
+    "agent", "gateway", "hermes_cli", "hermes_constants", "plugins",
+    "providers", "tools", "utils",
+})
+
+# module.name pairs hermes_compat.py imports from Hermes core that the
+# official plugin-API catalog (hermes_cli/data/plugin_api.json) lists, with
+# the release the listing first shipped in.
+PUBLIC_CORE_IMPORTS = frozenset({
+    "hermes_constants.get_hermes_home",            # module-level entry, all refs
+    "hermes_constants.apply_subprocess_home_env",  # module-level entry, all refs
+    "gateway.session_context.get_session_env",     # per-symbol entry, all refs
+    "agent.runtime_cwd.resolve_agent_cwd",         # per-symbol entry, all refs
+    "agent.redact.redact_sensitive_text",          # catalog since v0.23.1 (upstream 79109635df)
+    "agent.file_safety.get_read_block_error",      # catalog on main (upstream 9788899694)
+})
+
+# Deliberate private dependencies kept for their fail-closed security
+# contracts; see the register rows for the consequence when one is missing.
+PRIVATE_CORE_IMPORTS = frozenset({
+    "tools.environments.local.hermes_subprocess_env",
+    "agent.delegation_context.is_delegated_child_context",
+    "tools.skill_provenance.get_current_write_origin",
+    "agent.file_safety.get_nt_namespace_error",
+})
+
+
+def _core_import_targets(path: Path) -> set[str]:
+    """Every ``module.name`` (or bare ``module``) Hermes import the AST sees."""
+    targets: set[str] = set()
+    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+        if isinstance(node, ast.Import):
+            targets |= {
+                alias.name for alias in node.names
+                if alias.name.split(".")[0] in _HERMES_TOP_LEVEL
+            }
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            if node.module.split(".")[0] in _HERMES_TOP_LEVEL:
+                targets |= {f"{node.module}.{alias.name}" for alias in node.names}
+    return targets
+
+
+def test_hermes_compat_core_import_surface_is_the_documented_inventory() -> None:
+    found = _core_import_targets(PLUGIN_DIR / "hermes_compat.py")
+    documented = PUBLIC_CORE_IMPORTS | PRIVATE_CORE_IMPORTS
+    assert found == documented, (
+        "hermes_compat.py core imports drifted from the "
+        "docs/hermes-compatibility.md register; "
+        f"unregistered: {sorted(found - documented)}, "
+        f"no longer imported: {sorted(documented - found)}"
+    )
