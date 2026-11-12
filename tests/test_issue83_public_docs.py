@@ -1186,10 +1186,14 @@ def test_readme_scopes_ci_no_real_binary_wording_and_names_clean_room() -> None:
         "no authentication, and no real-binary execution" in readme
     )
     # The dedicated-UID hosted clean-room job's real-binary execution is
-    # stated as the exclusive CI exception, credential-free and prompt-free.
+    # stated as the CI exception alongside the platform install lanes,
+    # credential-free and prompt-free (issue #9 moved this off the
+    # "exclusively clean-room" wording, which contradicted the executed
+    # Windows tier paragraph in the same section).
     assert (
-        "Real-binary execution in CI belongs exclusively to the "
-        "dedicated-UID `acp-clean-room` job" in readme
+        "Real-binary execution in CI belongs to the dedicated-UID "
+        "`acp-clean-room` job described above and to the platform install "
+        "lanes" in readme
     )
 
 

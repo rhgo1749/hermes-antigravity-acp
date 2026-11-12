@@ -1,15 +1,59 @@
 name: Credential-free ACP checks
 
+# Issue #9 tier contract (see tests/test_ci_tier_contract.py):
+#   Fast PR (every event):      fake-acp, upstream-hermes-compat,
+#                               catalog-floor-gate
+#   Release / full OS:          acp-clean-room, windows-x64, macos-arm64 —
+#                               every main push, every manual dispatch, and
+#                               PRs that touch the install surface
+#   Extended ARM:               windows-arm64, linux-aarch64 — every main
+#                               push, every manual dispatch, and PRs that
+#                               touch the packaging surface only
+# The always-running `CI gate` job is the single honest verdict: a lane
+# that the detected scope required and then failed, skipped, or never
+# reported fails the gate. Required status checks should be set to
+# `CI gate` (plus optionally the three fast lanes); never to a
+# conditional lane name, whose skip must never read as green.
 on:
   pull_request:
     branches: [main]
   push:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: "Why this full-matrix run was dispatched (recorded in the change-scope summary)"
+        required: false
+        default: "manual full-OS verification"
 
 permissions:
   contents: read
 
 jobs:
+  change-scope:
+    name: Change scope
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      os_lanes: ${{ steps.scope.outputs.os_lanes }}
+      extended_arm: ${{ steps.scope.outputs.extended_arm }}
+      reason: ${{ steps.scope.outputs.reason }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Classify changed paths (unknown paths or detection failure fall back to the strongest scope)
+        id: scope
+        env:
+          CI_EVENT: ${{ github.event_name }}
+          CI_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          CI_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          CI_BEFORE_SHA: ${{ github.event.before }}
+          CI_AFTER_SHA: ${{ github.sha }}
+          CI_DISPATCH_REASON: ${{ github.event.inputs.reason }}
+        run: python3 scripts/ci_change_scope.py --output "$GITHUB_OUTPUT" --summary "$GITHUB_STEP_SUMMARY"
+
   fake-acp:
     name: Fake ACP regressions and static checks
     runs-on: ubuntu-latest
@@ -58,8 +102,14 @@ jobs:
     # No Docker-in-Docker, no privileged containers, no secrets.*, no Google
     # credentials or login, no live inference, no catalog submission (that
     # is separate). Prior private-container attempts stay NOT EXECUTED.
+    # Tier (issue #9): release/full-OS lane. Runs on every main push, every
+    # manual full-matrix dispatch, and PRs that touch the install surface;
+    # the CI gate fails closed if the scope required it and it did not
+    # succeed.
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    needs: change-scope
+    if: needs.change-scope.outputs.os_lanes == 'true'
     permissions:
       contents: read
     env:
@@ -179,22 +229,21 @@ jobs:
           test ! -e "$HOME/.gemini"
           echo "runner-user live state: untouched"
 
-  windows-install:
-    name: Windows install and unauthenticated ACP (${{ matrix.arch }})
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: windows-2022
-            arch: x64
-            machine: AMD64
-          - runner: windows-11-arm
-            arch: arm64
-            machine: ARM64
-    runs-on: ${{ matrix.runner }}
+  windows-x64:
+    name: Windows install and unauthenticated ACP (x64)
+    # Tier (issue #9): release/full-OS lane (real installer + provider
+    # registration + unauthenticated initialize on a hosted x64 runner).
+    # Runs on every main push, every manual full-matrix dispatch, and PRs
+    # that touch the install surface; the CI gate fails closed if the scope
+    # required it and it did not succeed.
+    runs-on: windows-2022
     timeout-minutes: 60
+    needs: change-scope
+    if: needs.change-scope.outputs.os_lanes == 'true'
     permissions:
       contents: read
+    env:
+      EXPECTED_MACHINE: AMD64
     steps:
       - uses: actions/checkout@v4
         with:
@@ -214,8 +263,6 @@ jobs:
         run: call install-windows.cmd < NUL
       - name: Verify architecture, provider registration and ACP initialize
         shell: pwsh
-        env:
-          EXPECTED_MACHINE: ${{ matrix.machine }}
         run: |
           $ErrorActionPreference = 'Stop'
           $python = Get-ChildItem "$env:HERMES_HOME\tools\python-*\python.exe" | Select-Object -Last 1 -ExpandProperty FullName
@@ -281,6 +328,223 @@ jobs:
           '@
           $check | & $python -
           if ($LASTEXITCODE -ne 0) { throw 'Login helper initialization failed' }
+
+  windows-arm64:
+    name: Windows install and unauthenticated ACP (arm64)
+    # Tier (issue #9): extended ARM lane. Removed from the ordinary PR
+    # critical path (it dominated every run at ~18 minutes); it now runs on
+    # every main push, every manual full-matrix dispatch, and PRs that
+    # touch the packaging surface. The CI gate fails closed if the scope
+    # required it and it did not succeed.
+    runs-on: windows-11-arm
+    timeout-minutes: 60
+    needs: change-scope
+    if: needs.change-scope.outputs.extended_arm == 'true'
+    permissions:
+      contents: read
+    env:
+      EXPECTED_MACHINE: ARM64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install official Hermes without interactive setup
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $hermesHome = Join-Path $env:RUNNER_TEMP 'acp-hermes'
+          "HERMES_HOME=$hermesHome" | Add-Content -Path $env:GITHUB_ENV
+          $installer = Join-Path $env:RUNNER_TEMP 'hermes-install.ps1'
+          Invoke-WebRequest -Uri 'https://hermes-agent.nousresearch.com/install.ps1' -OutFile $installer
+          & $installer -HermesHome $hermesHome -NonInteractive -SkipBrowser -SkipComputerUse
+          if ($LASTEXITCODE -ne 0) { throw "Hermes installer failed: $LASTEXITCODE" }
+      - name: Run the actual Windows installer
+        shell: cmd
+        run: call install-windows.cmd < NUL
+      - name: Verify architecture, provider registration and ACP initialize
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $python = Get-ChildItem "$env:HERMES_HOME\tools\python-*\python.exe" | Select-Object -Last 1 -ExpandProperty FullName
+          if (-not $python) { throw 'Hermes managed Python is missing' }
+          & $python -c 'import os, platform; assert platform.machine().upper() == os.environ["EXPECTED_MACHINE"], "unexpected native machine"'
+          if ($LASTEXITCODE -ne 0) { throw 'Native architecture check failed' }
+          $hermes = Get-ChildItem "$env:HERMES_HOME\bin\hermes.*" -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^hermes\.(exe|cmd)$' } | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $hermes) { throw 'Hermes launcher is missing' }
+          $plugins = & $hermes plugins list --plain
+          if ($LASTEXITCODE -ne 0) { throw 'Hermes plugin listing failed' }
+          if (($plugins -join "`n") -notmatch '(?m)^enabled\s+user\s+\S+\s+antigravity-acp-provider\s*$') {
+            throw 'Installed provider is not enabled'
+          }
+          & $python scripts/install_acp.py verify
+          if ($LASTEXITCODE -ne 0) { throw 'Unauthenticated ACP initialization failed' }
+      - name: Verify the login helper execution path without authenticating
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $python = Get-ChildItem "$env:HERMES_HOME\tools\python-*\python.exe" | Select-Object -Last 1 -ExpandProperty FullName
+          $check = @'
+          import json, os, runpy, subprocess, sys
+          from pathlib import Path
+
+          login = Path(os.environ['HERMES_HOME']) / 'plugins/model-providers/antigravity-acp/login.py'
+          module = runpy.run_path(str(login))
+          command, _ = module['_resolve_official_command']()
+          child_env = module['_child_env']()
+          probe = Path('scripts/acp_probe.py').resolve()
+
+          def run(label, env):
+              try:
+                  result = subprocess.run(
+                      [sys.executable, str(probe), '--timeout', '60', '--', *command],
+                      env=env, capture_output=True, text=True, timeout=75,
+                  )
+              except subprocess.TimeoutExpired:
+                  print(f'{label}: FAIL hard-limit exceeded', file=sys.stderr)
+                  return None
+              if result.returncode:
+                  print(f'{label}: FAIL exit={result.returncode}', file=sys.stderr)
+                  tail = (result.stderr or '').splitlines()[-30:]
+                  for line in tail:
+                      print(f'{label}: server-stderr: {line}', file=sys.stderr)
+                  return None
+              try:
+                  summary = json.loads(result.stdout)
+              except (ValueError, TypeError):
+                  print(f'{label}: FAIL malformed probe output', file=sys.stderr)
+                  return None
+              if summary.get('protocolVersion') != 1:
+                  print(f'{label}: FAIL protocolVersion={summary.get("protocolVersion")!r}', file=sys.stderr)
+                  return None
+              print(f'{label}: OK')
+              return summary
+
+          full_env = dict(os.environ)
+          if run('direct-exe-full-env', full_env) is None:
+              raise SystemExit('Direct official executable failed even with the full environment')
+          if run('direct-exe-login-env', child_env) is None:
+              raise SystemExit('Login-path restricted environment failed; see server stderr above')
+          print('Verified official login executable under full and restricted environments; no login attempted')
+          '@
+          $check | & $python -
+          if ($LASTEXITCODE -ne 0) { throw 'Login helper initialization failed' }
+
+  macos-arm64:
+    name: macOS arm64 install and unauthenticated ACP
+    # Tier (issue #9): release/full-OS lane candidate. First native
+    # Apple Silicon execution of the official binary by this repository's
+    # CI: download under the registry publisher pin -> install -> status ->
+    # integrity verify -> unauthenticated ACP initialize -> uninstall ->
+    # confirmed absence. Executed evidence is recorded per run; the README
+    # tier is only promoted after a green run is cited there. Hermes
+    # provider registration on macOS is NOT covered here (no Hermes-on-
+    # macOS lane yet); this lane never authenticates.
+    runs-on: macos-15
+    timeout-minutes: 20
+    needs: change-scope
+    if: needs.change-scope.outputs.os_lanes == 'true'
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+      - name: Assert native Apple Silicon execution
+        run: python -c 'import platform, sys; assert sys.platform == "darwin" and platform.machine() == "arm64", (sys.platform, platform.machine())'
+      - name: Record registry pin provenance
+        run: |
+          python - <<'PY'
+          import sys
+          sys.path.insert(0, ".")
+          from antigravity_acp.registry import VERSION, resolve_distribution
+          dist = resolve_distribution("darwin", "arm64")
+          print(f"ACP version: {VERSION}")
+          print(f"darwin/arm64 publisher digest: {dist.sha256}")
+          PY
+      - name: Install official ACP binary into isolated prefixes
+        run: python scripts/install_official.py --prefix "$RUNNER_TEMP/acp-native" --bin-dir "$RUNNER_TEMP/acp-bin"
+      - name: Status and integrity verification
+        run: |
+          python scripts/install_official.py --prefix "$RUNNER_TEMP/acp-native" --bin-dir "$RUNNER_TEMP/acp-bin" --status
+          python scripts/install_official.py --prefix "$RUNNER_TEMP/acp-native" --bin-dir "$RUNNER_TEMP/acp-bin" --verify
+      - name: Unauthenticated ACP initialize handshake
+        run: python scripts/acp_probe.py --timeout 60 -- "$RUNNER_TEMP/acp-bin/antigravity-acp-official"
+      - name: Uninstall and confirm absence
+        run: |
+          python scripts/install_official.py --prefix "$RUNNER_TEMP/acp-native" --bin-dir "$RUNNER_TEMP/acp-bin" --uninstall
+          if python scripts/install_official.py --prefix "$RUNNER_TEMP/acp-native" --bin-dir "$RUNNER_TEMP/acp-bin" --status; then
+            echo "installed state survived uninstall" >&2
+            exit 1
+          fi
+      - name: Record the executed-evidence boundary
+        run: |
+          {
+            echo "### macOS arm64 native lifecycle"
+            echo "- runner: macOS $(sw_vers -productVersion) / $(uname -m)"
+            echo "- tested HEAD: \`${GITHUB_SHA}\`"
+            echo "- executed: download + publisher-digest pin, install, status, verify, unauthenticated initialize, uninstall, confirmed absence"
+            echo "- NOT executed: authentication, model inference, Hermes provider registration on macOS"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  linux-aarch64:
+    name: Linux aarch64 install and unauthenticated ACP
+    # Tier (issue #9): extended ARM lane candidate. First native aarch64
+    # execution of the official binary by this repository's CI (GitHub
+    # arm64 hosted runners are GA for public repositories). Same lifecycle
+    # as the macOS lane; NOT a dedicated-UID clean room, so it cannot claim
+    # the clean-room tier. README promotion only after a cited green run.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    needs: change-scope
+    if: needs.change-scope.outputs.extended_arm == 'true'
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+      - name: Assert native aarch64 execution
+        run: python -c 'import platform, sys; assert sys.platform.startswith("linux") and platform.machine() == "aarch64", (sys.platform, platform.machine())'
+      - name: Record registry pin provenance
+        run: |
+          python - <<'PY'
+          import sys
+          sys.path.insert(0, ".")
+          from antigravity_acp.registry import VERSION, resolve_distribution
+          dist = resolve_distribution("linux", "aarch64")
+          print(f"ACP version: {VERSION}")
+          print(f"linux/aarch64 publisher digest: {dist.sha256}")
+          PY
+      - name: Install official ACP binary into isolated prefixes
+        run: python scripts/install_official.py --prefix "$RUNNER_TEMP/acp-native" --bin-dir "$RUNNER_TEMP/acp-bin"
+      - name: Status and integrity verification
+        run: |
+          python scripts/install_official.py --prefix "$RUNNER_TEMP/acp-native" --bin-dir "$RUNNER_TEMP/acp-bin" --status
+          python scripts/install_official.py --prefix "$RUNNER_TEMP/acp-native" --bin-dir "$RUNNER_TEMP/acp-bin" --verify
+      - name: Unauthenticated ACP initialize handshake
+        run: python scripts/acp_probe.py --timeout 60 -- "$RUNNER_TEMP/acp-bin/antigravity-acp-official"
+      - name: Uninstall and confirm absence
+        run: |
+          python scripts/install_official.py --prefix "$RUNNER_TEMP/acp-native" --bin-dir "$RUNNER_TEMP/acp-bin" --uninstall
+          if python scripts/install_official.py --prefix "$RUNNER_TEMP/acp-native" --bin-dir "$RUNNER_TEMP/acp-bin" --status; then
+            echo "installed state survived uninstall" >&2
+            exit 1
+          fi
+      - name: Record the executed-evidence boundary
+        run: |
+          {
+            echo "### Linux aarch64 native lifecycle"
+            echo "- runner: $(lsb_release -ds) / $(uname -m)"
+            echo "- tested HEAD: \`${GITHUB_SHA}\`"
+            echo "- executed: download + publisher-digest pin, install, status, verify, unauthenticated initialize, uninstall, confirmed absence"
+            echo "- NOT executed: authentication, model inference, dedicated-UID clean-room isolation"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   upstream-hermes-compat:
     name: Vanilla NousResearch Hermes provider API
@@ -445,3 +709,27 @@ jobs:
           git -C upstream-hermes diff --exit-code
           git -C upstream-hermes diff --cached --exit-code
           test -z "$(git -C upstream-hermes status --porcelain --untracked-files=no)"
+
+  ci-gate:
+    name: CI gate
+    # The single honest verdict (issue #9). Always runs; fails closed when
+    # any lane the detected scope required failed, was skipped, or never
+    # reported — a skipped or missing check is never a pass. Branch
+    # protection should require this check name, never a conditional lane.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [change-scope, fake-acp, acp-clean-room, windows-x64, windows-arm64, macos-arm64, linux-aarch64, upstream-hermes-compat, catalog-floor-gate]
+    if: always()
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Fail closed on failed, skipped, or missing required lanes
+        env:
+          EXPECTED_JSON: ${{ toJSON(needs.change-scope.outputs) }}
+          RESULTS_JSON: ${{ toJSON(needs) }}
+        run: >-
+          python3 scripts/ci_gate_check.py
+          --expected-json "$EXPECTED_JSON"
+          --results-json "$RESULTS_JSON"
+          --summary "$GITHUB_STEP_SUMMARY"

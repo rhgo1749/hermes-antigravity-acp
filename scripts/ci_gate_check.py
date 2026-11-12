@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+"""Fail-closed aggregator for the issue #9 CI tiers (the ``CI gate`` job).
+
+GitHub treats a *skipped* job as satisfying a required status check, and a
+workflow-level ``paths`` filter can leave required checks pending forever.
+Neither may silently green-light a run, so this script — not the per-job
+conclusions — is the single honest verdict:
+
+* the fast lanes (fake-acp, upstream-hermes-compat, catalog-floor-gate)
+  must be ``success`` on every event, no exceptions;
+* when the change scope required the OS lanes, each OS lane must be
+  ``success`` — a skipped or missing OS lane when required is a failure;
+* same for the extended ARM lanes and ``extended_arm``;
+* a lane that ran anyway and failed is a failure even when not required;
+* any other result (cancelled, action_required, neutral, timing_out,
+  stale, missing) is a failure — only ``success`` and, for unrequired
+  lanes, ``skipped`` are acceptable;
+* if ``change-scope`` itself did not succeed, nothing is trustworthy and
+  the gate fails;
+* the ``change-scope`` OUTPUTS are validated strictly: ``os_lanes`` and
+  ``extended_arm`` must be present and be exactly the strings ``true``
+  or ``false``. A missing key, empty string, typo, null, or wrong type
+  fails the gate even when every lane is green — a malformed scope may
+  never read as "not required". ``extended_arm=true`` with
+  ``os_lanes=false`` is contradictory and also fails;
+* any job wired into ``ci-gate`` that is NOT part of this script's tier
+  policy fails the gate regardless of its result — the gate refuses to
+  certify an outcome it never audited.
+
+Input is the Actions ``needs`` context serialized with ``toJSON`` plus the
+``change-scope`` outputs; the verdict is exit code 0/1 and a summary table.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+
+FAST_LANES = ("fake-acp", "upstream-hermes-compat", "catalog-floor-gate")
+OS_LANES = ("acp-clean-room", "windows-x64", "macos-arm64")
+ARM_LANES = ("windows-arm64", "linux-aarch64")
+
+
+def _strict_scope_flags(expected: dict) -> tuple[dict[str, bool], list[str]]:
+    """Parse scope flags with zero tolerance; return (flags, problems).
+
+    Only the exact strings ``"true"``/``"false"`` are valid. Everything
+    else (missing, empty, typo, null, non-string) is a problem the caller
+    must fail the gate on — never a silent ``False``.
+    """
+    flags: dict[str, bool] = {}
+    problems: list[str] = []
+    for key in ("os_lanes", "extended_arm"):
+        if key not in expected:
+            problems.append(f"{key} is missing from change-scope outputs")
+            continue
+        value = expected[key]
+        if not isinstance(value, str):
+            problems.append(
+                f"{key} must be the exact string 'true'/'false'; "
+                f"got {type(value).__name__} {value!r}"
+            )
+            continue
+        if value not in ("true", "false"):
+            problems.append(f"{key}={value!r} is not exactly 'true' or 'false'")
+            continue
+        flags[key] = value == "true"
+    if flags.get("extended_arm") and flags.get("os_lanes") is False:
+        problems.append(
+            "contradictory scope: extended_arm=true requires os_lanes=true"
+        )
+    return flags, problems
+
+
+def evaluate(expected: dict[str, object], results: dict[str, dict]) -> tuple[bool, list[str]]:
+    """Return (ok, report_lines). Pure; unit-tested in tests/."""
+    lines: list[str] = []
+    ok = True
+
+    scope_result = (results.get("change-scope") or {}).get("result")
+    if scope_result != "success":
+        ok = False
+        lines.append(f"FAIL change-scope: result={scope_result!r} (scope detection is mandatory)")
+
+    flags, scope_problems = _strict_scope_flags(expected)
+    for problem in scope_problems:
+        ok = False
+        lines.append(f"FAIL scope: {problem}")
+    if scope_problems:
+        # Fail closed for lane reporting: assume the strongest scope so
+        # every lane that could have been required is inspected.
+        expected_os = expected_arm = True
+    else:
+        expected_os = flags["os_lanes"]
+        expected_arm = flags["extended_arm"]
+
+    # ``results`` is toJSON(needs): every job wired into ci-gate appears
+    # here. A job outside the tier policy is never certified — whatever
+    # its result — so a newly added lane cannot ride to green (or hide a
+    # failure) until the policy above is deliberately extended to cover
+    # it. The contract test keeps workflow jobs and this policy in sync.
+    known = {"change-scope", *FAST_LANES, *OS_LANES, *ARM_LANES}
+    for lane in sorted(set(results) - known):
+        ok = False
+        lines.append(
+            f"FAIL {lane}: wired into ci-gate needs but unknown to the gate "
+            f"policy; an unaudited job is never a pass"
+        )
+
+    def check(lane: str, required: bool, tier: str) -> None:
+        nonlocal ok
+        result = (results.get(lane) or {}).get("result")
+        if result == "success":
+            lines.append(f"PASS {lane} ({tier}): success")
+            return
+        if result == "skipped" and not required:
+            lines.append(f"ok   {lane} ({tier}): skipped, not required by scope")
+            return
+        ok = False
+        verdict = "required by scope but" if required else "not required by scope but"
+        lines.append(f"FAIL {lane} ({tier}): result={result!r} ({verdict} not success)")
+
+    for lane in FAST_LANES:
+        check(lane, True, "fast")
+    for lane in OS_LANES:
+        check(lane, expected_os, "os")
+    for lane in ARM_LANES:
+        check(lane, expected_arm, "arm")
+
+    header = (
+        f"scope: os_lanes={expected_os} extended_arm={expected_arm} "
+        f"reason={expected.get('reason', 'unknown')}"
+    )
+    return ok, [header, *lines, "verdict: " + ("PASS" if ok else "FAIL")]
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Fail-closed CI tier aggregator (issue #9)")
+    parser.add_argument("--expected-json", required=True, help="toJSON(needs.change-scope.outputs)")
+    parser.add_argument("--results-json", required=True, help="toJSON(needs)")
+    parser.add_argument("--summary", default=None, help="optional step-summary file to append")
+    args = parser.parse_args(argv)
+
+    try:
+        expected = json.loads(args.expected_json)
+        results = json.loads(args.results_json)
+        if not isinstance(expected, dict) or not isinstance(results, dict):
+            raise ValueError("both inputs must be JSON objects")
+    except (ValueError, TypeError) as exc:
+        print(f"CI gate input malformed; failing closed: {exc}", file=sys.stderr)
+        return 1
+
+    ok, lines = evaluate(expected, results)
+    report = "\n".join(lines)
+    print(report)
+    if args.summary:
+        with open(args.summary, "a", encoding="utf-8") as handle:
+            handle.write("### CI gate verdict\n\n```text\n" + report + "\n```\n")
+    if not ok:
+        print(
+            "One or more lanes failed, were skipped while required, or never "
+            "reported. A skipped or missing check is never a pass.",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
