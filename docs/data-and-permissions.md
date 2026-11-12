@@ -108,10 +108,13 @@ every entry.
 - Usage reporting is a **response-level attribute**, truthful by contract:
   `antigravity_usage_telemetry` with `status="unavailable"` and null
   request-usage buckets; that separate attribute does not expose billing.
-  `completion.usage` prefers a valid per-turn breakdown in the ACP prompt
-  result. Otherwise, since v0.7.4, it carries a server-reported consumption
-  proxy when `usage_update` frames were observed (may under-report; not
-  billing), and is `None` when neither source is available.
+  `completion.usage` is populated **only** when the server itself supplies a
+  valid per-turn usage breakdown in the ACP prompt result — the pinned
+  official server currently never does, so completions carry
+  `completion.usage=None` and Hermes applies its designed estimation
+  fallback. The pre-v0.7.9 consumption-proxy split synthesized from
+  `usage_update` frames was removed as fabricated (issue #6) and is never
+  produced again.
   `usage_update` counters are kept
   separately as non-billing `context_occupancy`
   (`docs/acp-usage-telemetry.md`). `/quota` is unavailable/unsupported — no
@@ -125,18 +128,24 @@ every entry.
 
 ## 5. Shell and tool execution boundary
 
-- **Two execution paths.** Hermes tool calls use Hermes policy and approval.
-  The ACP server can also execute native coding tools directly; the provider
-  auto-approves vetted requests, and native commands bypass Hermes terminal
-  approval. The workspace path check is not a sandbox.
+- **One approval-gated execution path for mutations.** Hermes tool calls use
+  Hermes policy and approval. The ACP server's native coding tools are never
+  auto-approved: native `run_command` is disabled at session launch
+  (`agy.disabledTools`) and every native file-mutation or command permission
+  frame is answered with the server's own reject option, so the model performs
+  shell and file work through Hermes' approval-gated terminal and file tools
+  via the Hermes `<tool_call>` bridge. The harness `fs/read_text_file` and
+  `fs/write_text_file` callbacks stay bridged through Hermes' read-block,
+  redaction, and write-safety checks.
   Tool-call replay and duplicate suppression are in `docs/provider-runtime.md`.
 - The provider-mode **web research bridge** only relays function schemas
   Hermes explicitly supplies and returns calls to Hermes' policy/execution
   path; it never executes searches itself (`docs/web-research-bridge.md`).
-- Native coding is enabled by default. `HERMES_ANTIGRAVITY_ACP_WORKSPACE`
-  optionally pins the session workspace; the former
-  `HERMES_ANTIGRAVITY_ACP_EXECUTION_MODE` setting no longer changes behavior.
-  Native Telegram video remains opt-in with its own allowlist and TOCTOU limits.
+- The former trusted-coding auto-approval was removed after the Hermes plugin
+  catalog review; `HERMES_ANTIGRAVITY_ACP_EXECUTION_MODE` and
+  `HERMES_ANTIGRAVITY_ACP_WORKSPACE` are inert and no configuration re-enables
+  native auto-approval. Native Telegram video remains opt-in with its own
+  allowlist and TOCTOU limits.
 - If you want the full Antigravity agent runtime with native tools and MCP
   clients, run the official server as an external ACP **agent** — that is the
   vendor's own product surface, not this shim.

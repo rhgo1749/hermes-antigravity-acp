@@ -19,10 +19,11 @@ of a PTY, TUI parser, or a custom `agy --input-format stream-json` bridge.
 ![How Hermes connects to the official Antigravity ACP server, and the default tool execution boundary](docs/images/how-it-works.svg)
 
 The provider communicates with the official server over ACP JSON-RPC via stdio.
-Hermes tool calls follow Hermes policies and approvals. By default, the ACP
-server can also execute native coding tools: vetted native file edits and shell
-commands are automatically authorized by the provider. Native commands bypass
-Hermes terminal approvals; a workspace path check is not a sandbox.
+Hermes tool calls follow Hermes policies and approvals. The ACP server's native
+coding tools are never auto-approved: native `run_command` is disabled at
+session launch and native file-mutation or command permission frames are
+answered with the server's own reject option, so shell and file work runs
+through Hermes' own approval-gated terminal and file tools.
 
 ## Status at a glance (evidence-backed, checked 2026-11-08)
 
@@ -53,6 +54,31 @@ the v0.21.6-floor CI lanes. Real-server concurrent-resume behavior
 across sibling children is tracked as post-merge validation in
 issue [#10](https://github.com/rhgo1749/hermes-antigravity-acp/issues/10) and
 has not yet been executed-verified.
+
+## Native permissions fail-closed (v0.7.10)
+
+The Hermes catalog review (PR
+[#153182](https://github.com/NousResearch/hermes-agent/pull/153182),
+CHANGES_REQUESTED) blocked listing while the provider auto-approved native
+shell and file-mutation permission frames. v0.7.10 removes that mechanism
+entirely: native `run_command` is disabled at session launch
+(`agy.disabledTools`), every native mutation/command permission frame is
+answered with the server's own reject option (never `allow_always`), and the
+prompt preamble again instructs the model to use Hermes' approval-gated
+terminal tool through the `<tool_call>` bridge. The former
+`HERMES_ANTIGRAVITY_ACP_EXECUTION_MODE` / `HERMES_ANTIGRAVITY_ACP_WORKSPACE`
+switches are inert and no configuration re-enables native auto-approval.
+Preserved unchanged: the read-only Hermes scratch permission route, the
+harness `fs/read`/`fs/write` callbacks bridged through Hermes' write-safety
+chain, and the v0.7.9 session-ownership, delegated-child, and usage
+accounting contracts. The coding-loop evidence in
+`tests/test_native_permission_policy.py` is a **scripted fake-ACP loop**: the
+fallback `fs/write` calls and the Hermes `terminal` `<tool_call>` are emitted
+by the test's fake server, so they prove the harness protocol path only.
+Whether the real Google model autonomously chooses Hermes tools after its
+native requests are rejected is **NOT RUN** until a supervised live canary
+executes it. See `docs/data-and-permissions.md` §5 and
+`tests/test_native_permission_policy.py`.
 
 ## 5-minute Quick Start (single account, credential-free)
 
@@ -356,10 +382,12 @@ In brief:
   network or background behavior inside the proprietary vendor binary is
   attributed to Google's runtime and is neither observed nor speculated about
   in this repository.
-- **Shell/tool boundary.** Hermes tool calls use Hermes policy. The default
-  native coding path auto-approves vetted native operations and runs shell
-  commands outside Hermes terminal approval. Use only in a trusted environment;
-  path checks do not confine shell commands. Native Telegram video remains opt-in.
+- **Shell/tool boundary.** Hermes tool calls use Hermes policy. Native
+  `run_command` is disabled at session launch and every native file-mutation or
+  command permission frame is answered with the server's own reject option —
+  the plugin never auto-approves native execution, in any mode. Shell and file
+  work runs through Hermes' own approval-gated terminal and file tools.
+  Native Telegram video remains opt-in.
 - **Child processes.** The default topology launches one official server
   child per ACP session or attempt — concurrent sessions
   and retries can therefore yield more than one child over a Hermes process
@@ -524,11 +552,13 @@ preview that selects configured accounts and maintains session affinity; it
 is not part of the default install. Review its terms and boundaries in
 [`docs/mux-packaging.md`](docs/mux-packaging.md) before enabling it.
 
-The plugin keeps **Hermes tools in Hermes**. The official ACP child can also
-execute native coding tools: the provider defaults to trusted-coding behavior
-and automatically approves supported native edit and command requests when its
-checks pass. Native commands bypass Hermes terminal approval; path checks are
-not a sandbox. Review [`docs/data-and-permissions.md`](docs/data-and-permissions.md)
+The plugin keeps **Hermes tools in Hermes**. The official ACP child's native
+coding tools are not auto-approved: native `run_command` is disabled at session
+launch and native file-mutation permission frames are rejected, so the model
+performs shell and file work through Hermes' own approval-gated terminal and
+file tools (the harness `fs/read`/`fs/write` callbacks remain bridged through
+Hermes' write-safety checks). Review
+[`docs/data-and-permissions.md`](docs/data-and-permissions.md)
 before use.
 
 **Usage telemetry is explicit and truthful:** the pinned official ACP server

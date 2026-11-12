@@ -859,7 +859,10 @@ def test_fake_subprocess_normal_tool_turn_and_native_resume(monkeypatch, tmp_pat
     assert "session/resume" in methods
     for row in rows:
         if row.get("method") in {"session/new", "session/resume"}:
-            assert "_meta" not in row["params"]
+            # the native run_command built-in is always disabled at launch
+            assert row["params"]["_meta"] == {
+                "agy": {"disabledTools": ["run_command"]}
+            }
             assert row["params"]["mcpServers"] == []
             assert row["affinity_ttl"] == "86400"
             assert row["affinity_max_entries"] == "512"
@@ -927,7 +930,7 @@ def test_fake_pre_tool_denial_is_distinguished_without_permission_response(
     assert not any(row.get("id") == 900 for row in rows)
 
 
-def test_fake_permission_request_selects_offered_native_allow_option(
+def test_fake_permission_request_selects_offered_reject_option(
     monkeypatch, tmp_path
 ) -> None:
     script, log_path = _write_fake_server(tmp_path)
@@ -947,7 +950,7 @@ def test_fake_permission_request_selects_offered_native_allow_option(
     rows = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
     response = next(row for row in rows if row.get("id") == 900)
     assert response["result"]["outcome"] == {
-        "outcome": "selected", "optionId": "allow-900"
+        "outcome": "selected", "optionId": "reject-900"
     }
 
 

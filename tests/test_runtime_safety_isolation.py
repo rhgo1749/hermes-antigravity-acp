@@ -20,8 +20,8 @@ Coverage map (historical reference criteria 2/4/5/7 boundary tests):
   fails closed when the approval policy is unavailable;
 - unattended (gateway/cron) permission requests: answered synchronously with a
   deny/cancel — never an allow, never a wait for a human;
-- trusted coding mode: default-disabled; exact opt-in only; even when opted in,
-  commands and paths outside the session cwd are refused.
+- native auto-approval: the trusted-coding auto-allow mechanism is removed;
+  no environment value re-enables it and the legacy workspace pin is inert.
 """
 
 from __future__ import annotations
@@ -775,7 +775,7 @@ def test_unattended_mutation_permission_is_denied_immediately(
 ):
     client, _, _, workspace = _isolation(monkeypatch, tmp_path)
     _stub_file_safety(monkeypatch)
-    assert client._trusted_coding is True
+    assert not hasattr(client, "_trusted_coding")
 
     responses, elapsed = _ask(
         client,
@@ -812,8 +812,8 @@ def test_unattended_permission_without_reject_option_fails_closed_cancelled(
     assert elapsed < 5.0
 
 
-def test_default_permission_allows_in_workspace_edit(monkeypatch, tmp_path):
-    """A vetted workspace edit is auto-allowed but not executed by the permission handler."""
+def test_native_edit_in_workspace_is_denied(monkeypatch, tmp_path):
+    """Fail closed: even a vetted in-workspace native edit receives the reject option."""
     client, _, _, workspace = _isolation(monkeypatch, tmp_path)
     _stub_file_safety(monkeypatch)
     inside = workspace / "notes.txt"
@@ -830,74 +830,56 @@ def test_default_permission_allows_in_workspace_edit(monkeypatch, tmp_path):
         str(workspace),
     )
     outcome = responses[0]["result"]["outcome"]
-    assert outcome["optionId"] == "always"
+    assert outcome["outcome"] == "selected"
+    assert outcome["optionId"] == "deny"
     assert inside.read_text(encoding="utf-8") == "hi"
 
 
 # ---------------------------------------------------------------------------
-# (5) Trusted coding mode: default-off, exact opt-in, bounded to session cwd
+# (5) Native auto-approval is removed; legacy switches are inert
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("mode_value", ["", "trusted", "trusted_coding", "codex", "TRUSTED-X"])
-def test_native_coding_is_default_regardless_of_legacy_mode(monkeypatch, tmp_path, mode_value):
+@pytest.mark.parametrize("mode_value", ["", "trusted", "trusted_coding", "trusted-coding", "codex", "TRUSTED-X"])
+def test_native_auto_approval_is_gone_regardless_of_legacy_mode(monkeypatch, tmp_path, mode_value):
     if mode_value:
         monkeypatch.setenv("HERMES_ANTIGRAVITY_ACP_EXECUTION_MODE", mode_value)
     else:
         monkeypatch.delenv("HERMES_ANTIGRAVITY_ACP_EXECUTION_MODE", raising=False)
-    client, module, _, _ = _isolation(monkeypatch, tmp_path)
-    assert module._trusted_coding_mode_enabled() is True
-    assert client._trusted_coding is True
-
-
-def test_trusted_coding_requires_explicit_opt_in_and_becomes_active(monkeypatch, tmp_path):
-    monkeypatch.setenv("HERMES_ANTIGRAVITY_ACP_EXECUTION_MODE", "trusted-coding")
-    client, module, _, _ = _isolation(monkeypatch, tmp_path)
-    assert module._trusted_coding_mode_enabled() is True
-    assert client._trusted_coding is True
-
-
-@pytest.mark.parametrize(
-    ("kind", "raw_input", "content", "label"),
-    [
-        ("edit", {"absolute_path": "/etc/hosts"}, "diff", "named-edit-outside"),
-        ("edit", {"absolute_path": str(Path("/etc/cron.d/evil"))}, "diff", "named-edit-cron"),
-        ("execute", {"CommandLine": "pytest -q", "Cwd": "/"}, None, "nameless-run-outside-cwd"),
-    ],
-    ids=lambda value: str(value)[:24],
-)
-def test_trusted_mode_refuses_out_of_workspace_frames(monkeypatch, tmp_path, kind, raw_input, content, label):
-    monkeypatch.setenv("HERMES_ANTIGRAVITY_ACP_EXECUTION_MODE", "trusted-coding")
-    client, _, _, workspace = _isolation(monkeypatch, tmp_path)
+    client, module, _, workspace = _isolation(monkeypatch, tmp_path)
     _stub_file_safety(monkeypatch)
-    assert client._trusted_coding is True
+    assert not hasattr(module, "_trusted_coding_mode_enabled")
+    assert not hasattr(module, "_trusted_coding_permission_option")
+    assert not hasattr(client, "_trusted_coding")
 
-    params = _permission_params("", kind, raw_input, _ALLOW_REJECT, tool_call_id=f"call-{label}")
-    if kind == "edit":
-        params["toolCall"]["content"] = [
-            {"type": "diff", "path": raw_input.get("absolute_path"), "_meta": {"kind": "modify"}}
-        ]
-    responses, _ = _ask(client, params, str(workspace))
-    outcome = responses[0]["result"]["outcome"]
-    assert outcome["outcome"] == "selected"
-    assert outcome["optionId"] == "deny", f"trusted mode must refuse out-of-workspace frame: {label}"
+    # an in-workspace native command and an in-workspace native edit are both
+    # denied immediately, even though allow_always is offered first
+    for name, kind, raw_input in (
+        ("run_command", "execute", {"CommandLine": "pytest -q", "Cwd": str(workspace)}),
+        ("client_edit_file", "edit", {"absolute_path": str(workspace / "ok.py")}),
+    ):
+        responses, elapsed = _ask(
+            client,
+            _permission_params(name, kind, raw_input, _ALLOW_REJECT, tool_call_id=f"call-{name}"),
+            str(workspace),
+        )
+        assert len(responses) == 1
+        outcome = responses[0]["result"]["outcome"]
+        assert outcome["outcome"] == "selected"
+        assert outcome["optionId"] == "deny", (
+            f"{name} must be denied regardless of legacy mode value {mode_value!r}"
+        )
+        assert elapsed < 5.0
 
 
-def test_trusted_mode_positive_control_allows_in_workspace_edit(monkeypatch, tmp_path):
-    """Proves the refusals above are the workspace boundary, not a broken test rig."""
-    monkeypatch.setenv("HERMES_ANTIGRAVITY_ACP_EXECUTION_MODE", "trusted-coding")
-    client, _, _, workspace = _isolation(monkeypatch, tmp_path)
-    _stub_file_safety(monkeypatch)
-    inside = workspace / "src" / "module.py"
-    inside.parent.mkdir(parents=True, exist_ok=True)
-    inside.write_text("x = 1\n", encoding="utf-8")
-
-    params = _permission_params(
-        "client_edit_file",
-        "edit",
-        {"absolute_path": str(inside)},
-        _ALLOW_REJECT,
-    )
-    responses, _ = _ask(client, params, str(workspace))
-    outcome = responses[0]["result"]["outcome"]
-    assert outcome["outcome"] == "selected"
-    assert outcome["optionId"] == "always"
+def test_legacy_workspace_env_does_not_move_session_root(monkeypatch, tmp_path):
+    """The retired operator pin is inert: it can no longer relocate the session root."""
+    workspace = tmp_path / "pinned"
+    workspace.mkdir()
+    monkeypatch.setenv("HERMES_ANTIGRAVITY_ACP_WORKSPACE", str(workspace))
+    _, module, _, _ = _isolation(monkeypatch, tmp_path)
+    other = tmp_path / "explicit"
+    other.mkdir()
+    assert module._resolve_acp_working_directory(str(other)) == str(other.resolve())
+    # no explicit cwd: the pin is ignored and no RuntimeError is raised
+    resolved = module._resolve_acp_working_directory(None)
+    assert resolved != str(workspace.resolve())

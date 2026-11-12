@@ -3,7 +3,7 @@
 Detailed runtime behavior of `hermes-plugin/antigravity-acp/`,
 moved out of the README. These behaviors are code-verified and covered by the
 credential-free suites (`tests/test_standalone_client.py`,
-`tests/test_native_video_blocks.py`, `tests/test_trusted_coding_mode.py`,
+`tests/test_native_video_blocks.py`, `tests/test_native_permission_policy.py`,
 `tests/test_usage_telemetry_contract.py`, and siblings).
 
 ## ACP session flow
@@ -136,9 +136,12 @@ troubleshooting, sanitized evidence, and rollout/rollback guidance.
 
 ## Native coding and workspace
 
-Native coding is the default. The provider auto-approves vetted native file
-operations and commands; native commands bypass Hermes terminal approval and
-the workspace check is not a sandbox. `HERMES_ANTIGRAVITY_ACP_WORKSPACE`
-optionally pins the launch workspace. The legacy
-`HERMES_ANTIGRAVITY_ACP_EXECUTION_MODE` variable is ignored. Existing sessions
-with a different execution-policy fingerprint start a fresh ACP session.
+Native coding tools are never auto-approved. Native `run_command` is disabled
+at session launch (`agy.disabledTools`) and every native file-mutation or
+command permission frame is answered with the server's own reject option; the
+model performs shell and file work through Hermes' approval-gated terminal and
+file tools. The former trusted-coding auto-approval was removed after the
+Hermes plugin catalog review; `HERMES_ANTIGRAVITY_ACP_WORKSPACE` and the legacy
+`HERMES_ANTIGRAVITY_ACP_EXECUTION_MODE` variable are inert. Sessions whose
+stored context fingerprint predates the removal mismatch and start a fresh ACP
+session.

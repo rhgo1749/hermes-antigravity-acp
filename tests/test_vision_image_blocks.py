@@ -620,7 +620,7 @@ def test_legacy_multimodal_checkpoint_still_continues_and_sends_new_image(
         client_mod.ACPConversationState(
             session_id="s-vision",
             context_fingerprint=client_mod._context_fingerprint(
-                "antigravity-acp", None, None, execution_mode="trusted-coding"
+                "antigravity-acp", None, None
             ),
             request_fingerprints=legacy_fingerprints,
             response_fingerprint=client_mod._response_fingerprint("ok-vision", []),

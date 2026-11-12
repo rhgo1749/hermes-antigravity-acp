@@ -1315,31 +1315,6 @@ def _log_continuation_diagnostics(
     )
 
 
-_TRUSTED_CODING_PREAMBLE_REPLACEMENTS = {
-    "For shell commands, builds, tests, and GitHub CLI work, use an available Hermes terminal tool via ": (
-        "You are running in trusted coding-agent mode: native file creation/editing and "
-        "ACP-native run_command are pre-approved inside the session workspace. Create files, "
-        "edit files, run tests, and execute shell commands directly with your native tools, "
-        "keeping every path inside the session workspace."
-    ),
-}
-
-
-def _prompt_preamble(trusted_coding: bool) -> tuple[str, ...]:
-    """Keep the default preamble byte-identical; swap only the execution line in trusted mode."""
-    if not trusted_coding:
-        return _PROMPT_PREAMBLE
-    replaced: list[str] = []
-    for line in _PROMPT_PREAMBLE:
-        for prefix, replacement in _TRUSTED_CODING_PREAMBLE_REPLACEMENTS.items():
-            if line.startswith(prefix):
-                replaced.append(replacement)
-                break
-        else:
-            replaced.append(line)
-    return tuple(replaced)
-
-
 def _format_messages_as_prompt(
     messages: list[dict[str, Any]],
     model: str | None = None,
@@ -1347,7 +1322,6 @@ def _format_messages_as_prompt(
     tool_choice: Any = None,
     *,
     unresolved_denied_request: str = "",
-    trusted_coding: bool = False,
 ) -> str:
     """Build a full ACP bootstrap without making old user turns look active.
 
@@ -1362,7 +1336,7 @@ def _format_messages_as_prompt(
     del model  # Model selection is performed on the ACP session, never by prompt text.
     valid = [item for item in messages if isinstance(item, dict)]
     sections: list[str] = [
-        *_prompt_preamble(trusted_coding),
+        *_PROMPT_PREAMBLE,
         *render_tool_bridge_sections(tools, tool_choice),
     ]
     for overlay in policy_overlays:
@@ -2138,183 +2112,20 @@ _DOCUMENTED_PERMISSION_OPTION_KINDS = frozenset(
 )
 _NATIVE_PERMISSION_TOOL_NAMES = _KNOWN_NATIVE_READ_TOOLS | {"run_command"}
 
-# --- Native coding-agent policy (ALWAYS ON; disclosed behaviour) ----------------------
-# Headless coding work (create/edit files, run tests and commands) is
-# impossible under the fail-closed alternative: every mutation permission is
-# auto-rejected and ``run_command`` is disabled at session launch, and a
-# detached card worker has no human able to answer an approval prompt.  This
-# plugin therefore always answers the *official ACP server's own* permission
-# frames with a vetted allow option, bounded by the origin and workspace gates
-# below.  This is not Hermes's approval system and does not route around it:
-# Hermes tool approvals are untouched.  The behaviour is unconditional, is
-# disclosed in README.md and docs/data-and-permissions.md, and is NOT
-# configurable — ``_TRUSTED_CODING_MODE_ENV`` names a retired switch that is
-# never read (tests assert setting it changes nothing).
-_TRUSTED_CODING_MODE_ENV = "HERMES_ANTIGRAVITY_ACP_EXECUTION_MODE"
-_TRUSTED_CODING_WORKSPACE_ENV = "HERMES_ANTIGRAVITY_ACP_WORKSPACE"
-_TRUSTED_CODING_MODE_VALUE = "trusted-coding"
-
-
-def _trusted_coding_mode_enabled() -> bool:
-    """Use the native coding-agent policy for every provider session.
-
-    The former execution-mode environment variable is deliberately ignored:
-    an existing profile or a fresh installation gets the same behavior.
-    """
-    return True
-
-
-# Exact official-server built-in names, plus the nameless built-in frame
-# shape verified live on 1.4.0 by the historical reference canary (scripts/acp_live_canary.py
-# evidence): the 1.4.0 file-mutation permission frames carry NO ``name`` field at
-# all — they are identified by kind=edit plus structured diff content entries
-# and locations.  The same fail-closed origin assumption as
-# _is_known_native_read_tool applies: any frame with an explicit ``name`` that
-# is not one of the exact built-ins (MCP-qualified or otherwise) never receives
-# a trusted allow.
-_TRUSTED_NATIVE_PATH_MUTATION_TOOLS = frozenset({"client_create_file", "client_edit_file"})
-_TRUSTED_NATIVE_EXECUTION_TOOLS = frozenset({"run_command"})
-_TRUSTED_NATIVE_MUTATION_TOOLS = (
-    _TRUSTED_NATIVE_PATH_MUTATION_TOOLS | _TRUSTED_NATIVE_EXECUTION_TOOLS
-)
-_TRUSTED_BUILTIN_EDIT_KIND = "edit"
-_TRUSTED_BUILTIN_EXECUTE_KIND = "execute"
-# additional rawInput path aliases seen on real 1.4.0 mutation frames
-_TRUSTED_RAW_INPUT_PATH_KEYS = (
-    "absolute_path", "path", "filePath", "file_path", "filename", "file", "directory_path",
-    "target_file", "source_file", "destination", "dest_file", "new_path", "target", "Cwd",
-)
-
-
-def _has_builtin_diff_content(tool_call: dict[str, Any]) -> bool:
-    """True for the built-in structured-diff ToolCall shape (no name field)."""
-    content = tool_call.get("content")
-    if not isinstance(content, list) or not content:
-        return False
-    for item in content:
-        if not isinstance(item, dict):
-            return False
-        if str(item.get("type") or "").strip() != "diff":
-            return False
-        meta = item.get("_meta")
-        if not isinstance(meta, dict) or str(meta.get("kind") or "").strip() not in {
-            "add", "modify", "delete"
-        }:
-            return False
-    return True
-
-
-def _has_builtin_command_content(tool_call: dict[str, Any]) -> bool:
-    """True for the nameless run_command built-in frame shape (live 1.4.0)."""
-    raw_input = tool_call.get("rawInput")
-    return isinstance(raw_input, dict) and isinstance(raw_input.get("CommandLine"), str)
-
-
-def _trusted_permission_paths(tool_call: dict[str, Any]) -> tuple[str, ...]:
-    """Every path the frame discloses: rawInput aliases, diff content, locations.
-
-    1.4.0 built-in frames often disclose RELATIVE paths (session-cwd-relative);
-    they are resolved against the session root before the same Hermes policy
-    chain runs, so the session cwd and the permission root stay bound together.
-    """
-    paths: list[str] = []
-
-    def add(value: Any) -> None:
-        if isinstance(value, str) and value.strip() and value.strip() not in paths:
-            paths.append(value.strip())
-
-    raw_input = tool_call.get("rawInput")
-    if isinstance(raw_input, dict):
-        for key in _TRUSTED_RAW_INPUT_PATH_KEYS:
-            add(raw_input.get(key))
-    for section in ("content", "locations"):
-        items = tool_call.get(section)
-        if isinstance(items, list):
-            for item in items:
-                if isinstance(item, dict):
-                    add(item.get("path"))
-    return tuple(paths)
-
-
-def _trusted_path_is_under_session(path_text: str, cwd: str) -> bool:
-    candidate = Path(path_text).expanduser()
-    if not candidate.is_absolute():
-        candidate = Path(cwd) / candidate
-    try:
-        safe_path = _safe_path(str(candidate), cwd, verb="Write")
-        # Server-executed mutations never pass through the harness fs/write
-        # handler, so the full Hermes write policy chain must be enforced at
-        # the permission decision too — the same two gates _fs_write_text_file
-        # applies: explicit write denial and interactive write approval.
-        get_write_denied_error, is_write_approval_required = get_file_write_safety()
-        if get_write_denied_error(str(safe_path), verb="Write"):
-            return False
-        if is_write_approval_required(str(safe_path)):
-            return False
-    except Exception:
-        # Any policy failure (including the policy being unavailable) fails
-        # closed: an unverifiable path can never receive a trusted allow.
-        return False
-    return True
-
-
-def _trusted_coding_permission_option(
-    params: dict[str, Any], cwd: str
-) -> tuple[str, str] | None:
-    """Select an offered allow option for a trusted-mode native built-in call.
-
-    Origin gate: an explicit protocol ``name`` must be one of the exact
-    built-ins (titles are model-controlled and never prove origin), or the
-    frame must be the nameless structured-diff built-in shape that the official
-    1.4.0 server emits for its own file-mutation tools.  Every disclosed path
-    (rawInput aliases, diff content, locations; relative paths resolved against
-    the session cwd) must pass _safe_path — session-workspace rooting plus
-    Hermes NT namespace and Antigravity credential guards — so writes outside
-    the approved workspace stay blocked.  run_command has no path aliases;
-    running commands is exactly what explicit trusted-mode opt-in authorizes.
-    """
-    tool_call = _permission_tool_call(params)
-    if not tool_call:
-        return None
-    tool_name = str(tool_call.get("name") or "").strip()
-    kind = str(tool_call.get("kind") or "").strip().lower()
-    require_paths = False
-    if tool_name:
-        if tool_name not in _TRUSTED_NATIVE_MUTATION_TOOLS:
-            return None
-        # Named file-mutation built-ins must disclose a checkable target:
-        # server-executed edits bypass the harness fs/write gate, so a frame
-        # with no path anywhere cannot be bounded to the workspace.
-        require_paths = tool_name in _TRUSTED_NATIVE_PATH_MUTATION_TOOLS
-    elif kind == _TRUSTED_BUILTIN_EDIT_KIND and _has_builtin_diff_content(tool_call):
-        # nameless built-in file-mutation frame (live 1.4.0 shape); a diff
-        # frame with no path anywhere cannot be verified.
-        require_paths = True
-    elif kind == _TRUSTED_BUILTIN_EXECUTE_KIND and _has_builtin_command_content(tool_call):
-        # nameless built-in run_command frame (live 1.4.0 shape: rawInput
-        # {"CommandLine": ..., "Cwd": ...}); the disclosed Cwd must be inside
-        # the session workspace.
-        pass
-    else:
-        return None
-
-    paths = _trusted_permission_paths(tool_call)
-    if require_paths and not paths:
-        return None
-    for path_text in paths:
-        if not _trusted_path_is_under_session(path_text, cwd):
-            return None
-
-    for preferred_kind in ("allow_always", "allow_once"):
-        for option in params.get("options") or []:
-            if not isinstance(option, dict):
-                continue
-            if str(option.get("kind") or "").strip() != preferred_kind:
-                continue
-            option_id = str(option.get("optionId") or "").strip()
-            if option_id:
-                return option_id, preferred_kind
-    return None
+# --- Native coding-agent permission policy (FAIL CLOSED) ------------------
+# Every ``session/request_permission`` frame the official server emits for a
+# NATIVE tool (run_command, file create/edit/delete executed server-side) is
+# answered with the server's own reject option.  The plugin never auto-allows
+# a native mutation or command, in any run mode, and no configuration or
+# environment variable can enable one: shell and file-mutation work belongs to
+# Hermes' own approval-gated terminal and file tools, which the model reaches
+# through the Hermes <tool_call> bridge (see _PROMPT_PREAMBLE).  The only
+# permission auto-allow that remains is the read-only Hermes scratch-area
+# route in _safe_read_permission_option, and harness fs/read/fs/write
+# callbacks keep enforcing the full Hermes write-safety chain.  The former
+# "trusted coding" auto-approval (HERMES_ANTIGRAVITY_ACP_EXECUTION_MODE /
+# HERMES_ANTIGRAVITY_ACP_WORKSPACE) was removed after the Hermes catalog
+# review; both environment variables are now inert.
 
 
 def _opaque_permission_id(value: Any, domain: str) -> str | None:
@@ -3157,19 +2968,11 @@ def _context_fingerprint(
     model: str | None,
     tools: list[dict[str, Any]] | None,
     tool_choice: Any,
-    *,
-    execution_mode: str = "",
 ) -> str:
     payload_obj: dict[str, Any] = {
         "model": str(model or ""),
         "tool_bridge": render_tool_bridge_sections(tools, tool_choice),
     }
-    # Only a non-default mode adds a field, so default-mode fingerprints stay
-    # byte-identical across the upgrade; a mode switch on either side then
-    # mismatches and forces a fresh session instead of resuming a session
-    # whose tool policy was fixed at launch.
-    if execution_mode:
-        payload_obj["execution_mode"] = execution_mode
     payload = json.dumps(
         payload_obj,
         ensure_ascii=False,
@@ -3866,48 +3669,17 @@ def _rotation_threshold(model: str | None = None) -> int:
     return int(_native_token_limit(model) * fraction)
 
 
-def _resolve_acp_working_directory(explicit_cwd: str | None, *, trusted_mode: bool = False) -> str:
+def _resolve_acp_working_directory(explicit_cwd: str | None) -> str:
     """Use Hermes' scoped workdir before the process-wide launch directory.
 
     A gateway may be launched from /ws/hermes-agent while a delegated reviewer is
     scoped to /ws/projects/<repo>.  The native ACP session must use that same
     workdir for file permissions and relative operations.
 
-    In trusted coding mode an operator may pin the session workspace explicitly
-    (``HERMES_ANTIGRAVITY_ACP_WORKSPACE``), which keeps the ACP session cwd and
-    the permission root on the same resolved directory even when the agent runs
-    inside an isolated git worktree.  The override fails closed on a missing or
-    relative directory and is ignored outside trusted mode.
+    The former ``HERMES_ANTIGRAVITY_ACP_WORKSPACE`` operator pin belonged to the
+    removed trusted-coding auto-approval and is no longer read; the session cwd
+    is always the Hermes-scoped working directory.
     """
-    if trusted_mode:
-        configured = os.environ.get(_TRUSTED_CODING_WORKSPACE_ENV, "").strip()
-        if configured:
-            workspace = Path(configured).expanduser()
-            if not workspace.is_absolute():
-                raise RuntimeError(
-                    f"{_TRUSTED_CODING_WORKSPACE_ENV} must be an absolute path; "
-                    "refusing to start an Antigravity ACP session."
-                )
-            workspace = workspace.resolve()
-            if not workspace.is_dir():
-                raise RuntimeError(
-                    f"{_TRUSTED_CODING_WORKSPACE_ENV} is not an existing directory; "
-                    "refusing to start an Antigravity ACP session."
-                )
-            # The operator pin is authoritative for BOTH the session cwd and
-            # the permission root; an explicit acp_cwd may agree with it but
-            # must never silently override or bypass validation of it, or a
-            # mistyped pin would create a session whose root differs from the
-            # one the operator believes is enforced.
-            if explicit_cwd:
-                explicit_resolved = str(Path(explicit_cwd).expanduser().resolve())
-                if explicit_resolved != str(workspace):
-                    raise RuntimeError(
-                        f"{_TRUSTED_CODING_WORKSPACE_ENV} pins the session root to "
-                        f"{workspace}, which conflicts with the explicit acp_cwd "
-                        f"{explicit_resolved}; refusing to start with two roots."
-                    )
-            return str(workspace)
     if explicit_cwd:
         return str(Path(explicit_cwd).expanduser().resolve())
     runtime_cwd = resolve_agent_cwd()
@@ -4112,10 +3884,7 @@ class AntigravityACPClient:
         self._acp_command = acp_command or command or "antigravity-acp-official"
         selected_args = acp_args if acp_args is not None else args
         self._acp_args = list(selected_args) if selected_args is not None else []
-        self._trusted_coding = _trusted_coding_mode_enabled()
-        self._acp_cwd = _resolve_acp_working_directory(
-            acp_cwd, trusted_mode=self._trusted_coding
-        )
+        self._acp_cwd = _resolve_acp_working_directory(acp_cwd)
         self._rate_limit_retries = max(0, min(int(rate_limit_retries), 8))
         # Fail closed on a misspelled policy name: silently falling back to a
         # different postprocessing set would change security-relevant behavior.
@@ -4263,14 +4032,7 @@ class AntigravityACPClient:
             if self._llm_backend_postprocessing
             else _conversation_affinity(request_messages, self._acp_cwd)
         )
-        context_fingerprint = _context_fingerprint(
-            model,
-            tools,
-            tool_choice,
-            execution_mode=(
-                _TRUSTED_CODING_MODE_VALUE if self._trusted_coding else ""
-            ),
-        )
+        context_fingerprint = _context_fingerprint(model, tools, tool_choice)
         prior_state = conversation_registry.get(affinity_key) if affinity_key else None
         denied_request = _denied_request_text(request_messages, prior_state)
         full_prompt_text = _format_messages_as_prompt(
@@ -4279,7 +4041,6 @@ class AntigravityACPClient:
             tools=tools,
             tool_choice=tool_choice,
             unresolved_denied_request=denied_request,
-            trusted_coding=self._trusted_coding,
         )
 
         resume_session_id = ""
@@ -5004,14 +4765,10 @@ class AntigravityACPClient:
                     getattr(proc, _USAGE_SEMANTICS_ATTR)
                     or _USAGE_SEMANTICS_UNVERIFIED
                 )
-            # The default Hermes model-provider mode disables the native
-            # run_command built-in at launch; trusted coding mode omits the
-            # override so the server keeps its normal built-in tool set.
-            session_meta = (
-                None
-                if self._trusted_coding
-                else {"agy": {"disabledTools": ["run_command"]}}
-            )
+            # Hermes model-provider mode always disables the native
+            # run_command built-in at launch; shell work belongs to Hermes'
+            # approval-gated terminal tool through the <tool_call> bridge.
+            session_meta = {"agy": {"disabledTools": ["run_command"]}}
             if resume_session_id:
                 resume_params: dict[str, Any] = {
                     "sessionId": resume_session_id,
@@ -5552,11 +5309,6 @@ class AntigravityACPClient:
             allow_option_id = _safe_read_permission_option(params, cwd)
             selected_option_kind = "allow_once" if allow_option_id else None
             selection_source = "read_only_scratch" if allow_option_id else None
-            if not allow_option_id and self._trusted_coding:
-                trusted_option = _trusted_coding_permission_option(params, cwd)
-                if trusted_option:
-                    allow_option_id, selected_option_kind = trusted_option
-                    selection_source = "trusted_coding"
             reject_option = None if allow_option_id else _safe_reject_permission_option(params)
             offered_kinds = _permission_option_kinds(params)
             tool_call = _permission_tool_call(params)
@@ -5564,17 +5316,9 @@ class AntigravityACPClient:
             if allow_option_id:
                 selected_option_id = allow_option_id
                 server_outcome = "selected"
-                if selection_source == "trusted_coding":
-                    logger.info(
-                        "Antigravity ACP trusted-coding policy auto-approved a native "
-                        "built-in request (option kind: %s, tool: %s).",
-                        selected_option_kind,
-                        _safe_permission_tool_name(tool_call),
-                    )
-                else:
-                    logger.info(
-                        "Antigravity ACP approved one read-only Hermes scratch permission request."
-                    )
+                logger.info(
+                    "Antigravity ACP approved one read-only Hermes scratch permission request."
+                )
                 outcome = {"outcome": "selected", "optionId": selected_option_id}
             elif reject_option:
                 selected_option_id, selected_option_kind = reject_option
