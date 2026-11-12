@@ -24,7 +24,9 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import queue
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -418,8 +420,40 @@ def main() -> int:
         err_thread.start()
         return True
 
+    # Graceful shutdown on SIGTERM/SIGINT (issue #23): a signal must never skip
+    # the finally teardown below and orphan the official ACP child. A Python
+    # signal handler cannot interrupt a blocked ``for line in sys.stdin``, so
+    # stdin is pumped by a thread and the main loop polls the stop flag.
+    stopping = threading.Event()
+
+    def _request_stop(signum: int, frame: object) -> None:
+        stopping.set()
+
+    for _sig_name in ("SIGTERM", "SIGINT"):
+        _sig = getattr(signal, _sig_name, None)
+        if _sig is not None:
+            try:
+                signal.signal(_sig, _request_stop)
+            except (ValueError, OSError, RuntimeError):
+                pass  # not the main thread / unsupported: EOF teardown still applies
+
+    stdin_lines: queue.Queue[str | None] = queue.Queue()
+
+    def pump_stdin() -> None:
+        for raw_line in sys.stdin:
+            stdin_lines.put(raw_line)
+        stdin_lines.put(None)
+
+    threading.Thread(target=pump_stdin, daemon=True).start()
+
     try:
-        for line in sys.stdin:
+        while not stopping.is_set():
+            try:
+                line = stdin_lines.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            if line is None:
+                break
             method = ""
             request_id: object | None = None
             payload: object = None
