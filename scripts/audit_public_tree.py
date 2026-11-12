@@ -64,6 +64,7 @@ PUBLIC_PROVIDER_FILES = frozenset(
         "bridge.py",
         "conversation_state.py",
         "native_limit_state.py",
+        "process_teardown.py",
         "hermes_compat.py",
         "login.py",
     }

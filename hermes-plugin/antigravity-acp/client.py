@@ -58,6 +58,7 @@ from .hermes_compat import (
     windows_hide_flags,
 )
 from .native_limit_state import native_limit_registry
+from .process_teardown import terminate_process_tree
 from .bridge import (
     MalformedToolCallError,
     advertised_tool_names,
@@ -449,6 +450,17 @@ class _AcpEarlyExitError(RuntimeError):
     def __init__(self, message: str, *, acp_retry_class: str | None = None) -> None:
         super().__init__(message)
         self.acp_retry_class = acp_retry_class
+
+
+class _AcpCancelledError(RuntimeError):
+    """Hermes interrupt cancelled this request (issue #23).
+
+    Raised on the owner thread when ``AntigravityACPClient.cancel()`` (called
+    by Hermes Core's stranger-thread abort hook) lands while a session is in
+    flight. Deliberately never a failover class: a user stop must not spawn a
+    fresh ACP session or replay the prompt, and the message carries no
+    rate-limit/auth/resume-miss signature.
+    """
 
 
 def _is_failover_error(exc: BaseException) -> bool:
@@ -3791,12 +3803,10 @@ _warm_pool_atexit_armed = False
 
 
 def _terminate_parked(proc: subprocess.Popen[str]) -> None:
-    try:
-        proc.terminate()
-        proc.wait(timeout=2)
-    except Exception:
-        with contextlib.suppress(Exception):
-            proc.kill()
+    # A parked process has no active writer, so the cooperative stdin-EOF
+    # shutdown is safe here; the tree escalation guarantees a parked mux never
+    # leaves its bound official-server child behind (issue #23 P1 review).
+    terminate_process_tree(proc, graceful_stdin=True)
 
 
 def _shutdown_warm_pool() -> None:
@@ -3896,15 +3906,22 @@ class AntigravityACPClient:
         self.is_closed = False
         self._active_processes: set[subprocess.Popen[str]] = set()
         self._active_process_lock = threading.Lock()
+        # Cancellation epoch (issue #23): cancel() increments it and terminates
+        # this instance's active processes; every in-flight session snapshots
+        # it at start and aborts when it moves. A new session snapshots the
+        # CURRENT value, so a cancel is never sticky for later requests on a
+        # reused instance. Guarded by _active_process_lock.
+        self._cancel_epoch = 0
 
     @staticmethod
-    def _terminate_process(proc: subprocess.Popen[str]) -> None:
-        try:
-            proc.terminate()
-            proc.wait(timeout=2)
-        except Exception:
-            with contextlib.suppress(Exception):
-                proc.kill()
+    def _terminate_process(
+        proc: subprocess.Popen[str], *, graceful_stdin: bool = False
+    ) -> None:
+        # Platform-guaranteed tree teardown (process-group kill on POSIX,
+        # taskkill /T /F on Windows): a mux force-killed here can never leave
+        # its official-server child running (issue #23 P1 review).  Closing
+        # stdin first is only safe for the thread that owns the request pipe.
+        terminate_process_tree(proc, graceful_stdin=graceful_stdin)
 
     def _release_process(self, proc: subprocess.Popen[str]) -> None:
         with self._active_process_lock:
@@ -3912,8 +3929,9 @@ class AntigravityACPClient:
         # A poisoned or failed child is terminated here; a healthy session's
         # child is parked for reuse by ``_session``'s warm-pool release path
         # instead. The facade itself must remain open so Hermes can reuse its
-        # durable ACP continuation state.
-        self._terminate_process(proc)
+        # durable ACP continuation state.  Owner-thread path: stdin close is
+        # the cooperative first step.
+        self._terminate_process(proc, graceful_stdin=True)
 
     def _warm_acquire(
         self, affinity_key: str, resume_session_id: str
@@ -3992,6 +4010,43 @@ class AntigravityACPClient:
         with self._active_process_lock:
             procs, self._active_processes = tuple(self._active_processes), set()
         self.is_closed = True
+        for proc in procs:
+            # Owner/lifecycle path: cooperative stdin EOF first.
+            self._terminate_process(proc, graceful_stdin=True)
+
+    def cancel(self) -> None:
+        """Stop this instance's in-flight ACP session(s) (issue #23).
+
+        Hermes Core's interrupt path (``agent/client_lifecycle.py::
+        _abort_request_slot_client``) calls this from the interrupt thread
+        when the client type exposes ``cancel()``, instead of falling through
+        to the HTTP socket sweep (which finds no sockets on a stdio transport:
+        ``tcp_force_closed=0`` and the worker keeps running to completion).
+
+        Request scope: in Core's request-slot topology every in-flight request
+        owns its own client instance, so terminating only this instance's
+        ``_active_processes`` is request-scoped. Sibling requests live on
+        their own instances and are never touched. Parked warm-pool processes
+        belong to no request and are outside ``_active_processes`` by design,
+        so cancel never kills a process waiting for warm reuse. The instance
+        stays open (no ``is_closed``): Core poisons the slot and durable ACP
+        continuation state must survive. Idempotent.
+
+        The owner thread observes the epoch move in its request loop and
+        raises ``_AcpCancelledError`` (never a failover class), so a user stop
+        never re-sends the prompt. If cancel races a spawn, the process is
+        not yet in the active set; the owner's pre-send epoch check then
+        prevents ``session/prompt`` and the session teardown reaps it.
+        """
+        with self._active_process_lock:
+            self._cancel_epoch += 1
+            procs = tuple(self._active_processes)
+        if len(procs) > 1:
+            logger.warning(
+                "Antigravity ACP cancel() found %d concurrent sessions on one client"
+                " instance; all in-flight sessions on this instance are cancelled.",
+                len(procs),
+            )
         for proc in procs:
             self._terminate_process(proc)
 
@@ -4541,6 +4596,9 @@ class AntigravityACPClient:
                 cwd=self._acp_cwd,
                 env=child_env,
                 creationflags=_windows_hide_flags(),
+                # Own process group so teardown can signal the whole tree
+                # (mux + official-server child) — see process_teardown.
+                start_new_session=(os.name != "nt"),
             )
         except FileNotFoundError as exc:
             raise RuntimeError(
@@ -4567,6 +4625,14 @@ class AntigravityACPClient:
         strict_same_session: bool = False,
     ) -> Iterator[tuple[dict[str, Any], Callable[..., Any], dict[str, Any]]]:
         resume_session_id = str(resume_session_id or "").strip()
+        # Snapshot the cancellation epoch (issue #23): this session aborts when
+        # cancel() moves it, but a session started after a cancel is unaffected.
+        with self._active_process_lock:
+            cancel_epoch = self._cancel_epoch
+
+        def _cancelled() -> bool:
+            return self._cancel_epoch != cancel_epoch
+
         entry = self._warm_acquire(affinity_key, resume_session_id)
         fresh = entry is None
         if fresh:
@@ -4667,19 +4733,37 @@ class AntigravityACPClient:
                 # per-model-call deltas; frames outside it are re-reports or
                 # placeholders (see _capture_usage_delta).
                 activity_stats[_PROMPT_TURN_ACTIVE_KEY] = True
-            proc.stdin.write(
-                json.dumps(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": request_id,
-                        "method": method,
-                        "params": params,
-                    }
+            if _cancelled():
+                # A cancel that raced the spawn must stop here: the prompt is
+                # never written, so the vendor never sees it. The finally
+                # reaps the freshly spawned child (poisoned release path).
+                raise _AcpCancelledError(
+                    "Antigravity ACP request cancelled by Hermes interrupt before send."
                 )
-                + "\n"
-            )
-            proc.stdin.flush()
+            try:
+                proc.stdin.write(
+                    json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": request_id,
+                            "method": method,
+                            "params": params,
+                        }
+                    )
+                    + "\n"
+                )
+                proc.stdin.flush()
+            except BrokenPipeError:
+                if _cancelled():
+                    raise _AcpCancelledError(
+                        "Antigravity ACP request cancelled by Hermes interrupt during send."
+                    ) from None
+                raise
             while time.monotonic() < session_deadline and proc.poll() is None:
+                if _cancelled():
+                    raise _AcpCancelledError(
+                        "Antigravity ACP request cancelled by Hermes interrupt."
+                    )
                 try:
                     message = inbox.get(timeout=0.1)
                 except queue.Empty:
@@ -4712,6 +4796,12 @@ class AntigravityACPClient:
                         diagnostic += ": " + "; ".join(details)
                     raise RuntimeError(diagnostic)
                 return message.get("result")
+            if _cancelled():
+                # The loop exited on the deadline/poll race while a cancel was
+                # landing; classify as cancellation, not a provider timeout.
+                raise _AcpCancelledError(
+                    "Antigravity ACP request cancelled by Hermes interrupt."
+                )
             if proc.poll() is not None:
                 # The child is gone; give the pump a bounded moment to drain
                 # the pipe so the captured-tail summary is deterministic.
@@ -5027,6 +5117,10 @@ class AntigravityACPClient:
                     strict_same_session=strict_same_session,
                 )
             except RuntimeError as exc:
+                if isinstance(exc, _AcpCancelledError):
+                    # A user stop is final (issue #23): no failover session,
+                    # no resume-miss replay, no correction replay.
+                    raise
                 # A checkpoint error after the prompt has started may follow partial
                 # native shell/git mutations. A blind full replay is unsafe even
                 # if the official server no longer knows its checkpoint channel.
