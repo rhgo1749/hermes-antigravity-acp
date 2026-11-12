@@ -103,7 +103,7 @@ def _deploy():
 def test_canonical_fileset_witness_matches_deployer_contract() -> None:
     deploy = _deploy()
     assert set(deploy.REQUIRED) == CANONICAL_PROVIDER_FILES
-    assert len(deploy.REQUIRED) == 8
+    assert len(deploy.REQUIRED) == 9
 
 
 _PROVIDER_PREFIX = "hermes-plugin/antigravity-acp/"
