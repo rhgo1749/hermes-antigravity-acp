@@ -534,6 +534,12 @@ job is the single required verdict:
   reported — a skipped or missing check is never a pass. Branch
   protection should require `CI gate`, never a conditional lane name.
 
+Phase A of [issue #28](https://github.com/rhgo1749/hermes-antigravity-acp/issues/28)
+adds an exact, reviewed platform-neutral test classification, not a pytest
+selection list. Ordinary plugin changes still require the three OS lanes;
+unreviewed tests remain full-matrix, and main pushes still run all five native
+targets. See [the path matrix, measured baseline and estimate boundaries](docs/ci-cost-phase-a.md).
+
 ### Four distinct evidence classes (never conflated)
 
 Verification reporting in this repository separates four evidence classes

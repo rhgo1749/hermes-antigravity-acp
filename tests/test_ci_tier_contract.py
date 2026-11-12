@@ -22,6 +22,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -183,6 +184,156 @@ def test_dispatch_supports_full_matrix_with_recorded_reason(ci: str) -> None:
     assert "workflow_dispatch:" in header
     scope_block = _job_block(ci, "change-scope")
     assert "CI_DISPATCH_REASON" in scope_block
+
+
+# -- Phase A (issue #28): reviewed tests, never a discovery allowlist ------
+
+REVIEWED_NEUTRAL_TESTS = (
+    "tests/test_acp_thinking_level.py",
+    "tests/test_model_surface_selection.py",
+)
+
+
+@pytest.mark.parametrize("path", REVIEWED_NEUTRAL_TESTS)
+@pytest.mark.parametrize("with_plugin", (False, True))
+def test_reviewed_neutral_tests_do_not_pull_extended_arm(path, with_plugin) -> None:
+    paths = [path]
+    if with_plugin:
+        paths.append("hermes-plugin/antigravity-acp/client.py")
+    scope = scope_mod.classify_paths(paths)
+    assert (scope.os_lanes, scope.extended_arm) == (with_plugin, False)
+    assert scope.unknown_paths == ()
+
+
+@pytest.mark.parametrize("path", (
+    "tests/test_registry.py",
+    "tests/test_official_install_integrity.py",
+    "tests/test_generic_install.py",
+    "tests/test_clean_env_e2e_smoke.py",
+    "tests/test_acp_interactive_login.py",
+    "tests/test_hosted_clean_room_ci.py",
+    "tests/test_mux_packaging.py",
+    "tests/test_acp_mux.py",
+    "tests/test_mux_wrapper.py",
+    "tests/test_ci_tier_contract.py",
+    "tests/test_unreviewed_regression.py",
+    "tests/nested/test_model_surface_selection.py",
+    "tests/fixtures/new-wire-payload.json",
+    "tests/conftest.py",
+    "tests/unreviewed.md",
+))
+def test_unreviewed_and_native_tests_keep_full_matrix(path) -> None:
+    scope = scope_mod.classify_paths([*REVIEWED_NEUTRAL_TESTS, path])
+    assert (scope.os_lanes, scope.extended_arm) == (True, True), path
+    assert path in scope.unknown_paths
+
+
+@pytest.mark.parametrize("path", (
+    "scripts/install_acp.py",
+    "scripts/install_official.py",
+    "scripts/install_mux.py",
+    "scripts/acp_mux.py",
+    "scripts/antigravity-acp-mux.py",
+    "scripts/antigravity-acp-mux",
+    "antigravity_acp/registry.py",  # version, platform map and publisher SHA-256
+    ".github/workflows/ci.yml",
+    ".python-version",
+    "pyproject.toml",
+    "unknown/new-file.py",
+))
+def test_sensitive_paths_widen_even_with_reviewed_tests(path) -> None:
+    scope = scope_mod.classify_paths([*REVIEWED_NEUTRAL_TESTS, path])
+    assert (scope.os_lanes, scope.extended_arm) == (True, True), path
+
+
+@pytest.mark.parametrize("operation", ("add", "modify", "delete", "rename", "move"))
+def test_reviewed_test_git_changes_classify_both_sides(tmp_path, operation) -> None:
+    repo = _make_scratch_repo(tmp_path)
+    reviewed = REVIEWED_NEUTRAL_TESTS[0]
+    (repo / "tests").mkdir()
+    if operation != "add":
+        (repo / reviewed).write_text("# reviewed neutral regression\n", encoding="utf-8")
+        import subprocess
+
+        subprocess.run(["git", "add", reviewed], cwd=repo, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-qm", "reviewed test base"],
+            cwd=repo, check=True, capture_output=True,
+        )
+
+    def mutate(repo_path):
+        source = repo_path / reviewed
+        if operation in ("add", "modify"):
+            source.write_text("# added neutral assertion\n", encoding="utf-8")
+        elif operation == "delete":
+            source.unlink()
+        elif operation == "rename":
+            source.rename(repo_path / "tests/test_unreviewed_name.py")
+        else:
+            (repo_path / "docs").mkdir()
+            source.rename(repo_path / "docs/moved-test.md")
+
+    paths = _repo_diff_paths(tmp_path, repo, mutate)
+    assert reviewed in paths
+    if operation == "rename":
+        assert "tests/test_unreviewed_name.py" in paths
+    if operation == "move":
+        assert "docs/moved-test.md" in paths
+    scope = scope_mod.classify_paths(paths)
+    assert (scope.os_lanes, scope.extended_arm) == (
+        (True, True) if operation == "rename" else (False, False)
+    )
+
+
+@pytest.mark.parametrize("missing", ("base", "head"))
+@pytest.mark.parametrize("bad", ("", "0" * 40, "not-a-sha", "f" * 40))
+def test_invalid_pr_commits_fail_closed(missing, bad) -> None:
+    env = {
+        "CI_EVENT": "pull_request",
+        "CI_BASE_SHA": "HEAD",
+        "CI_HEAD_SHA": "HEAD",
+    }
+    env[f"CI_{missing.upper()}_SHA"] = bad
+    scope = scope_mod.scope_for_event(env)
+    assert (scope.os_lanes, scope.extended_arm) == (True, True)
+    assert scope.reason == "detection-failed-missing-base"
+
+
+@pytest.mark.parametrize("error", (OSError, subprocess.CalledProcessError))
+def test_git_diff_errors_fail_closed(monkeypatch, error) -> None:
+    import subprocess
+
+    monkeypatch.setattr(scope_mod, "_commit_exists", lambda rev: True)
+
+    def broken_diff(*args):
+        if error is OSError:
+            raise OSError("git unavailable")
+        raise subprocess.CalledProcessError(128, "git diff")
+
+    monkeypatch.setattr(scope_mod, "_changed_files", broken_diff)
+    scope = scope_mod.scope_for_event({
+        "CI_EVENT": "pull_request", "CI_BASE_SHA": "base", "CI_HEAD_SHA": "head",
+    })
+    assert (scope.os_lanes, scope.extended_arm) == (True, True)
+    assert scope.reason == "detection-failed-git-error"
+
+
+@pytest.mark.parametrize("lane", ALL_LANES)
+@pytest.mark.parametrize("result", ("failure", "cancelled", "skipped", "missing"))
+def test_every_required_job_failure_is_fatal(lane, result) -> None:
+    results = _results(**{lane: result})
+    if result == "missing":
+        del results[lane]
+    ok, report = gate_mod.evaluate(FULL, results)
+    assert not ok, report
+
+
+def test_os_only_scope_accepts_only_the_two_unrequired_arm_skips() -> None:
+    expected = {"os_lanes": "true", "extended_arm": "false"}
+    results = _results(**{lane: "skipped" for lane in gate_mod.ARM_LANES})
+    assert gate_mod.evaluate(expected, results)[0]
+    for lane in gate_mod.OS_LANES:
+        assert not gate_mod.evaluate(expected, {**results, lane: {"result": "skipped"}})[0]
 
 
 # -- change classifier: widen-only ---------------------------------------
