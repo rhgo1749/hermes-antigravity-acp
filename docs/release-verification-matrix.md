@@ -78,7 +78,7 @@ SHA-256 **before extraction/execution**, not a redistributed GitHub asset.
 | Unauthenticated ACP initialize | R / real binary | R / real binary | R / real binary | R / real binary | R / real binary |
 | Error/timeout/permission denial | R / shared fake protocol | R / shared fake protocol | R / shared fake protocol | R / shared fake protocol | R / shared fake protocol |
 | Session resume/recovery | R / shared fake protocol | R / shared fake protocol | R / shared fake protocol | R / shared fake protocol | R / shared fake protocol |
-| Extra platform hardening | R / dedicated UID | O / owned process tree | O / NOT_RUN | O / NOT_RUN | O / NOT_RUN |
+| Extra platform hardening | R / dedicated UID | O / native synthetic-process tree | O / NOT_RUN | O / NOT_RUN | O / NOT_RUN |
 
 Historical statuses and citations are in the JSON. The first executed macOS
 and Linux aarch64 registration/factory evidence is run
@@ -94,7 +94,9 @@ PASS/FAIL status, not this historical table.
 integrity/initialize verification and owned removal, then requires every
 managed-state flag absent. Windows retains its actual `.cmd` installer,
 architecture/provider checks and restricted-environment initialize; x64
-also retains the #31 request-scoped cancel/process-tree regression. The
+also retains the #31 request-scoped cancel/process-tree regression. Its
+process-tree evidence executes the production teardown function on synthetic
+Python parent/grandchild processes, not a proprietary vendor-server tree. The
 POSIX provider/factory probe is shared with the Linux clean room. The
 clean-room driver remains separate because its dedicated UID and canary
 isolation assertions are stronger, not interchangeable OS adapters.

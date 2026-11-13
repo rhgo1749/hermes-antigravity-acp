@@ -22,6 +22,7 @@ EVIDENCE_CLASSES = frozenset(
         "official_binary_clean_room",
         "official_binary_hosted",
         "real_core_integration",
+        "native_process_tree",
         "fake_transport_protocol",
         "registry_pin_only",
         "not_executed",

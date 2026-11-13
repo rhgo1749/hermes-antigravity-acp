@@ -12,6 +12,7 @@
     "official_binary_clean_room": "Real official ACP binary executed in a dedicated-OS-UID GitHub-hosted clean room.",
     "official_binary_hosted": "Real official ACP binary executed on a native GitHub-hosted runner (no dedicated-UID isolation).",
     "real_core_integration": "Executed against an unmodified official Hermes Core checkout (strict seam or provider probe).",
+    "native_process_tree": "Real host-OS process teardown using synthetic Python parent/grandchild processes and the production plugin teardown function; NOT an official vendor-binary tree.",
     "fake_transport_protocol": "Deterministic credential-free fake-ACP protocol contract; OS-independent; never claims real-binary or vendor-auth behavior.",
     "registry_pin_only": "Publisher digest pinned in antigravity_acp/registry.py with no executed native lifecycle.",
     "not_executed": "No executed evidence exists in this repository's CI for this cell."
@@ -152,9 +153,9 @@
         "platform_security_hardening": {
           "required": false,
           "status": "PASS",
-          "evidence_class": "official_binary_hosted",
+          "evidence_class": "native_process_tree",
           "trigger": "ci_full_matrix",
-          "evidence": "issue #23 owned process-tree teardown verification (verify_process_tree_teardown.py) executed on the x64 lane"
+          "evidence": "issue #23 production teardown function verified on native Windows x64 against synthetic Python parent/grandchild processes (verify_process_tree_teardown.py), not a real vendor-server process tree"
         }
       }
     },

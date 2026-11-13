@@ -150,6 +150,12 @@ def test_matrix_target_set_drift_is_rejected(tmp_path) -> None:
         matrix_mod.load_matrix(_write_matrix(tmp_path, mutate))
 
 
+def test_windows_tree_evidence_is_not_mislabeled_as_vendor_binary(matrix) -> None:
+    cell = matrix.targets["windows-x64"]["platform_security_hardening"]
+    assert cell.evidence_class == "native_process_tree"
+    assert "synthetic Python" in cell.evidence
+
+
 def test_matrix_primary_lane_collision_is_rejected(tmp_path) -> None:
     def mutate(raw):
         raw["targets"][1]["lane"] = raw["targets"][0]["lane"]
