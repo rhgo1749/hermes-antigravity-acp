@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import os
+import re
 import subprocess
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -52,7 +53,7 @@ OS_TRIGGER_EXACT = (
 )
 
 # Packaging surface: the bytes/architecture selection itself. Only these
-# changes (or a manual dispatch / main push) pull the slow ARM lanes in.
+# changes (on PRs or main pushes), or manual dispatch, pull slow ARM lanes in.
 ARM_TRIGGER_EXACT = (
     "antigravity_acp/registry.py",
     "install-windows.cmd",
@@ -226,14 +227,62 @@ def _changed_files(base: str, head: str) -> list[str]:
     return [line for line in diff.stdout.splitlines() if line.strip()]
 
 
+def _push_git(*args: str) -> str:
+    """Bounded, literal argv; no revision expressions from the push payload."""
+    return subprocess.run(
+        ["git", *args], check=True, capture_output=True, timeout=45,
+    ).stdout.decode("utf-8")
+
+
+def _scope_for_push(env: Mapping[str, str]) -> Scope:
+    # GitHub push payload, not a PR base or HEAD^ approximation. Missing
+    # metadata must not silently acquire normal/false defaults.
+    if env.get("CI_PUSH_REF") != "refs/heads/main":
+        return Scope(True, True, "push-ref-fail-closed")
+    if any(env.get(key) != "false" for key in (
+        "CI_PUSH_FORCED", "CI_PUSH_CREATED", "CI_PUSH_DELETED",
+    )):
+        return Scope(True, True, "push-event-flags-fail-closed")
+    before, after = env.get("CI_BEFORE_SHA", ""), env.get("CI_AFTER_SHA", "")
+    if not all(isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{40}", sha)
+               and sha != "0" * 40 for sha in (before, after)):
+        return Scope(True, True, "push-endpoints-fail-closed")
+    if env.get("CI_EXECUTION_SHA") != after:
+        return Scope(True, True, "push-execution-sha-fail-closed")
+    try:
+        if _push_git("rev-parse", "HEAD").strip() != after:
+            return Scope(True, True, "push-checkout-sha-fail-closed")
+        if _push_git("rev-parse", "--is-shallow-repository").strip() != "false":
+            return Scope(True, True, "push-shallow-history-fail-closed")
+        for sha in (before, after):
+            if _push_git("cat-file", "-t", sha).strip() != "commit":
+                return Scope(True, True, "push-non-commit-endpoint-fail-closed")
+        # A false payload forced flag is insufficient: prove the graph too.
+        ancestor = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", before, after],
+            check=False, capture_output=True, timeout=45,
+        )
+        if ancestor.returncode == 1:
+            return Scope(True, True, "push-non-fast-forward-fail-closed")
+        ancestor.check_returncode()
+        # Two endpoints, not PR's three-dot merge base. All commits since
+        # before are covered, even a multi-commit/merge push whose final
+        # commit touched only docs. --no-renames exposes both move sides;
+        # -z preserves spaces, Unicode and embedded newlines literally.
+        raw = _push_git("diff", "--no-renames", "--name-only", "-z", before, after, "--")
+        if raw and (not raw.endswith("\0") or "" in raw[:-1].split("\0")):
+            raise ValueError("invalid NUL-delimited diff")
+        return classify_paths(raw[:-1].split("\0") if raw else [])
+    except (OSError, subprocess.SubprocessError, UnicodeError, ValueError):
+        return Scope(True, True, "detection-failed-git-error")
+
+
 def scope_for_event(env: Mapping[str, str]) -> Scope:
     event = env.get("CI_EVENT", "")
     if event == "workflow_dispatch":
         return Scope(True, True, "workflow-dispatch-full-matrix")
     if event == "push":
-        # Every main push is the post-merge full-audit run that release
-        # trust is built on; it never narrows.
-        return Scope(True, True, "post-merge-full-audit")
+        return _scope_for_push(env)
     if event == "pull_request":
         base = env.get("CI_BASE_SHA", "")
         head = env.get("CI_HEAD_SHA", "")
