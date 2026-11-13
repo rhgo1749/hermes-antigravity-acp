@@ -1,101 +1,134 @@
-# Release verification matrix (issue #28 Phase B)
+# Cross-platform release verification (Issue #28 Phase B)
 
-This is the version-controlled contract for what a release candidate of
-this plugin must prove on each native target before it may be published.
-The machine-readable source of truth is
-[`release/verification-matrix.json`](../release/verification-matrix.json);
-this page explains the stages and records the honest current status. The
-enforcement is `scripts/release_gate_check.py` wired as the conditional
-`Release gate` job in `.github/workflows/ci.yml` — not a manual checklist.
+The existing `.github/workflows/ci.yml` owns both ordinary CI and candidate
+verification. There is no second native matrix or publishing workflow.
+`release/verification-matrix.json` versions the five targets, eight stages,
+required/optional flags, evidence classes and historical coverage snapshot.
+**The snapshot is not approval of a new SHA.** Only a fresh `Release gate`
+result and its run-bound JSON artifact certify the candidate under test.
 
-## How release verification runs
+## Exact-SHA enforced path
 
-1. Cut nothing yet: pick the exact candidate commit SHA on `main`
-   (full 40 hex).
-2. `gh workflow run ci.yml -f candidate_sha=<sha>` — every lane checks
-   out exactly that SHA and refuses to run on anything else.
-3. `candidate-identity` binds the candidate to the remote history
-   (object exists, reachable from a branch, relation to current `main`
-   head).
-4. Each evidence lane attests its own `git rev-parse HEAD` plus the list
-   of matrix stages its steps actually executed.
-5. `Release gate` fails closed unless every required target×stage cell is
-   attested by a *successful* lane at *exactly* the candidate SHA.
+Dispatch against the branch whose current HEAD is the candidate. For example,
+from the clean, already-pushed candidate checkout:
 
-The gate blocks, at minimum:
+```bash
+branch=$(git branch --show-current)
+candidate=$(git rev-parse HEAD)
+test -n "$branch" &&
+  gh workflow run ci.yml --repo rhgo1749/hermes-antigravity-acp \
+    --ref "$branch" -f "candidate_sha=$candidate"
+```
 
-- evidence from any other SHA (attested HEAD ≠ candidate);
-- a required lane that failed, was cancelled, was skipped, or never
-  reported;
-- a lane that stopped running a stage while still claiming it (the
-  drift guard in `tests/test_release_gate_contract.py` ties each
-  attestation string to the command fragments in the same lane block);
-- an optional lane's success substituting a required cell (coverage is
-  evaluated per covering lane, never globally);
-- partial-platform aggregation (every required cell is checked
-  individually; one FAIL is the whole verdict FAIL);
-- unknown job names or malformed inputs (fail closed, no defaults).
+The same existing workflow runs the full native matrix on dispatch. It never
+creates a tag, release or deployment. An omitted `candidate_sha` means a normal
+full-matrix diagnostic dispatch, **not** release approval.
 
-The gate does NOT auto-tag or publish. Publication remains the existing
-manual `publication-gate.yml` + `scripts/publication_gate.py` flow; the
-tag-time policy should require that a `Release gate` PASS exists for the
-exact tag SHA (that policy lives outside this repo's control and is a
-maintainer step).
+1. Every checkout pins `github.sha`, never an independently supplied commit.
+   The common `candidate_identity.py --attest-checkout` driver checks the
+   actual checkout against the candidate **and** the Actions execution SHA.
+   A bad candidate fails change-scope before native lanes are selected.
+2. `Candidate identity` additionally validates full lowercase 40-hex syntax,
+   remote commit/tree provenance and the exact advertised `github.ref` branch
+   HEAD. A reachable ancestor is insufficient. Tags are not candidate branches.
+3. All eight test lanes attest their tested SHA after successful execution;
+   native/protocol lanes also attest their own stages. `needs` is from this
+   workflow execution, not an API search for an older green run.
+4. `Release gate` waits for the existing `CI gate`, identity, scope and all
+   test lanes. Missing, pending, failed, cancelled, skipped, unknown or
+   wrong-SHA required evidence fails closed. An optional PASS cannot fill a
+   required cell owned by another lane.
+5. At the end the gate independently checks its checkout, `GITHUB_SHA`,
+   `GITHUB_WORKFLOW_SHA` and a fresh remote branch HEAD against the candidate.
+   Movement of the selected branch fails even if every platform passed.
+   A PASS produces `release-verification-RUN_ID-ATTEMPT`, containing the SHA,
+   tree, start/end identity, repository/run/attempt/workflow provenance,
+   matrix SHA-256, job conclusions and all forty per-target stage results.
+   The uploader runs only after successful verification; missing output is
+   an error. Artifacts are retained for 30 days.
 
-## Stages
+Branch protection's ordinary check remains `CI gate`; `Release gate` is
+intentionally dispatch-only. A normal PR's Actions SHA can be a synthetic
+merge commit, so its green native jobs are **not** substituted for the exact
+PR HEAD dispatch. Branch movement after certification also invalidates use of
+that result for a different candidate: a later publishing integration must
+consume the recorded exact SHA and revalidate its current target.
 
-| stage | meaning |
-| --- | --- |
-| `binary_publisher_pin_sha256` | the official GitHub Release asset is fetched and its SHA-256 equals the pinned value before anything executes |
-| `install_status_verify_uninstall` | real installer `install` → `status` → `verify` → `--verify-only` → `--uninstall` against a throwaway Hermes home |
-| `provider_registration_enabled` | `antigravity-acp` appears in `hermes plugins list` as enabled in a clean Hermes home |
-| `provider_selection_factory` | the provider is selectable and the factory constructs the ACP-backed provider (clean-room probe) |
-| `acp_initialize_unauthenticated` | ACP `initialize` round-trip against the real binary with no account credentials |
-| `platform_security_hardening` | target-specific hardening evidence (clean-UID child / process-tree teardown on Windows) |
-| `error_timeout_permission_failclosed` | protocol-level error, timeout, and permission-denied paths fail closed |
-| `session_resume_recovery` | session resume/recovery semantics hold |
+### Existing publication gate: separate responsibility
 
-The last two are protocol-level: they are verified once on the shared
-fake-ACP harness (`fake-acp` lane) and recorded per target as
-`shared_with: fake-acp`. They are not re-executed per OS, and the matrix
-says so explicitly rather than pretending otherwise.
+This repository has **no `publication-gate.yml` or release/tag publisher**.
+`scripts/publication_gate.py` is the existing privacy/exposure and explicit
+human-authorization gate; it is not a native-platform result aggregator and
+is preserved unchanged. Neither a privacy decision nor a candidate PASS
+supplies the other's authorization. Phase B implements executable CI candidate
+certification, not a new publisher or permission to bypass maintainer review.
 
-## Current honest status (2026-11-13, pre-first-hosted-run)
+## Platform contract and honest evidence boundaries
 
-Evidence class per cell lives in the JSON; this table mirrors it.
+R = required; O = optional. Binary/native evidence executes the official
+Google CDN distribution under `antigravity_acp/registry.py`'s publisher
+SHA-256 **before extraction/execution**, not a redistributed GitHub asset.
 
-| target | binary pin | install/verify | provider reg | selection/factory | initialize | hardening | error/timeout | resume |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| linux-x64 | PASS | PASS | PASS | PASS | PASS | PASS | PASS¹ | PASS¹ |
-| windows-x64 | PASS | PASS | PASS | **NOT_RUN** | PASS | PASS | PASS¹ | PASS¹ |
-| windows-arm64 | PASS | PASS | PASS | **NOT_RUN** | PASS | **BLOCKED** | PASS¹ | PASS¹ |
-| macos-arm64 | PASS | PASS | **BLOCKED²** | **BLOCKED²** | **BLOCKED²** | **BLOCKED** | PASS¹ | PASS¹ |
-| linux-aarch64 | PASS | PASS | **BLOCKED²** | **BLOCKED²** | **BLOCKED²** | **BLOCKED** | PASS¹ | PASS¹ |
+| Stage | Linux x86_64 | Windows x64 | Windows ARM64 | macOS ARM64 | Linux aarch64 |
+|---|---|---|---|---|---|
+| Publisher pin + SHA-256 | R / real binary | R / real binary | R / real binary | R / real binary | R / real binary |
+| Install/status/verify/remove/absence | R / clean-room driver | R / common lifecycle | R / common lifecycle | R / common lifecycle | R / common lifecycle |
+| Provider registered/enabled | R / real Core | R / real Core CLI | R / real Core CLI | R / real Core | R / real Core |
+| Provider selection + factory | R / real Core | O / NOT_RUN | O / NOT_RUN | R / real Core | R / real Core |
+| Unauthenticated ACP initialize | R / real binary | R / real binary | R / real binary | R / real binary | R / real binary |
+| Error/timeout/permission denial | R / shared fake protocol | R / shared fake protocol | R / shared fake protocol | R / shared fake protocol | R / shared fake protocol |
+| Session resume/recovery | R / shared fake protocol | R / shared fake protocol | R / shared fake protocol | R / shared fake protocol | R / shared fake protocol |
+| Extra platform hardening | R / dedicated UID | O / owned process tree | O / NOT_RUN | O / NOT_RUN | O / NOT_RUN |
 
-¹ shared protocol-level evidence from the `fake-acp` lane.
+Historical statuses and citations are in the JSON. The first executed macOS
+and Linux aarch64 registration/factory evidence is run
+[43321929587](https://github.com/rhgo1749/hermes-antigravity-acp/actions/runs/43321929587)
+at `93db79996c56f6c1455b25ec29fea54bbc86c558`; it is a baseline, not approval
+of subsequent commits. Previous Windows jobs did **not** execute removal;
+that full-stage snapshot stays BLOCKED pending the new common driver's
+execution. The required stage cannot be approved without fresh successful
+same-SHA attestation. Read the dispatch artifact for the actual candidate's
+PASS/FAIL status, not this historical table.
 
-² These hosted lanes (macOS ARM64, Linux aarch64 provider registration,
-selection/factory probe, and `initialize`) are introduced by this Phase B
-change and have not executed on GitHub-hosted runners yet. They stay
-BLOCKED with `evidence_class: not_executed` until a real run URL exists;
-the first green hosted run at a candidate SHA flips them to PASS with the
-run cited in the JSON. Until then the README's platform-support claims
-stay limited to what is proven.
+`scripts/ci_provider_lifecycle.py` reuses the public installer's status,
+integrity/initialize verification and owned removal, then requires every
+managed-state flag absent. Windows retains its actual `.cmd` installer,
+architecture/provider checks and restricted-environment initialize; x64
+also retains the #31 request-scoped cancel/process-tree regression. The
+POSIX provider/factory probe is shared with the Linux clean room. The
+clean-room driver remains separate because its dedicated UID and canary
+isolation assertions are stronger, not interchangeable OS adapters.
 
-Remaining known limitations:
+The fake-protocol stages execute once on Linux, not once per native OS.
+They do not prove OS-native authenticated resume, vendor recovery, auth
+success or inference. Windows selection/factory remains unverified because
+the real-Core probe assumes POSIX UID/launcher semantics. macOS and Linux
+ARM now have real-Core registration/factory evidence, but not dedicated-UID
+isolation. No lane claims live-account validation or authenticated inference.
+Latest upstream Hermes `main` and minimum `v0.21.6` strict seams remain
+required; the native probe's reviewed Core commit pin is preserved.
 
-- Windows x64/arm64 `provider_selection_factory`: the hosted Windows
-  lanes have no Hermes provider selection UI; the clean-room probe is
-  Linux-only. NOT_RUN, optional.
-- `platform_security_hardening` beyond the Windows process-tree teardown
-  and the clean-UID child: no target-specific harness yet. BLOCKED,
-  optional.
-- `session_resume_recovery` per-OS with the real binary: only the
-  shared fake-ACP protocol evidence exists.
+## Tests, cost and the subsequent main-push change
 
-## What Phase B does and does not change for day-to-day CI
+Auto-discovered pytest covers wrong/missing SHA, pending/missing/cancelled/
+skipped/failed jobs, optional substitution, malformed records, actual scratch
+remote HEAD movement with a still-pinned checkout, historical-vs-run status,
+and the real shared attestation CLI. RED receipts for the previously accepted
+identity substitutions and missing lifecycle wiring are retained with PR
+verification evidence. Publisher pins and all existing cancel/security tests
+are unchanged.
 
-Phase B adds a dispatch-only verification path. It does not shorten the
-normal `main` push pipeline; that reduction is the separate Phase A
-follow-up PR gated on this phase's evidence (see
-[`ci-cost-phase-b.md`](ci-cost-phase-b.md)).
+Phase B **does not reduce main CI time**. Main pushes and dispatches still
+force all native lanes. PR Fast/OS/ARM classification remains Phase A's
+conservative policy; unknown changes still widen to the full matrix.
+Measured Actions records, queue/runner definitions and estimated-vs-measured
+boundaries are documented in [ci-cost-phase-b.md](ci-cost-phase-b.md).
+
+Only after independent verification of this gate may a separate Phase A
+follow-up change `ci_change_scope.py::scope_for_event`'s push policy and its
+workflow/contract tests: routine main push = Fast + risk-required OS;
+packaging/architecture = affected full native coverage; unknown/detection
+failure = full coverage; release dispatch = all five exact-SHA targets.
+That follow-up must retain publisher checks, Windows ARM installation,
+latest/minimum strict seams, pytest discovery, #31 regressions and both
+fail-closed gates, then measure the resulting ordinary-main savings.

@@ -158,6 +158,13 @@ def test_matrix_primary_lane_collision_is_rejected(tmp_path) -> None:
         matrix_mod.load_matrix(_write_matrix(tmp_path, mutate))
 
 
+def test_matrix_rejects_forward_reference_to_another_targets_native_lane(tmp_path) -> None:
+    def mutate(raw):
+        raw["targets"][0]["stages"]["binary_publisher_pin_sha256"]["lane"] = "linux-aarch64"
+    with pytest.raises(matrix_mod.MatrixError, match="owned by another target"):
+        matrix_mod.load_matrix(_write_matrix(tmp_path, mutate))
+
+
 def test_matrix_unknown_status_is_rejected(tmp_path) -> None:
     def mutate(raw):
         raw["targets"][0]["stages"]["acp_initialize_unauthenticated"]["status"] = "GREEN"
@@ -177,6 +184,11 @@ def _identity(**overrides) -> dict:
         "candidate_on_main": "true",
         "candidate_is_main_head": "true",
         "candidate_reachable": "true",
+        "github_sha": CANDIDATE,
+        "checkout_sha": CANDIDATE,
+        "target_ref": "refs/heads/candidate",
+        "ref_head_start": CANDIDATE,
+        "ref_head_end": CANDIDATE,
     }
     base.update(overrides)
     return base
@@ -185,6 +197,7 @@ def _identity(**overrides) -> dict:
 def _results(matrix, *, candidate=CANDIDATE, **overrides) -> dict:
     results: dict = {
         "change-scope": {"result": "success"},
+        "ci-gate": {"result": "success"},
         "candidate-identity": {"result": "success", "outputs": _identity()},
     }
     for lane in matrix.lanes:
@@ -317,6 +330,22 @@ def test_gate_other_lanes_cannot_substitute_a_missing_required_stage(matrix) -> 
     assert any("windows-x64" in line and line.startswith("FAIL") for line in report2)
 
 
+@pytest.mark.parametrize("bad", (None, [], "success", 1, True))
+def test_gate_rejects_malformed_required_job_without_raising(matrix, bad) -> None:
+    results = _results(matrix)
+    results["windows-arm64"] = bad
+    ok, _ = gate_mod.evaluate(CANDIDATE, _identity(), results, matrix)
+    assert not ok
+
+
+@pytest.mark.parametrize("bad", (None, [], "stages", 1, True))
+def test_gate_rejects_malformed_attestation_without_raising(matrix, bad) -> None:
+    results = _results(matrix)
+    results["windows-arm64"]["outputs"] = bad
+    ok, _ = gate_mod.evaluate(CANDIDATE, _identity(), results, matrix)
+    assert not ok
+
+
 def test_gate_fails_on_unknown_job_wired_into_the_release_gate(matrix) -> None:
     for result in ("success", "failure", "skipped"):
         results = _results(matrix, **{"synth-unknown": {"result": result}})
@@ -345,6 +374,22 @@ def test_gate_fails_when_identity_job_failed(matrix) -> None:
     assert not ok
 
 
+@pytest.mark.parametrize("field", ("github_sha", "checkout_sha", "ref_head_start", "ref_head_end"))
+@pytest.mark.parametrize("bad", (OTHER_SHA, "", None))
+def test_gate_rejects_run_checkout_or_branch_head_substitution(matrix, field, bad) -> None:
+    identity = _identity(**{field: bad})
+    ok, report = gate_mod.evaluate(CANDIDATE, identity, _results(matrix), matrix)
+    assert not ok, (field, bad, report)
+
+
+@pytest.mark.parametrize("target_ref", ("", None, "refs/tags/v1", "refs/heads/"))
+def test_gate_rejects_missing_or_non_branch_candidate_ref(matrix, target_ref) -> None:
+    ok, report = gate_mod.evaluate(
+        CANDIDATE, _identity(target_ref=target_ref), _results(matrix), matrix
+    )
+    assert not ok, report
+
+
 def test_gate_reports_optional_gaps_without_counting_them_green(matrix) -> None:
     ok, report = gate_mod.evaluate(CANDIDATE, _identity(), _results(matrix), matrix)
     assert ok
@@ -365,10 +410,25 @@ def test_gate_notes_non_main_head_candidate_without_silently_passing_it(matrix) 
         _results(matrix),
         matrix,
     )
-    # The SHA binding itself is what this gate certifies; the main-head
-    # freshness binding is recorded for the tag-time policy, loudly.
+    # A candidate may be the current HEAD of a release/feature branch.
+    # Unrelated main movement is metadata, not movement of that target ref.
     assert ok
     assert any("not the current main head" in line for line in report)
+
+
+@pytest.fixture
+def cli_context(monkeypatch):
+    # Only the Git/GitHub boundary is replaced; the CLI, matrix and evaluator
+    # execute for real. Separate scratch-remote tests exercise the boundary.
+    for key, value in {
+        "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_SHA": CANDIDATE,
+        "GITHUB_WORKFLOW_SHA": CANDIDATE, "GITHUB_REF": "refs/heads/candidate",
+        "GITHUB_RUN_ID": "42", "GITHUB_RUN_ATTEMPT": "1",
+        "GITHUB_REPOSITORY": "example/project",
+        "GITHUB_WORKFLOW_REF": "example/project/.github/workflows/ci.yml@refs/heads/candidate",
+    }.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(gate_mod, "resolve_release_identity", lambda *a, **kw: _identity())
 
 
 def test_gate_cli_fails_closed_on_malformed_input(tmp_path, matrix) -> None:
@@ -383,7 +443,7 @@ def test_gate_cli_fails_closed_on_malformed_input(tmp_path, matrix) -> None:
     assert code == 1
 
 
-def test_gate_cli_end_to_end_verdict(tmp_path, capsys) -> None:
+def test_gate_cli_end_to_end_verdict(tmp_path, capsys, cli_context) -> None:
     summary = tmp_path / "summary.md"
     matrix = matrix_mod.load_matrix(MATRIX_PATH)
     code = gate_mod.main(
@@ -402,7 +462,7 @@ def test_gate_cli_end_to_end_verdict(tmp_path, capsys) -> None:
     assert "verdict: FAIL" in summary.read_text(encoding="utf-8")
 
 
-def test_gate_cli_passes_for_full_attestation(capsys) -> None:
+def test_gate_cli_passes_for_full_attestation(capsys, cli_context) -> None:
     matrix = matrix_mod.load_matrix(MATRIX_PATH)
     code = gate_mod.main(
         [
@@ -497,6 +557,114 @@ def test_identity_rejects_unpushed_local_commit(tmp_path) -> None:
         identity_mod.resolve_identity(local_sha, remote=str(remote), cwd=work)
 
 
+def test_release_identity_binds_run_checkout_and_advertised_branch(tmp_path) -> None:
+    remote, work, sha = _make_scratch_remote(tmp_path)
+    identity = identity_mod.resolve_release_identity(
+        sha, sha, "refs/heads/main", remote=str(remote), cwd=work
+    )
+    assert identity["github_sha"] == identity["checkout_sha"] == sha
+    assert identity["ref_head_start"] == sha
+    assert identity["target_ref"] == "refs/heads/main"
+
+
+def test_release_identity_rejects_remote_head_movement_with_checkout_still_pinned(tmp_path) -> None:
+    remote, work, sha = _make_scratch_remote(tmp_path)
+    identity_mod.resolve_release_identity(sha, sha, "refs/heads/main", remote=str(remote), cwd=work)
+    (work / "next.md").write_text("# moved branch\n", encoding="utf-8")
+    for args in (
+        ["add", "next.md"], ["commit", "-qm", "advance candidate branch"],
+        ["push", "-q", "origin", "HEAD:refs/heads/main"], ["checkout", "-q", "--detach", sha],
+    ):
+        subprocess.run(["git", *args], cwd=work, check=True, capture_output=True)
+    # The old candidate remains published and reachable; that alone is NOT
+    # a freshness proof. Actions SHA and the checkout are still the old SHA.
+    assert identity_mod.resolve_identity(sha, remote=str(remote), cwd=work)["candidate_reachable"] == "true"
+    with pytest.raises(identity_mod.IdentityError, match="branch HEAD moved"):
+        identity_mod.resolve_release_identity(sha, sha, "refs/heads/main", remote=str(remote), cwd=work)
+
+
+@pytest.mark.parametrize("bad", (CANDIDATE.upper(), " " + CANDIDATE, CANDIDATE + "\n", "main"))
+def test_release_identity_rejects_malformed_tokens_before_any_git_lookup(monkeypatch, bad) -> None:
+    def forbidden_git(*args, **kwargs):
+        pytest.fail("malformed SHA must be rejected before Git lookup")
+    monkeypatch.setattr(identity_mod, "_git", forbidden_git)
+    with pytest.raises(identity_mod.IdentityError):
+        identity_mod.attest_checkout(bad, bad)
+
+
+def test_release_identity_rejects_other_actions_sha_before_git_lookup(monkeypatch) -> None:
+    def forbidden_git(*args, **kwargs):
+        pytest.fail("wrong Actions SHA must be rejected before Git lookup")
+    monkeypatch.setattr(identity_mod, "_git", forbidden_git)
+    with pytest.raises(identity_mod.IdentityError, match="execution SHA"):
+        identity_mod.attest_checkout(CANDIDATE, OTHER_SHA)
+
+
+def test_release_identity_rejects_actual_checkout_substitution(tmp_path) -> None:
+    _, work, _ = _make_scratch_remote(tmp_path)
+    with pytest.raises(identity_mod.IdentityError, match="actual checkout SHA"):
+        identity_mod.attest_checkout(OTHER_SHA, OTHER_SHA, cwd=work)
+
+
+def test_release_identity_rejects_dirty_tracked_checkout(tmp_path) -> None:
+    _, work, sha = _make_scratch_remote(tmp_path)
+    (work / "README.md").write_text("not the candidate bytes\n", encoding="utf-8")
+    with pytest.raises(identity_mod.IdentityError):
+        identity_mod.attest_checkout(sha, sha, cwd=work)
+
+
+def test_shared_attestation_driver_executes_against_real_checkout(tmp_path, monkeypatch) -> None:
+    _, work, sha = _make_scratch_remote(tmp_path)
+    output = tmp_path / "outputs"
+    monkeypatch.setenv("CANDIDATE_SHA", sha)
+    monkeypatch.setenv("GITHUB_SHA", sha)
+    monkeypatch.setenv("ATTESTED_STAGES", "acp_initialize_unauthenticated")
+    code = identity_mod.main(["--attest-checkout", "--cwd", str(work), "--output", str(output)])
+    assert code == 0
+    assert output.read_text(encoding="utf-8").splitlines() == [
+        f"sha={sha}", "stages=acp_initialize_unauthenticated"
+    ]
+
+
+@pytest.mark.parametrize("lane", ("change-scope", "ci-gate", "candidate-identity"))
+@pytest.mark.parametrize("state", ("failure", "cancelled", "skipped", "in_progress", None))
+def test_release_gate_rejects_unsuccessful_control_jobs(matrix, lane, state) -> None:
+    ok, report = gate_mod.evaluate(CANDIDATE, _identity(), _results(matrix, **{lane: state}), matrix)
+    assert not ok, report
+
+
+def test_release_gate_writes_run_bound_evidence_not_historical_optional_pass(tmp_path, cli_context) -> None:
+    evidence = tmp_path / "evidence.json"
+    matrix = matrix_mod.load_matrix(MATRIX_PATH)
+    code = gate_mod.main([
+        "--candidate-sha", CANDIDATE, "--identity-json", json.dumps(_identity()),
+        "--results-json", json.dumps(_results(matrix)), "--matrix", str(MATRIX_PATH),
+        "--evidence-output", str(evidence),
+    ])
+    assert code == 0
+    record = json.loads(evidence.read_text(encoding="utf-8"))
+    assert record["candidate_sha"] == record["workflow_sha"] == CANDIDATE
+    assert record["run_id"] == "42" and record["run_attempt"] == "1"
+    assert len(record["platform_checks"]) == 40
+    assert all(cell["status"] == "PASS" for cell in record["platform_checks"] if cell["required"])
+    security = next(cell for cell in record["platform_checks"] if cell["target"] == "windows-x64" and cell["stage"] == "platform_security_hardening")
+    assert security["status"] == "NOT_RUN"  # fixture did not attest this optional stage
+
+
+@pytest.mark.parametrize("field", ("GITHUB_EVENT_NAME", "GITHUB_WORKFLOW_SHA", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT"))
+def test_release_cli_cannot_approve_outside_bound_actions_context(tmp_path, monkeypatch, cli_context, field) -> None:
+    monkeypatch.delenv(field)
+    evidence = tmp_path / "must-not-exist.json"
+    matrix = matrix_mod.load_matrix(MATRIX_PATH)
+    code = gate_mod.main([
+        "--candidate-sha", CANDIDATE, "--identity-json", json.dumps(_identity()),
+        "--results-json", json.dumps(_results(matrix)), "--matrix", str(MATRIX_PATH),
+        "--evidence-output", str(evidence),
+    ])
+    assert code == 1
+    assert not evidence.exists()
+
+
 # -- workflow wiring: candidate pinning, attestation, release gate ----------
 
 
@@ -521,7 +689,7 @@ def test_release_gate_job_wiring(ci: str) -> None:
     assert listed == {
         "candidate-identity", "change-scope", "fake-acp", "acp-clean-room",
         "windows-x64", "windows-arm64", "macos-arm64", "linux-aarch64",
-        "upstream-hermes-compat", "catalog-floor-gate",
+        "upstream-hermes-compat", "catalog-floor-gate", "ci-gate",
     }, listed
     assert "if: always() && github.event_name == 'workflow_dispatch' && inputs.candidate_sha != ''" in block
     assert "scripts/release_gate_check.py" in block
@@ -545,7 +713,7 @@ LANE_JOBS = (
 @pytest.mark.parametrize("job_id", LANE_JOBS)
 def test_every_lane_checkout_is_pinned_to_the_candidate(ci, job_id) -> None:
     block = _job_block(ci, job_id)
-    assert "ref: ${{ inputs.candidate_sha || github.sha }}" in block, job_id
+    assert "ref: ${{ github.sha }}" in block, job_id
 
 
 @pytest.mark.parametrize("job_id", LANE_JOBS)
@@ -554,8 +722,8 @@ def test_every_attesting_lane_compares_its_head_to_the_candidate(ci, job_id) -> 
         pytest.skip("change-scope pins its checkout but is not a release evidence lane")
     block = _job_block(ci, job_id)
     assert "id: attest" in block
-    assert "git rev-parse HEAD" in block
-    assert "!= candidate" in block or "ne $env:CANDIDATE_SHA" in block
+    assert "run: python scripts/candidate_identity.py --attest-checkout" in block
+    assert "CANDIDATE_SHA: ${{ inputs.candidate_sha || github.sha }}" in block
 
 
 # Drift guard: the stages a lane ATTESTS in the workflow must equal the
@@ -573,10 +741,10 @@ STAGE_IMPLEMENTATION_FRAGMENTS = {
     },
     "install_status_verify_uninstall": {
         "acp-clean-room": "hosted_clean_room_ci.py",
-        "windows-x64": "install-windows.cmd",
-        "windows-arm64": "install-windows.cmd",
-        "macos-arm64": "--uninstall",
-        "linux-aarch64": "--uninstall",
+        "windows-x64": "scripts/ci_provider_lifecycle.py",
+        "windows-arm64": "scripts/ci_provider_lifecycle.py",
+        "macos-arm64": "scripts/ci_provider_lifecycle.py",
+        "linux-aarch64": "scripts/ci_provider_lifecycle.py",
     },
     "provider_registration_enabled": {
         "acp-clean-room": "hosted_clean_room_ci.py",
@@ -607,7 +775,7 @@ STAGE_IMPLEMENTATION_FRAGMENTS = {
 
 
 def _attested_stages_in_block(block: str) -> set[str]:
-    match = re.search(r'stages=([a-z0-9_,]+)"', block)
+    match = re.search(r'ATTESTED_STAGES: "([a-z0-9_,]+)"', block)
     assert match, "lane attest step must emit its stage list"
     return set(match.group(1).split(","))
 
@@ -629,6 +797,13 @@ def test_lane_attested_stages_match_the_matrix_and_its_own_steps(ci, matrix, lan
         fragment = STAGE_IMPLEMENTATION_FRAGMENTS.get(stage, {}).get(lane)
         assert fragment, (lane, stage)
         assert fragment in block, f"{lane} attests {stage} but no longer runs {fragment!r}"
+
+
+@pytest.mark.parametrize("lane", ("windows-x64", "windows-arm64", "macos-arm64", "linux-aarch64"))
+def test_native_provider_lifecycle_uses_shared_verified_removal_driver(ci, lane) -> None:
+    block = _job_block(ci, lane)
+    assert "scripts/ci_provider_lifecycle.py" in block
+    assert block.index("scripts/ci_provider_lifecycle.py") < block.index("id: attest")
 
 
 def test_fake_acp_attests_the_protocol_stages(ci, matrix) -> None:
@@ -669,6 +844,11 @@ def test_release_control_scripts_are_reviewed_non_packaging(path) -> None:
     scope = scope_mod.classify_paths([path])
     assert (scope.os_lanes, scope.extended_arm) == (True, False), path
     assert scope.unknown_paths == ()
+
+
+def test_new_native_lifecycle_driver_fails_closed_to_full_matrix() -> None:
+    scope = scope_mod.classify_paths(["scripts/ci_provider_lifecycle.py"])
+    assert (scope.os_lanes, scope.extended_arm) == (True, True)
 
 
 def test_matrix_file_edits_fail_closed_to_full_matrix() -> None:

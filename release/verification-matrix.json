@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "issue": "https://github.com/rhgo1749/hermes-antigravity-acp/issues/28",
-  "description": "Version-controlled release verification matrix (issue #28 Phase B). One entry per declared native target x verification stage. `required` entries must be attested by the named lane at the exact release-candidate SHA before scripts/release_gate_check.py may certify a release candidate. `status` records the CURRENT executed state of this repository's CI: PASS only when a cited executed lane covers it; BLOCKED/NOT_RUN are never green. Optional PASS entries are reported but never substitute for a required gap.",
+  "description": "Version-controlled five-target x eight-stage verification contract. status is a historical evidence snapshot, NOT approval of a new candidate. Each dispatch starts unverified and scripts/release_gate_check.py derives a fresh run-bound result from successful same-run needs, exact Actions/checkout/candidate SHA and start/end branch checks. Required BLOCKED snapshot cells must still execute and attest their stages; historical or optional PASS never substitutes for current required evidence.",
   "status_values": [
     "PASS",
     "FAIL",
@@ -106,15 +106,16 @@
         },
         "install_status_verify_uninstall": {
           "required": true,
-          "status": "PASS",
+          "status": "BLOCKED",
           "evidence_class": "official_binary_hosted",
           "trigger": "ci_full_matrix",
-          "evidence": "actual Windows installer executed; install_acp.py verify lifecycle"
+          "evidence": "Actual install-windows.cmd remains required; scripts/ci_provider_lifecycle.py adds status -> verify -> delete -> explicit absence assertions before attestation.",
+          "limitation": "Prior hosted Windows evidence covered install/registration/initialize, not the full removal stage. New shared lifecycle is required; its first exact-SHA dispatch result is authoritative, never this historical snapshot."
         },
         "provider_registration_enabled": {
           "required": true,
           "status": "PASS",
-          "evidence_class": "official_binary_hosted",
+          "evidence_class": "real_core_integration",
           "trigger": "ci_full_matrix",
           "evidence": "hermes plugins list enabled antigravity-acp-provider assertion"
         },
@@ -171,15 +172,16 @@
         },
         "install_status_verify_uninstall": {
           "required": true,
-          "status": "PASS",
+          "status": "BLOCKED",
           "evidence_class": "official_binary_hosted",
           "trigger": "ci_full_matrix",
-          "evidence": "actual Windows installer executed on windows-11-arm"
+          "evidence": "Actual install-windows.cmd remains required; scripts/ci_provider_lifecycle.py adds status -> verify -> delete -> explicit absence assertions before attestation.",
+          "limitation": "Prior hosted Windows evidence covered install/registration/initialize, not the full removal stage. New shared lifecycle is required; its first exact-SHA dispatch result is authoritative, never this historical snapshot."
         },
         "provider_registration_enabled": {
           "required": true,
           "status": "PASS",
-          "evidence_class": "official_binary_hosted",
+          "evidence_class": "real_core_integration",
           "trigger": "ci_full_matrix",
           "evidence": "hermes plugins list enabled antigravity-acp-provider assertion"
         },
@@ -243,19 +245,17 @@
         },
         "provider_registration_enabled": {
           "required": true,
-          "status": "BLOCKED",
-          "evidence_class": "not_executed",
+          "status": "PASS",
+          "evidence_class": "real_core_integration",
           "trigger": "ci_full_matrix",
-          "evidence": "install_acp.py install + clean_room_provider_probe.py served_from_hermes_home on macos-15 at pinned HERMES_CORE_REF (issue #28 Phase B)",
-          "limitation": "Added by issue #28 Phase B; awaiting first hosted execution at the release-candidate SHA. Until a cited green run exists this cell is BLOCKED, never PASS."
+          "evidence": "install_acp.py install + clean_room_provider_probe.py served_from_hermes_home on macos-15 at pinned HERMES_CORE_REF (issue #28 Phase B); executed baseline https://github.com/rhgo1749/hermes-antigravity-acp/actions/runs/43321929587/job/131544594907 at 93db79996c56f6c1455b25ec29fea54bbc86c558"
         },
         "provider_selection_factory": {
           "required": true,
-          "status": "BLOCKED",
-          "evidence_class": "not_executed",
+          "status": "PASS",
+          "evidence_class": "real_core_integration",
           "trigger": "ci_full_matrix",
-          "evidence": "clean_room_provider_probe.py PROBE|selection + PROBE|client on macos-15 (issue #28 Phase B)",
-          "limitation": "Added by issue #28 Phase B; awaiting first hosted execution at the release-candidate SHA. Until a cited green run exists this cell is BLOCKED, never PASS."
+          "evidence": "clean_room_provider_probe.py PROBE|selection + PROBE|client on macos-15 (issue #28 Phase B); executed baseline https://github.com/rhgo1749/hermes-antigravity-acp/actions/runs/43321929587/job/131544594907 at 93db79996c56f6c1455b25ec29fea54bbc86c558"
         },
         "acp_initialize_unauthenticated": {
           "required": true,
@@ -310,19 +310,17 @@
         },
         "provider_registration_enabled": {
           "required": true,
-          "status": "BLOCKED",
-          "evidence_class": "not_executed",
+          "status": "PASS",
+          "evidence_class": "real_core_integration",
           "trigger": "ci_full_matrix",
-          "evidence": "install_acp.py install + clean_room_provider_probe.py served_from_hermes_home on ubuntu-24.04-arm at pinned HERMES_CORE_REF (issue #28 Phase B)",
-          "limitation": "Added by issue #28 Phase B; awaiting first hosted execution at the release-candidate SHA. Until a cited green run exists this cell is BLOCKED, never PASS."
+          "evidence": "install_acp.py install + clean_room_provider_probe.py served_from_hermes_home on ubuntu-24.04-arm at pinned HERMES_CORE_REF (issue #28 Phase B); executed baseline https://github.com/rhgo1749/hermes-antigravity-acp/actions/runs/43321929587/job/131544594889 at 93db79996c56f6c1455b25ec29fea54bbc86c558"
         },
         "provider_selection_factory": {
           "required": true,
-          "status": "BLOCKED",
-          "evidence_class": "not_executed",
+          "status": "PASS",
+          "evidence_class": "real_core_integration",
           "trigger": "ci_full_matrix",
-          "evidence": "clean_room_provider_probe.py PROBE|selection + PROBE|client on ubuntu-24.04-arm (issue #28 Phase B)",
-          "limitation": "Added by issue #28 Phase B; awaiting first hosted execution at the release-candidate SHA. Until a cited green run exists this cell is BLOCKED, never PASS."
+          "evidence": "clean_room_provider_probe.py PROBE|selection + PROBE|client on ubuntu-24.04-arm (issue #28 Phase B); executed baseline https://github.com/rhgo1749/hermes-antigravity-acp/actions/runs/43321929587/job/131544594889 at 93db79996c56f6c1455b25ec29fea54bbc86c558"
         },
         "acp_initialize_unauthenticated": {
           "required": true,

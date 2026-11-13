@@ -1,83 +1,58 @@
-# CI cost evidence for Phase B (issue #28)
+# Phase B CI cost: measured records and forecast boundaries
 
-All numbers are measured from GitHub Actions run records of
-`rhgo1749/hermes-antigravity-acp` (job `started_at`→`completed_at` for
-execution, `created_at`→`started_at` for queue delay). No estimates are
-mixed into the measured tables.
+Snapshot: **2026-11-13T03:18:05.122243+00:00**, GitHub API window `2026-10-30..2026-11-13`.
+The snapshot contains **83** workflow executions; every API page and each run's job total were checked before aggregation.
 
-## 1. Measured per-job cost, current main pipeline (post Phase A)
+## Definitions and limits
 
-Run `43294010951` — push `a5b526b` (main, first post-Phase-A main push,
-full matrix by policy), conclusion success:
+- Runner elapsed = job `completed_at - started_at`, excluding skipped jobs. It measures allocated-job elapsed, not CPU time or invoiced cost.
+- Start delay = job `started_at - created_at`. GitHub reports queue/provisioning timestamps; this is not a direct measurement of scarce-runner queue alone. Workflow DAG dependency time and overall wall time are not added to runner-minutes.
+- Wall time = last job completion minus workflow creation. No OS pricing multiplier or dollar cost is invented; public repository billing/credits are not available from these timing records.
+- The historical window spans changing CI contracts. All-five-native frequency is reported separately; older runs before those lanes existed are not mislabeled failed or optimized. Five native targets first appeared in this snapshot on 2026-11-12T08:34:19Z.
 
-| job | exec | queue |
-| --- | --- | --- |
-| Windows install and unauthenticated ACP (arm64) | **17.9 min** | 3 s |
-| Windows install and unauthenticated ACP (x64) | 4.6 min | 2 s |
-| Fresh-UID clean room with official ACP binary | 3.1 min | 2 s |
-| Fake ACP regressions and static checks | 1.7 min | 2 s |
-| Vanilla NousResearch Hermes provider API | 1.1 min | 2 s |
-| Catalog admission + seam at Hermes floor | 0.8 min | 2 s |
-| macOS arm64 install and unauthenticated ACP | 0.3 min | 7 s |
-| Linux aarch64 install and unauthenticated ACP | 0.2 min | 4 s |
-| Change scope / CI gate | 0.2 min | 2 s |
-| **total runner-minutes** | **29.9 min** | — |
+## Event frequency (actual attempts, not a policy estimate)
 
-Windows ARM64 alone is 60 % of runner time; Windows x64 adds 15 %.
-macOS ARM64 and Linux aarch64 hosted jobs are nearly free (≤ 20 s each).
+| Event group | Runs | All five native jobs started | All five native jobs succeeded |
+|---|---:|---:|---:|
+| Ordinary PR events (excluding scenario branches) | 42 | 23 | 23 |
+| main push only | 36 | 6 | 6 |
+| Non-main push / policy scenarios | 4 | 0 | 0 |
+| workflow_dispatch | 1 | 1 | 1 |
 
-Median over the last 12 completed runs (5 main pushes, 6 PRs, 1 dispatch,
-all full-matrix events): Windows ARM64 exec median 18.1 min (max 23.9),
-Windows x64 5.0 min (max 6.0), clean room 1.8 min, fake-acp 1.2 min,
-compat 1.0 min, catalog 0.8 min, macOS 0.3 min, Linux aarch64 0.25 min.
-Queue delay is 2–7 s on every lane except one macOS outlier (603 s).
+Since Phase A's merged-main run `43294010951` in this snapshot: 1 main push and 1 PR, both full-native. The PR is this packaging/CI change; there is **no post-A ordinary fast-only PR speedup measurement** here.
 
-## 2. Event frequency (2026-10-30 → 2026-11-13)
+## Platform timing
 
-- `pull_request` full-matrix runs: 41 (pre-Phase-A policy; wall median 18.4 min)
-- `push` (main) runs: 35 (wall median 19.9 min)
-- `workflow_dispatch`: 1
+Baseline main: [run 43294010951](https://github.com/rhgo1749/hermes-antigravity-acp/actions/runs/43294010951), SHA `a5b526bc672ed32ec71b78ace3cf79f4347507f7`.
+Initial Phase B PR (not release approval): [run 43321929587](https://github.com/rhgo1749/hermes-antigravity-acp/actions/runs/43321929587), SHA `93db79996c56f6c1455b25ec29fea54bbc86c558`.
 
-Phase A (merged 2026-11-12 in `a5b526b`) re-tiered PR runs to
-risk-selected lanes. **No post-Phase-A non-packaging PR has executed yet**
-— this PR is the first candidate for that measurement, so the PR-tier
-reduction is currently *expected*, not yet *measured*: a docs/test-only PR
-should run only the four fast jobs (≈ 3.5 runner-min vs ≈ 30).
+| Platform | Main runner / delay (s) | Initial Phase B PR runner / delay (s) | Historical successful samples | Historical runner median / max (s) |
+|---|---:|---:|---:|---:|
+| linux-x86_64 | 188 / 2 | 165 / 2 | 77 | 96.0 / 278 |
+| windows-x64 | 278 / 2 | 320 / 2 | 70 | 306.5 / 654 |
+| windows-arm64 | 1072 / 3 | 1079 / 2 | 70 | 1100.5 / 1654 |
+| macos-arm64 | 20 / 7 | 53 / 306 | 30 | 18.0 / 89 |
+| linux-aarch64 | 15 / 4 | 58 / 4 | 30 | 16.0 / 122 |
 
-## 3. What Phase B itself costs
+Main total: **29.92 runner-min**, **18.17 min wall**. Initial Phase B PR: **31.28 runner-min**, **18.27 min wall**.
+Windows ARM64 accounts for 59.7% of baseline allocated runner elapsed. Its installer/registration/initialize checks remain; the new removal assertions add coverage rather than replace any old check.
 
-- On ordinary PR/push events: zero added native cost. The two new jobs
-  (`candidate-identity`, `release-gate`) are dispatch-only and gated on
-  `inputs.candidate_sha`; they skip instantly otherwise.
-- On a release-candidate dispatch: the same full matrix as a main push
-  (≈ 30 runner-min, ≈ 18 min wall) plus ≈ 0.5 min for the identity and
-  gate jobs.
+## Release-candidate cost and Phase B impact
 
-**Phase B does not reduce main CI time.** It is the prerequisite that
-makes later reduction safe: until a candidate SHA can be fully verified
-on demand, every main push doubles as the release verification net.
+**Phase B does not reduce main CI time or full-matrix frequency.** It adds provider/factory work on the two ARM POSIX lanes, completes the Windows lifecycle contract, and adds dispatch-only identity/final-gate overhead. A before/after timing difference is observational, not causal savings: runner images, downloads and caches vary.
 
-## 4. Expected reduction after the Phase A follow-up (NOT applied in this PR)
+The initial PR run above skipped Candidate identity and Release gate. It is **not** evidence that the SHA-bound gate executed. The final exact-HEAD dispatch URL, artifact identity and measured candidate runner/wall timings are recorded in [Draft PR #37](https://github.com/rhgo1749/hermes-antigravity-acp/pull/37) and the delivered verification receipts; never borrow the old PR/main success as candidate approval.
 
-Per the issue's target policy (risk-selected PR tiers; main push keeps
-fast + required OS lanes; packaging changes widen; unknown fails closed):
+## Forecast for the separate Phase A main-push follow-up (not implemented)
 
-| event | today (measured) | after follow-up (expected) |
-| --- | --- | --- |
-| non-packaging PR | ≈ 30 runner-min (pre-A) / ≈ 3.5 (post-A, first measurement pending) | ≈ 3.5 min |
-| main push | ≈ 30 runner-min | unchanged in Phase B; candidate for later policy |
-| packaging/arch PR | ≈ 30 runner-min | ≈ 30 runner-min (by design) |
-| release candidate | n/a (was: hope) | ≈ 30.5 runner-min, dispatch-only |
+These are component-sum forecasts from the measured **Phase A main baseline**, not observations of a reduced pipeline. They exclude Phase B added coverage/dispatch overhead and are not promised runtimes.
 
-The only large lever left is Windows ARM64 (18 min/run). It stays on
-main-push + packaging + release-candidate cadence; it must not be
-weakened or removed to save time (issue #28 §4).
+| Proposed ordinary-main scope | Baseline components (runner-min) | Forecast reduction vs full baseline |
+|---|---:|---:|
+| Docs / reviewed neutral-only: Fast | 3.70 | 26.22 runner-min |
+| Plugin change: Fast + required OS | 11.80 | 18.12 runner-min |
+| Packaging / unknown / release candidate: full native | 29.92 | 0.00 runner-min |
 
-## 5. GO / PARTIAL / NO-GO input
+**Measured main-policy saving from Phase B: none; the policy was not reduced.** A controlled post-review follow-up must measure its own ordinary PR/main events, runner elapsed and start delays. Exact-SHA release dispatch stays all-five; unknown changes stay fail-closed full.
 
-- Fail-closed SHA binding, matrix, gate, drift guard: implemented and
-  unit-proven (RED 28 → GREEN 234 on the contract suite).
-- Hosted evidence at an exact candidate SHA: produced by the
-  `release-verify` dispatch recorded in the PR body.
-- main CI reduction: **not started** — correct sequencing is Phase B
-  evidence first, reduction PR second.
+Raw evidence consists of paginated workflow/job metadata (`actions-runs-and-jobs.json`) and `actions-cost-summary.json` in the verification bundle. The snapshot includes non-main scenario pushes explicitly; calling every `push` a main push would inflate the frequency.

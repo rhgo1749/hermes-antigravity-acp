@@ -147,7 +147,7 @@ def test_macos_and_linux_arm_lanes_execute_full_lifecycle(ci: str) -> None:
             "uv sync --frozen --python 3.14 --group dev",
             "install_acp.py install --hermes-home",
             "clean_room_provider_probe.py",
-            "install_acp.py delete --hermes-home",
+            "ci_provider_lifecycle.py --hermes-home",
         ):
             assert step in block, f"{job_id} missing lifecycle step fragment {step!r}"
         assert "NOT executed" in block, f"{job_id} must state its evidence boundary"

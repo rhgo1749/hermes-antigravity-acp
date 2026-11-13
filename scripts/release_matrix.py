@@ -172,6 +172,10 @@ def load_matrix(path: Path) -> Matrix:
         raise MatrixError("matrix target set drifted from the five declared native targets")
     for target_id, entries in targets.items():
         for stage_id, entry in entries.items():
+            # The first pass cannot see a later target's primary lane. Check
+            # again with the complete owner map: one OS can never attest another.
+            if entry.lane in primary_lanes and primary_lanes[entry.lane] != target_id:
+                raise MatrixError(f"{target_id}/{stage_id}: lane {entry.lane} is owned by another target")
             if entry.required and not entry.lane:
                 raise MatrixError(f"{target_id}/{stage_id}: required cell needs a covering lane")
     return Matrix(targets)

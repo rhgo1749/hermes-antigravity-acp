@@ -25,12 +25,12 @@ session launch and native file-mutation or command permission frames are
 answered with the server's own reject option, so shell and file work runs
 through Hermes' own approval-gated terminal and file tools.
 
-## Status at a glance (evidence-backed, checked 2026-11-08)
+## Status at a glance (evidence-backed, checked 2026-11-13)
 
 | Topic | Current status |
 |---|---|
 | Hermes version | `plugin.yaml` declares `requires_hermes: ">=0.21.6"` — a CI-proven floor re-run on every change (`catalog-floor-gate`); the latest upstream Hermes release is `v0.23.1`. |
-| OS support | **Ubuntu 24.04 x86_64** is the only OS with real-binary, dedicated-OS-UID clean-room execution evidence (GitHub-hosted CI; see [OS support and verification tiers](#os-support-and-verification-tiers)). **Windows x64 and Windows arm64** have real-binary hosted-CI execution evidence (actual installer + provider registration + unauthenticated ACP `initialize` on `windows-2022`/`windows-11-arm` runners) — one tier below clean-room, still executed. **Linux aarch64 and macOS arm64** are registry-pinned with publisher digests and have executed native hosted-CI lifecycle evidence (Actions run [43198795406](https://github.com/rhgo1749/hermes-antigravity-acp/actions/runs/43198795406) at `8c054be1eaa4230a87b4e5f9f23a56e3fe74ae09`: native-arch assert, publisher-pinned download + SHA-256, install → status → verify, unauthenticated ACP `initialize`, uninstall → confirmed absence) — promoted from pinned-only, still below the clean-room tier, with no provider-registration, authentication, or model-inference coverage. |
+| OS support | **Ubuntu 24.04 x86_64** is the only OS with real-binary, dedicated-OS-UID clean-room execution evidence (GitHub-hosted CI; see [OS support and verification tiers](#os-support-and-verification-tiers)). **Windows x64 and Windows arm64** have real-binary hosted-CI execution evidence (actual installer + provider registration + unauthenticated ACP `initialize` on `windows-2022`/`windows-11-arm` runners) — one tier below clean-room, still executed. **Linux aarch64 and macOS arm64** are registry-pinned with publisher digests and have executed native hosted-CI lifecycle evidence (Actions run [43198795406](https://github.com/rhgo1749/hermes-antigravity-acp/actions/runs/43198795406) at `8c054be1eaa4230a87b4e5f9f23a56e3fe74ae09`: native-arch assert, publisher-pinned download + SHA-256, install → status → verify, unauthenticated ACP `initialize`, uninstall → confirmed absence) — promoted from pinned-only, still below the clean-room tier, with no authentication or model-inference coverage. Provider registration and selection/client-factory were additionally executed in Phase B run [43321929587](https://github.com/rhgo1749/hermes-antigravity-acp/actions/runs/43321929587) at `93db79996c56f6c1455b25ec29fea54bbc86c558`; these remain hosted evidence, not dedicated-UID isolation or approval of a later release SHA. |
 | Public plugin catalog | **Not registered yet.** `hermes plugins install antigravity-acp-provider` does not resolve today (upstream `plugin-catalog/` contains no entry for this provider as of 2026-11-12). The catalog submission PR ([NousResearch/hermes-agent#153182](https://github.com/NousResearch/hermes-agent/pull/153182)) is open and pending upstream review; registration is not approved or merged as of this writing. The only currently reproducible install path is the standalone installer below. |
 | Official server binary | Pinned `1.4.4`, fetched **only during an explicit install command** over HTTPS from `dl.google.com`; the publisher-pinned SHA-256 digest is verified **before** the archive is opened, extracted, or installed. No self-update; no redistribution. |
 | Authentication & first model call | Credential-free CI does not validate authentication or real inference. A supervised one-prompt canary produced a real response on an earlier client version; the current release has not been verified end-to-end in that same way. This observation does not establish terms compliance for other uses. |
@@ -487,8 +487,8 @@ verification tier:
   an extended-ARM lane (main pushes, dispatch, packaging-surface PRs) —
   its executed status for a given change is whatever the latest cited
   green run on the relevant scope shows, never an assumption.
-- **Native-lifecycle hosted-CI executed tier (not dedicated-UID
-  clean-room, no provider registration) — macOS arm64, Linux aarch64.**
+- **Native-lifecycle and provider hosted-CI executed tier (not dedicated-UID
+  clean-room) — macOS arm64, Linux aarch64.**
   These targets are registry-pinned with publisher digests, and their
   real Google binary lifecycle has been executed on native hosted
   runners (`macos-15` and `ubuntu-24.04-arm:`): native-architecture
@@ -500,10 +500,13 @@ verification tier:
   `macOS arm64 install and unauthenticated ACP` and `Linux aarch64
   install and unauthenticated ACP`, both `success`, `CI gate` green;
   first green native executions of these lanes occurred at run
-  43184922860, `e9eb1c4`). This tier proves none of: authentication
-  success, real model inference, Hermes provider registration on macOS
-  (the lanes never register a provider), or dedicated-UID clean-room
-  isolation.
+  43184922860, `e9eb1c4`). Phase B additionally executes the shared real-Core
+  provider registration, selection and client-factory probe on both native
+  ARM runners: [run 43321929587](https://github.com/rhgo1749/hermes-antigravity-acp/actions/runs/43321929587)
+  at `93db79996c56f6c1455b25ec29fea54bbc86c558`. This resolves the previous
+  provider-registration gap, not authentication success, real model inference
+  or dedicated-UID clean-room isolation. These historical runs do not approve
+  another candidate SHA; the dispatch-only Release gate requires fresh evidence.
 - **Registry-pinned but NOT RUN tier — currently empty.** macOS arm64
   and Linux aarch64 were promoted out of this tier only by the cited
   green native runs above; promotion is per-platform, executed, and
@@ -541,16 +544,16 @@ unreviewed tests remain full-matrix, and main pushes still run all five native
 targets. See [the path matrix, measured baseline and estimate boundaries](docs/ci-cost-phase-a.md).
 
 Phase B of the same issue adds the **release-candidate verification gate**,
-dispatch-only and separate from `CI gate`: `gh workflow run ci.yml -f
-candidate_sha=<40-hex>` pins every lane checkout to that exact commit, each
-lane attests its own HEAD SHA plus the verification stages it executed, and a
-conditional `Release gate` job fails closed unless every required cell of the
-version-controlled matrix (`release/verification-matrix.json`, documented in
-[docs/release-verification-matrix.md](docs/release-verification-matrix.md))
-is attested at exactly that SHA by successful lanes. Evidence from another
-SHA, skipped or missing lanes, and optional-lane substitution for required
-gaps all fail the gate. Ordinary PR and main-push runs are unaffected and
-pay no extra native cost.
+using the existing `workflow_dispatch` with `candidate_sha` (see the
+[runnable dispatch example and contract](docs/release-verification-matrix.md)).
+Every checkout, Actions execution SHA and candidate SHA must agree; each lane
+attests its executed stages and the gate rechecks the selected remote branch
+HEAD after all required jobs and `CI gate` succeed. Wrong/stale SHA, branch
+movement, skipped/cancelled/missing/failed lanes and optional substitution
+fail closed. A PASS preserves a run/attempt-bound JSON evidence artifact.
+Ordinary PR and main-push selection policy is unchanged, including the full
+main matrix. New provider/removal checks add coverage and work; Phase B
+itself makes no main-CI saving claim. See [measured costs](docs/ci-cost-phase-b.md).
 
 ### Four distinct evidence classes (never conflated)
 
