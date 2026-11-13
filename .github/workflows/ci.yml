@@ -863,7 +863,7 @@ jobs:
         env:
           CANDIDATE_SHA: ${{ inputs.candidate_sha || github.sha }}
         run: >-
-          upstream-hermes/.venv/bin/python scripts/gateway_e2e.py
+          upstream-hermes/.venv/bin/python scripts/gateway_docker.py
           --hermes-root upstream-hermes
           --candidate-sha "$CANDIDATE_SHA"
           --output gateway-e2e-verification.json

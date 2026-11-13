@@ -4,13 +4,22 @@ from __future__ import annotations
 from copy import deepcopy
 import unittest
 
+from scripts.gateway_docker import CHECKS
+
 from scripts import gateway_e2e as gateway
 
 
 class GatewayEvidenceTests(unittest.TestCase):
     def receipt(self):
         return {"schema_version": 1, "status": "PASS", "candidate_sha": "a" * 40,
-                "hermes_commit": "b" * 40,
+                "hermes_commit": "b" * 40, "candidate_source_dirty": False,
+                "scratch_cleanup": {"status": "PASS", "launch_count": 1},
+                "shutdown_diagnostic": {"status": "PASS", "launch_count": 1},
+                "confinement": {"status": "PASS", "checks": {name: True for name in CHECKS}, "pid_namespace_sha256": "1" * 64, "host_pid_namespace_sha256": "2" * 64},
+                "docker_execution": {"status": "PASS", "config_verified": True, "owned_pid_namespace_verified": True, "outside_canary_unchanged": True,
+                                     "container_removed": True, "image_removed": True},
+                "regression": {"status": "PASS", "tests": 1, "failures": 0, "errors": 0, "skipped": 0},
+                "final_namespace_live_count": 1, "final_namespace_process_count": 1,
                 "stages": {name: {"status": "PASS", "detail": "executed"} for name in gateway.REQUIRED_STAGES}}
 
     def test_complete_receipt_is_accepted(self):
@@ -42,6 +51,42 @@ class GatewayEvidenceTests(unittest.TestCase):
         for value in ({"status": "ok"}, {**good, "pid": 102}, {**good, "status": "starting"},
                       {**good, "gateway_state": "startup_failed"}, {**good, "pid": True}, None):
             self.assertFalse(gateway.is_ready(value, 101))
+
+    def test_readiness_diagnostics_only_publish_fixed_statuses_not_payloads(self):
+        secret = "credential-or-session-must-not-escape"
+        value = {"pid": 101, "status": "degraded", "gateway_state": "running",
+                 "prompt": secret, "readiness": {"status": "degraded", "checks": {
+                     "state_db": {"status": "degraded", "detail": "OperationalError"},
+                     "disk": {"status": "ok", "path": secret},
+                     "config": {"status": secret, "detail": secret},
+                     secret: {"status": "ok"}}}}
+        actual = gateway.readiness_observation(value, 101, 200)
+        self.assertEqual("degraded", actual["status"])
+        self.assertTrue(actual["expected_pid"])
+        self.assertEqual("degraded", actual["checks"]["state_db"])
+        self.assertEqual("unrecognized", actual["checks"]["config"])
+        self.assertNotIn(secret, str(actual))
+        self.assertNotIn("detail", str(actual))
+
+    def test_transport_diagnostics_distinguish_errors_without_exception_text(self):
+        import urllib.error
+        for error, expected in ((ConnectionRefusedError("secret"), "connection_refused"),
+                                (ConnectionResetError("secret"), "connection_reset"),
+                                (TimeoutError("secret"), "timeout"),
+                                (OSError("secret"), "unavailable")):
+            for wrapped in (error, urllib.error.URLError(error)):
+                with self.subTest(expected=expected, wrapped=type(wrapped).__name__):
+                    value = gateway.transport_observation(wrapped)
+                    self.assertEqual({"transport": expected}, value)
+                    self.assertNotIn("secret", str(value))
+
+    def test_bad_readiness_observation_never_reports_expected_pid(self):
+        for value in (None, [], {}, {"pid": True}, {"pid": 102}):
+            with self.subTest(value=value):
+                observation = gateway.readiness_observation(value, 101, 503)
+                self.assertFalse(observation["expected_pid"])
+                self.assertEqual(503, observation["http_status"])
+                self.assertFalse(gateway.is_ready(value, 101))
 
     def test_stage_fails_instead_of_promoting_cleanup_or_ready_to_success(self):
         receipt = self.receipt()

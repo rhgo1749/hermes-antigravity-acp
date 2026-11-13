@@ -13,9 +13,11 @@ import os
 from pathlib import Path
 import runpy
 import sys
+import threading
 import traceback
 
-from gateway_process_policy import PRUNE_BODY, scratch_command_verdict
+from gateway_docker import namespace_verified
+from gateway_process_policy import PRUNE_BODY, scratch_command_verdict, shutdown_command_verified
 
 
 def main() -> None:
@@ -24,6 +26,11 @@ def main() -> None:
     receipt = root / ("contender-envelope.json" if os.environ.get("PHASE_C_CONTENDER") == "1" else "gateway-envelope.json")
     refused: list[str] = []
     owned_pids: dict[int, str] = {}
+    owned_processes: list = []
+    receipt_lock = threading.RLock()
+    confined = namespace_verified()
+    if not confined:
+        raise PermissionError("verified_container_required")
     dependency_roots = [Path(sys.prefix).resolve(), Path(sys.base_prefix).resolve()]
     protected = [Path("/opt/data").resolve(), Path("/home/hermes").resolve()]
     allowed = [root, core, *dependency_roots]
@@ -53,7 +60,8 @@ def main() -> None:
                 frame = sys._getframe(1)
                 while frame is not None:
                     if (frame.f_code.co_name == "lineage_with_start_times"
-                            and Path(frame.f_code.co_filename).resolve() == core / "hermes_constants_scratch.py"):
+                            and Path(frame.f_code.co_filename).resolve() == core / "hermes_constants_scratch.py"
+                            and not confined):
                         reject("scratch_process_namespace_unverified")
                     frame = frame.f_back
             flags = args[2] if len(args) > 2 and isinstance(args[2], int) else 0
@@ -95,11 +103,17 @@ def main() -> None:
             if len(git_args) >= 2 and git_args[0] == "-C" and Path(git_args[1]).resolve() == core:
                 git_args = git_args[2:]
             is_readonly_git = name == "git" and bool(git_args) and git_args[0] in {"rev-parse", "describe", "status", "symbolic-ref", "log", "diff", "tag"}
+            housekeeping = False
             if PRUNE_BODY in command:
-                reject(scratch_command_verdict(str(args[0]), command, root, core, sys.executable, sys.path))
+                verdict = scratch_command_verdict(str(args[0]), command, root, core, sys.executable, sys.path)
+                if verdict != "scratch_process_namespace_unverified" or not confined:
+                    reject(verdict)
+                housekeeping = True
             if name in {"timeout", "gtimeout"} and "bash" in command:
-                reject("host_shutdown_process_scan_not_permitted")
-            if not (is_fixture or is_readonly_git):
+                if not confined or not shutdown_command_verified(str(args[0]), command, core, os.getpid()):
+                    reject("shutdown_diagnostic_not_verified")
+                housekeeping = True
+            if not (is_fixture or is_readonly_git or housekeeping):
                 reject("unapproved_subprocess")
         elif event in {"os.kill", "os.killpg"}:
             pid, signum = args
@@ -125,14 +139,17 @@ def main() -> None:
     client_cancel_calls = 0
 
     def finish() -> None:
-        bootstrap = sys.modules.get("hermes_bootstrap")
-        origin = Path(getattr(bootstrap, "__file__", "")).resolve()
-        value = {"pid": os.getpid(), "refusals": sorted(set(refused)),
-                 "core_bootstrap_from_requested_source": origin == core / "hermes_bootstrap.py",
-                 "loaded_provider_sha256": sorted(factory_hashes), "client_cancel_calls": client_cancel_calls}
-        temporary = receipt.with_suffix(".tmp")
-        temporary.write_text(json.dumps(value), encoding="utf-8")
-        temporary.replace(receipt)
+        with receipt_lock:
+            bootstrap = sys.modules.get("hermes_bootstrap")
+            origin = Path(getattr(bootstrap, "__file__", "")).resolve()
+            value = {"pid": os.getpid(), "refusals": sorted(set(refused)),
+                     "core_bootstrap_from_requested_source": origin == core / "hermes_bootstrap.py",
+                     "loaded_provider_sha256": sorted(factory_hashes), "client_cancel_calls": client_cancel_calls,
+                     "housekeeping": [{"kind": kind, "target": target, "returncode": process.poll()}
+                                      for kind, target, process in owned_processes]}
+            temporary = receipt.with_suffix(".tmp")
+            temporary.write_text(json.dumps(value), encoding="utf-8")
+            temporary.replace(receipt)
 
     def profile(frame, event, arg) -> None:
         nonlocal client_cancel_calls
@@ -155,14 +172,19 @@ def main() -> None:
                     started = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[22-3]
                 except FileNotFoundError:
                     started = None
+                command = getattr(process, "args", [])
+                kind = "scratch" if PRUNE_BODY in command else "shutdown" if "bash" in command else "other"
+                if kind != "other":
+                    owned_processes.append((kind, str(command[5]) if kind == "scratch" else "", process))
                 if started is not None:
                     owned_pids[pid] = started
-                    with (root / "owned-core-children.jsonl").open("a", encoding="utf-8") as stream:
-                        stream.write(json.dumps({"pid": pid, "started": started}) + "\n")
+                elif process.poll() is None:
+                    reject("owned_child_identity_unavailable")
+                with (root / "owned-core-children.jsonl").open("a", encoding="utf-8") as stream:
+                    stream.write(json.dumps({"pid": pid, "started": started, "exit_code": process.poll(), "kind": kind}) + "\n")
         elif event == "c_call" and arg is os._exit:
             finish()
 
-    import threading
     sys.addaudithook(audit)
     atexit.register(finish)
     sys.setprofile(profile)

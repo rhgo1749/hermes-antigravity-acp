@@ -4,7 +4,8 @@
 
 The credential-free functional path has executed in a disposable local fixture.
 It is **not yet a compliant replacement for operating `gateway-eval` verification**.
-The stricter scratch/process boundary is BLOCKED on the available local runner.
+The available local runner is BLOCKED; the conditionally approved Hosted Docker
+boundary is implemented but must pass actual execution before adoption.
 A dirty development run is not a candidate-SHA verification receipt. No merge,
 release, operating deployment or production service change is authorized.
 
@@ -59,46 +60,72 @@ The observed current official Core contender contract is a successful no-op:
 requires the original owner PID and unchanged lock plus a subsequent real request;
 exit zero alone is insufficient. This is safe reuse, not rejection.
 
-## Strict scratch approval: unresolved process isolation
+## Conditionally approved Hosted Docker boundary
 
-Operator approval permits original Core scratch housekeeping **only inside the
-new fixture root**, with executable, argv, target, alias/symlink and lifecycle
-verification. It does not authorize operating GC or ACP MUX native-session GC.
+The operator authorized a non-root container **only on the existing Linux GitHub
+Hosted disposable VM**. No operating-host container launch, sudo/security-policy
+change, privileged container, host PID/network mode, published port, forwarded
+Docker socket, operating HOME/profile/credentials mount, Core patch, cleanup-stamp
+spoof, or direct-host Gateway fallback is permitted.
 
-The investigated official Core is
-`97039b436b9ddc30ba9aa6f1ae8e62de511fa866`:
+`scripts/gateway_docker.py` imports a tiny credential-free rootfs locally into the
+existing daemon; it pulls no image. Only exact source/interpreter roots and necessary
+system binary/library inputs are mounted read-only. The one fresh `/gw` bind is
+writable. The container uses explicit non-root UID/GID, cap-drop ALL,
+no-new-privileges, network none, default private PID namespace, IPC none, readonly
+root, 128-PID / 2-GiB / 2-CPU limits and a 360-second outer execution deadline.
+The original Gateway READY deadline remains 60 seconds: no blind timeout increase.
 
-- `hermes_constants_scratch_detach.py:23-45`: original command is the running
-  Python, `-I -B -c`, the fixed `_CHILD` body, exact scratch target, ancestor
-  lineage, and original `sys.path`. `-I` means the parent Python audit hook is
-  **not inherited** by this child.
-- `hermes_constants_scratch.py:195-211`: computing lineage before Popen reads
-  ancestors outside the fixture. Checking only target containment is insufficient.
-- `hermes_constants_scratch.py:298-369,433-461`: a cleanup pass calls
-  `psutil.process_iter` even when no entry is eligible for deletion. Therefore
-  an empty scratch directory does not prove no outside-process access.
-- `gateway/shutdown_forensics.py:120-165`: the unchanged signal-shutdown diagnostic
-  starts a bounded shell with host process listings. It also cannot be admitted
-  under a no-outside-process-access assertion.
+Before any Core execution, the same container process tests actual UID, effective
+capabilities, no-new-privileges, readonly root mount, private PID/network namespace,
+PID1-only psutil inventory and the absence of its known external fixture parent.
+Raw libc open controls must deny an unmounted external fixture canary, source
+write and rootfs write; kernel routing must reject an external connect while
+container loopback bind works. The host separately inspects exact Docker settings,
+mount set and the owned live container PID namespace before releasing execution.
+Only compared namespace hashes, fixed statuses and counts enter the receipt.
 
-The earlier development result with all fourteen stage labels PASS predates this
-strict boundary review and used an inadequate child allow rule. It is explicitly
-**superseded as isolation evidence**, not a successful candidate verification.
+Every pytest file runs inside the exercised boundary with the real dependency
+interpreter (180-second suite deadline; sanitized JUnit counts only), followed by
+the original Gateway driver in the same container. Native Fast/OS/Extended ARM,
+latest/floor strict seams and the stable CI/Release aggregators remain unchanged.
+This extra full regression is measured as part of container cost, not concealed
+as free reuse. The local CI-equivalent credential-free suite remains separate
+from this full real-Core run.
 
-The hardened envelope denies scratch ancestry reads/child launch and the host
-shutdown diagnostic instead of broadly admitting their executable names. Refusals
-are sticky: a zero Core exit code or caught PermissionError cannot certify PASS.
-`gateway_process_policy.py` checks exact original command spelling, launcher,
-import path, owned absolute target, dot segments and symlink aliases; even a valid
-command remains `scratch_process_namespace_unverified`. No opt-in boolean fabricates
-namespace proof and no cleanup-complete stamp is created by the fixture.
+The original Core `python -I` scratch child is admitted only after exact executable,
+argv, import-path and canonical owned-target checks **and actual namespace proof**.
+A bare allow flag cannot admit it. Fresh idle probe entries (not prune stamps) must
+be removed by the original pruner while fresh active probes survive; observed
+original child return codes and native prune audit logs are required. Original
+shutdown forensics are admitted only for the exact source-derived literal/f-string
+script and canonical timeout executable. Its completion footer and child cleanup
+are required. No Core callable or file is replaced. Python audit refusals remain
+sticky, even if Core catches PermissionError or exits zero.
 
-Local capability probe: `unshare --user --map-root-user --pid --fork --mount-proc
-true` returned `Operation not permitted`; no Docker socket was available. A genuine
-isolated process namespace or an upstream supported confined cleanup contract is
-needed before this stage can become PASS. This repository does not patch Core or
-expand host privileges to obtain it. No new upstream issue has been filed without
-separate authorization; existing related incident links remain in Issue #28.
+The final container inventory must contain only PID1, with zombies reaped. The
+host verifies removal of its exact container and private imported image. Missing
+Docker, unavailable isolation, failed controls, nonzero/timeout execution, dirty
+source, missing scratch/diagnostic completion or unverified teardown cannot PASS.
+No shared Docker prune or name-based process kill is used.
+
+Historical analysis of official Core `97039b4` found ancestry walking in
+`hermes_constants_scratch.py:195-211`, whole-process enumeration even for an empty
+scratch in `:298-369,433-461`, the isolated child in
+`hermes_constants_scratch_detach.py:23-45`, and shutdown scans in
+`gateway/shutdown_forensics.py:118-165`. The earlier bare-child development PASS
+is superseded as isolation evidence. Local unshare remains EPERM and no Docker
+socket is available: local container execution is **BLOCKED**, not a reason to
+run the Gateway directly. Real container acceptance remains NOT RUN until the
+clean candidate executes on the authorized Hosted VM.
+
+The prior Hosted READY timeout remains a distinct unresolved observation. The
+same `b51a30c` Core reproduced all 13 functional stages locally in a dirty diagnostic
+run, with isolation BLOCKED. This does not approve a candidate or prove a port-race,
+disk or Python-version cause. New `last_readiness` records contain only fixed HTTP,
+transport, expected-PID and allowlisted readiness check states, never raw errors,
+paths, prompt/session text or credentials. A later container PASS is not retrospective
+proof of the old failure's cause.
 
 ## CI gating policy
 
@@ -134,8 +161,9 @@ from workflow text, or cost savings from a full-matrix implementation PR.
 
 Historical development run: 25.070 seconds, 16 tracked child identities, zero live
 tracked survivors; **dirty overall FAIL and superseded isolation evidence**. This
-is not measured Hosted runner-min or a verified CI overhead delta. Final Hosted and
-Release results remain NOT RUN until the exact candidate actually executes there.
+is not measured Hosted runner-min or a verified CI overhead delta. Prior Hosted run 43470290348 FAILED on d27e12f/PR-merge b417341 with official
+Core b51a30c (READY timeout). New-HEAD Hosted and Release results remain NOT RUN
+until that exact candidate actually executes; previous results cannot be reused.
 
 Production profiles, operating accounts/session databases, s6 and Multiplexer
 settings remain outside this work. The existing operating `gateway-eval` is not

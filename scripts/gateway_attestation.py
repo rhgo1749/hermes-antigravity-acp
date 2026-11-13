@@ -9,8 +9,10 @@ from pathlib import Path
 
 try:
     from gateway_e2e import validate_receipt
+    from gateway_docker import validate_docker_receipt
 except ImportError:
     from scripts.gateway_e2e import validate_receipt
+    from scripts.gateway_docker import validate_docker_receipt
 
 
 def check_outputs(outputs: dict, *, required: bool, candidate: str | None = None) -> list[str]:
@@ -28,7 +30,7 @@ def check_outputs(outputs: dict, *, required: bool, candidate: str | None = None
     sha = candidate if candidate is not None else outputs.get("attested_sha", "")
     if not isinstance(sha, str):
         return ["gateway_candidate_missing"]
-    return validate_receipt(record, sha)
+    return [*validate_receipt(record, sha), *validate_docker_receipt(record)] if isinstance(record, dict) else ["gateway_record_malformed"]
 
 
 def main() -> int:
@@ -39,6 +41,10 @@ def main() -> int:
     args = parser.parse_args()
     record = json.loads(args.record.read_text(encoding="utf-8"))
     problems = validate_receipt(record, args.candidate)
+    if not isinstance(record, dict):
+        print("Gateway attestation refused: receipt_not_object")
+        return 1
+    problems.extend(validate_docker_receipt(record))
     if record.get("hermes_commit") != args.core:
         problems.append("gateway_core_identity_mismatch")
     if problems:

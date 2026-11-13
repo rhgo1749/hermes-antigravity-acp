@@ -26,8 +26,10 @@ import urllib.request
 
 try:
     import deploy_hermes_profiles as deployment
+    from gateway_docker import namespace_verified, validate_confinement
 except ImportError:
     from scripts import deploy_hermes_profiles as deployment
+    from scripts.gateway_docker import namespace_verified, validate_confinement
 
 REQUIRED_STAGES = (
     "isolation", "candidate_install", "enablement", "gateway_ready", "provider_factory",
@@ -49,11 +51,18 @@ def validate_receipt(receipt: object, candidate: str) -> list[str]:
         problems.append("core_identity_missing")
     if receipt.get("status") != "PASS":
         problems.append("overall_not_pass")
-    if receipt.get("candidate_source_dirty") is not None and receipt["candidate_source_dirty"] is not False:
+    if receipt.get("candidate_source_dirty") is not False:
         problems.append("candidate_source_dirty")
-    if "scratch_cleanup" in receipt and (not isinstance(receipt["scratch_cleanup"], dict)
-            or receipt["scratch_cleanup"].get("status") != "PASS"):
+    if (not isinstance(receipt.get("scratch_cleanup"), dict)
+            or receipt["scratch_cleanup"].get("status") != "PASS"
+            or type(receipt["scratch_cleanup"].get("launch_count")) is not int
+            or receipt["scratch_cleanup"]["launch_count"] < 1):
         problems.append("scratch_cleanup_not_pass")
+    diagnostic = receipt.get("shutdown_diagnostic")
+    if (not isinstance(diagnostic, dict) or diagnostic.get("status") != "PASS"
+            or type(diagnostic.get("launch_count")) is not int or diagnostic["launch_count"] < 1):
+        problems.append("shutdown_diagnostic_not_pass")
+    problems.extend(validate_confinement(receipt))
     stages = receipt.get("stages")
     if not isinstance(stages, dict):
         return [*problems, "stages_not_object"]
@@ -67,6 +76,38 @@ def validate_receipt(receipt: object, candidate: str) -> list[str]:
 def is_ready(value: object, pid: int) -> bool:
     return (isinstance(value, dict) and type(value.get("pid")) is int and value["pid"] == pid
             and value.get("status") == "ok" and value.get("gateway_state") == "running")
+
+
+def readiness_observation(value: object, pid: int, http_status: int) -> dict:
+    """Bounded allowlisted diagnostics; never emit response text, PIDs or details."""
+    statuses = {"ok", "degraded", "running", "starting", "draining", "stopped",
+                "startup_failed", "unknown", "retrying", "unavailable"}
+    def state(item):
+        return item if isinstance(item, str) and item in statuses else "unrecognized"
+    response = value if isinstance(value, dict) else {}
+    readiness = response.get("readiness")
+    checks = readiness.get("checks") if isinstance(readiness, dict) else None
+    checks = checks if isinstance(checks, dict) else {}
+    return {"http_status": http_status, "status": state(response.get("status")),
+            "gateway_state": state(response.get("gateway_state")),
+            "expected_pid": type(response.get("pid")) is int and response["pid"] == pid,
+            "checks": {name: state(checks[name].get("status"))
+                       for name in ("state_db", "session_store", "config", "model", "disk", "gateway", "background_queues")
+                       if isinstance(checks.get(name), dict)}}
+
+
+def transport_observation(error: BaseException) -> dict:
+    """Classify the transport without leaking exception messages or target URLs."""
+    reason = error.reason if isinstance(error, urllib.error.URLError) else error
+    if isinstance(reason, ConnectionRefusedError):
+        status = "connection_refused"
+    elif isinstance(reason, ConnectionResetError):
+        status = "connection_reset"
+    elif isinstance(reason, TimeoutError):
+        status = "timeout"
+    else:
+        status = "unavailable"
+    return {"transport": status}
 
 
 def _git(root: Path, *args: str) -> str:
@@ -114,6 +155,9 @@ class Run:
                        "hermes_commit": _git(core, "rev-parse", "HEAD"), "status": "FAIL",
                        "stages": {name: {"status": "NOT_RUN", "detail": "not_executed"} for name in REQUIRED_STAGES}}
         self.current = "isolation"
+        if namespace_verified():
+            proof = json.loads(Path("/gw/confinement.json").read_text())
+            self.record["confinement"] = {key: proof[key] for key in ("status", "checks", "pid_namespace_sha256", "host_pid_namespace_sha256")}
 
     def pass_stage(self, name: str, detail: str) -> None:
         self.record["stages"][name] = {"status": "PASS", "detail": detail}
@@ -148,6 +192,7 @@ class Run:
                 "TMPDIR": str(self.root / "t"), "TMP": str(self.root / "t"), "TEMP": str(self.root / "t"),
                 "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "TZ": "UTC", "GIT_OPTIONAL_LOCKS": "0",
                 "HERMES_DISABLE_LAZY_INSTALLS": "1", "HERMES_GATEWAY_NO_SUPERVISE": "1",
+                "PHASE_C_DOCKER_POLICY": os.environ.get("PHASE_C_DOCKER_POLICY", ""),
                 "API_SERVER_ENABLED": "true", "API_SERVER_HOST": "127.0.0.1",
                 "API_SERVER_PORT": str(self.port), "API_SERVER_KEY": self.key}
 
@@ -174,14 +219,18 @@ class Run:
         raise GatewayFailure(detail)
 
     def ready(self):
+        pid = self.process.pid if self.process is not None else -1
         try:
             value = self.http("GET", "/p/phasec/health/detailed")
         except urllib.error.HTTPError as exc:
+            self.record["last_readiness"] = readiness_observation(None, pid, exc.code)
             if exc.code in {401, 403, 404}:
                 raise GatewayFailure("gateway_profile_route_not_authenticated") from None
             return False
-        except (OSError, urllib.error.URLError, TimeoutError):
+        except (OSError, urllib.error.URLError, TimeoutError) as exc:
+            self.record["last_readiness"] = transport_observation(exc)
             return False
+        self.record["last_readiness"] = readiness_observation(value, pid, 200)
         return self.process is not None and is_ready(value, self.process.pid)
 
     def start(self, *, contender=False):
@@ -218,12 +267,23 @@ class Run:
         self.need(not provider or provider == "antigravity-acp", "served_provider_mismatch")
 
     def prepare(self) -> None:
+        self.need(namespace_verified(), "verified_container_required")
         self.need(sys.platform == "linux" and os.uname().machine in {"x86_64", "amd64"}, "unsupported_host")
         self.need(not self.root.is_symlink() and self.root.stat().st_uid == os.getuid(), "unowned_test_root")
         for name in ("os-home", "config", "cache", "data", "state", "runtime", "t"):
             (self.root / name).mkdir(mode=0o700)
         self.profile.mkdir(parents=True)
         self.home.chmod(0o700)
+        for home in (self.home, self.profile):
+            scratch = home / "cache" / "scratch"
+            old = scratch / "phasec-idle-probe"
+            old.mkdir(parents=True)
+            seed = old / "fixture-only.txt"
+            seed.write_text("disposable-cleanup-negative-control")
+            idle = time.time() - 48 * 3600
+            os.utime(seed, (idle, idle))
+            os.utime(old, (idle, idle))
+            (scratch / "phasec-active-probe").write_text("must-survive-original-prune")
         # Export exact Git bytes into the disposable root. No .git, install stamp, PM
         # selection or Core file is edited; the existing interpreter owns dependencies.
         archive = self.root / "core-source.tar"
@@ -385,16 +445,37 @@ class Run:
         self.record["owned_child_count"] = len(pids)
         self.record["live_owned_children_after_exit"] = sum(_live(pid, token) for pid, token in pids.items())
         boundary_ok = True
+        housekeeping = []
         for name in ("gateway-envelope.json", "contender-envelope.json"):
             path = self.root / name
-            if path.exists() and json.loads(path.read_text()).get("refusals"):
-                boundary_ok = False
+            if path.exists():
+                envelope = json.loads(path.read_text())
+                boundary_ok = boundary_ok and not envelope.get("refusals")
+                housekeeping.extend(envelope.get("housekeeping", []))
+        pruning = [item for item in housekeeping if item["kind"] == "scratch"]
+        targets = {Path(item["target"]) for item in pruning}
+        allowed_targets = {home / "cache" / "scratch" for home in (self.home, self.profile)}
+        scratch_ok = bool(pruning) and targets.issubset(allowed_targets) and all(item["returncode"] == 0 for item in pruning)
+        for target in targets & allowed_targets:
+            log = target.parent.parent / "logs" / "scratch-prune.log"
+            content = log.read_text(errors="replace") if log.exists() else ""
+            scratch_ok = (scratch_ok and not (target / "phasec-idle-probe").exists()
+                          and (target / "phasec-active-probe").is_file() and bool(content)
+                          and not any(text in content.lower() for text in ("failed", "could not", "nothing deleted")))
+        self.record["scratch_cleanup"] = {"status": "PASS" if scratch_ok and boundary_ok else "FAIL",
+                                          "launch_count": len(pruning), "target_count": len(targets),
+                                          "detail": "original_pruner_idle_removed_active_retained" if scratch_ok else "pruner_execution_not_verified"}
+        diagnostics = [item for item in housekeeping if item["kind"] == "shutdown"]
+        diagnostic_log = self.home / "logs" / "gateway-shutdown-diag.log"
+        diagnostic_ok = bool(diagnostics) and diagnostic_log.exists() and "=== end ===" in diagnostic_log.read_text(errors="replace")
+        self.record["shutdown_diagnostic"] = {"status": "PASS" if diagnostic_ok else "FAIL", "launch_count": len(diagnostics)}
         if not boundary_ok:
-            self.record["stages"]["isolation"] = {"status": "BLOCKED", "detail": "unconfined_core_housekeeping_refused"}
-            self.record["scratch_cleanup"] = {"status": "BLOCKED", "detail": "original_core_scans_host_processes"}
+            self.record["stages"]["isolation"] = {"status": "BLOCKED", "detail": "sticky_boundary_refusal"}
+        if not scratch_ok:
+            self.record["stages"]["isolation"] = {"status": "FAIL", "detail": "original_scratch_cleanup_unverified"}
         if self.process is not None:
-            success = self.process.returncode == 0 and not forced
-            self.record["stages"]["shutdown"] = {"status": "PASS" if success else "FAIL", "detail": "graceful_exit" if success else "unclean_or_forced_exit"}
+            success = self.process.returncode == 0 and not forced and diagnostic_ok
+            self.record["stages"]["shutdown"] = {"status": "PASS" if success else "FAIL", "detail": "graceful_exit_and_original_diagnostic" if success else "unclean_exit_or_missing_diagnostic"}
         self.record["stages"]["child_cleanup"] = {"status": "PASS" if clean and not forced else "FAIL", "detail": "no_live_owned_children" if clean and not forced else "residual_or_forced_cleanup"}
 
 

@@ -6,6 +6,7 @@ Without an independently verified process namespace it must remain BLOCKED.
 """
 from __future__ import annotations
 
+import ast
 import os
 from pathlib import Path
 from typing import Sequence
@@ -66,3 +67,34 @@ def scratch_command_verdict(
     # original command allows process_iter over the HOST: a target-path check cannot
     # grant the stronger no-outside-process-access property.
     return "scratch_process_namespace_unverified"
+
+
+def shutdown_command_verified(executable: str, argv: Sequence[str], core: Path, pid: int) -> bool:
+    """Match only the original source's literal/f-string diagnostic, never eval it."""
+    if (len(argv) != 5 or list(argv[1:4]) != ["5", "bash", "-c"] or argv[0] != executable
+            or executable not in {"/usr/bin/timeout", "/bin/timeout"}
+            or Path(executable).resolve() != Path("/usr/bin/timeout").resolve()):
+        return False
+    try:
+        source = ast.parse((core / "gateway" / "shutdown_forensics.py").read_text())
+        function = next(node for node in source.body if isinstance(node, ast.FunctionDef)
+                        and node.name == "_async_diagnostic_script")
+        expression = next(node.value for node in function.body if isinstance(node, ast.Return))
+        if not isinstance(expression, ast.JoinedStr):
+            return False
+        for signum in ("SIGINT", "SIGTERM"):
+            parts = []
+            for node in expression.values:
+                if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                    parts.append(node.value)
+                elif (isinstance(node, ast.FormattedValue) and isinstance(node.value, ast.Name)
+                      and node.value.id in {"signal_name", "self_pid"}
+                      and node.conversion == -1 and node.format_spec is None):
+                    parts.append(signum if node.value.id == "signal_name" else str(pid))
+                else:
+                    return False
+            if argv[4] == "".join(parts):
+                return True
+    except (OSError, SyntaxError, StopIteration):
+        return False
+    return False
