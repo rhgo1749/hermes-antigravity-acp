@@ -771,12 +771,15 @@ jobs:
 
   upstream-hermes-compat:
     name: Vanilla NousResearch Hermes provider API
+    needs: [change-scope]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
       contents: read
     outputs:
       attested_sha: ${{ steps.attest.outputs.sha }}
+      gateway_result: ${{ steps.gateway.outcome }}
+      gateway_record: ${{ steps.gateway-attest.outputs.record }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -851,7 +854,38 @@ jobs:
           tests/test_vanilla_hermes_seam.py
           tests/test_upstream_hermes_runtime_contracts.py
           tests/test_upstream_delegate_affinity_e2e.py
+      - name: Exclude only existing CI-generated checkout and provenance
+        run: |
+          printf '%s\n' '/upstream-hermes/' '/upstream-hermes-provenance.txt' '/upstream-hermes-lock.sha256' '/upstream-hermes-dependencies.txt' '/gateway-e2e-verification.json' >> .git/info/exclude
+      - name: Disposable real-Core Gateway E2E
+        id: gateway
+        if: needs.change-scope.outputs.os_lanes == 'true'
+        env:
+          CANDIDATE_SHA: ${{ inputs.candidate_sha || github.sha }}
+        run: >-
+          upstream-hermes/.venv/bin/python scripts/gateway_e2e.py
+          --hermes-root upstream-hermes
+          --candidate-sha "$CANDIDATE_SHA"
+          --output gateway-e2e-verification.json
+      - name: Validate executed Gateway receipt against candidate and Core
+        id: gateway-attest
+        if: success() && needs.change-scope.outputs.os_lanes == 'true'
+        env:
+          CANDIDATE_SHA: ${{ inputs.candidate_sha || github.sha }}
+          CORE_SHA: ${{ steps.hermes-target.outputs.commit }}
+        run: >-
+          python scripts/gateway_attestation.py
+          --record gateway-e2e-verification.json
+          --candidate "$CANDIDATE_SHA" --core "$CORE_SHA"
+      - name: Preserve sanitized Gateway evidence only
+        if: always() && needs.change-scope.outputs.os_lanes == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: gateway-e2e-${{ github.run_id }}-${{ github.run_attempt }}
+          path: gateway-e2e-verification.json
+          if-no-files-found: error
       - name: Confirm Hermes Core source remained unmodified
+        if: always()
         run: |
           git -C upstream-hermes diff --exit-code
           git -C upstream-hermes diff --cached --exit-code

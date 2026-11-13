@@ -220,6 +220,11 @@ def _results(matrix, *, candidate=CANDIDATE, **overrides) -> dict:
         results.setdefault(
             lane, {"result": "success", "outputs": {"attested_sha": candidate}}
         )
+    from scripts.gateway_e2e import REQUIRED_STAGES
+    results["upstream-hermes-compat"]["outputs"].update({
+        "gateway_result": "success", "gateway_record": json.dumps({
+            "schema_version": 1, "candidate_sha": candidate, "hermes_commit": "b" * 40, "status": "PASS",
+            "stages": {name: {"status": "PASS"} for name in REQUIRED_STAGES}})})
     for lane, value in overrides.items():
         if value is None:
             del results[lane]

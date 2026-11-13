@@ -36,6 +36,11 @@ import argparse
 import json
 import sys
 
+try:
+    from gateway_attestation import check_outputs as check_gateway_outputs
+except ImportError:
+    from scripts.gateway_attestation import check_outputs as check_gateway_outputs
+
 FAST_LANES = ("fake-acp", "upstream-hermes-compat", "catalog-floor-gate")
 OS_LANES = ("acp-clean-room", "windows-x64", "macos-arm64")
 ARM_LANES = ("windows-arm64", "linux-aarch64")
@@ -126,6 +131,11 @@ def evaluate(expected: dict[str, object], results: dict[str, dict]) -> tuple[boo
         check(lane, expected_os, "os")
     for lane in ARM_LANES:
         check(lane, expected_arm, "arm")
+
+    gateway_outputs = (results.get("upstream-hermes-compat") or {}).get("outputs") or {}
+    for problem in check_gateway_outputs(gateway_outputs, required=expected_os):
+        ok = False
+        lines.append("FAIL gateway_e2e: " + problem)
 
     header = (
         f"scope: os_lanes={expected_os} extended_arm={expected_arm} "
