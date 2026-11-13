@@ -79,6 +79,7 @@ NON_PACKAGING_SCRIPTS_EXACT = (
     "scripts/acp_surface_dump.py",
     "scripts/audit_exposure.py",
     "scripts/audit_public_tree.py",
+    "scripts/candidate_identity.py",
     "scripts/ci_change_scope.py",
     "scripts/ci_gate_check.py",
     "scripts/clean_room_provider_probe.py",
@@ -86,6 +87,8 @@ NON_PACKAGING_SCRIPTS_EXACT = (
     "scripts/hermes_canary_env.py",
     "scripts/hosted_clean_room_ci.py",
     "scripts/publication_gate.py",
+    "scripts/release_gate_check.py",
+    "scripts/release_matrix.py",
 )
 
 # Name heuristics for packaging/installer surface under scripts/: a NEW

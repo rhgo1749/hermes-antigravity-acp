@@ -143,6 +143,11 @@ def test_macos_and_linux_arm_lanes_execute_full_lifecycle(ci: str) -> None:
             "--verify",
             "acp_probe.py --timeout",
             "--uninstall",
+            # issue #28 Phase B: Hermes provider parity on both ARM lanes.
+            "uv sync --frozen --python 3.14 --group dev",
+            "install_acp.py install --hermes-home",
+            "clean_room_provider_probe.py",
+            "ci_provider_lifecycle.py --hermes-home",
         ):
             assert step in block, f"{job_id} missing lifecycle step fragment {step!r}"
         assert "NOT executed" in block, f"{job_id} must state its evidence boundary"
@@ -687,6 +692,12 @@ def test_docs_only_diff_in_a_real_repo_stays_fast(tmp_path) -> None:
 # -- P1-1 (issue #9 rework): gate needs stay synced with workflow jobs ----
 
 
+# Issue #28 Phase B: these jobs exist ONLY to certify a release-candidate
+# dispatch. They are deliberately not tier lanes and are never wired into
+# `CI gate`; the release-gate sync test below owns their needs list.
+RELEASE_ONLY_JOBS = {"candidate-identity", "release-gate"}
+
+
 def _top_level_job_ids(ci: str) -> set[str]:
     jobs_section = ci.split("\njobs:\n", 1)[1]
     return set(re.findall(r"^  ([a-z][a-z0-9_-]*):", jobs_section, re.M))
@@ -703,13 +714,21 @@ def test_gate_needs_stay_in_sync_with_the_workflow_jobs(ci: str) -> None:
     jobs = _top_level_job_ids(ci)
     assert "ci-gate" in jobs, "workflow job discovery is broken"
     needs = _gate_needs(ci)
-    missing = jobs - {"ci-gate"} - needs
+    missing = jobs - {"ci-gate"} - RELEASE_ONLY_JOBS - needs
     stale = needs - jobs
     assert not missing, f"jobs missing from ci-gate needs: {sorted(missing)}"
     assert not stale, f"ci-gate needs reference unknown jobs: {sorted(stale)}"
-    assert set(ALL_LANES) == jobs - {"ci-gate"}, (
+    assert set(ALL_LANES) == jobs - {"ci-gate"} - RELEASE_ONLY_JOBS, (
         "ALL_LANES drifted from the workflow; sync the contract test"
     )
+
+
+def test_release_only_jobs_are_never_wired_into_ci_gate(ci: str) -> None:
+    # A release-only job riding into `CI gate` would make every ordinary
+    # PR depend on release certification (or a skipped release job read as
+    # green). They must stay outside ci-gate's needs.
+    needs = _gate_needs(ci)
+    assert not (needs & RELEASE_ONLY_JOBS), needs & RELEASE_ONLY_JOBS
 
 
 def test_gate_needs_sync_detects_a_new_unlisted_job(ci: str) -> None:

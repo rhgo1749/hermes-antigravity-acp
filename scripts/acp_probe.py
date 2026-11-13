@@ -2,11 +2,23 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
+import os
+from pathlib import Path
 import queue
 import subprocess
 import threading
 from typing import Any
+
+
+# Use the production #31 teardown contract, not a second OS kill policy.
+_TEARDOWN = Path(__file__).resolve().parents[1] / "hermes-plugin/antigravity-acp/process_teardown.py"
+_spec = importlib.util.spec_from_file_location("acp_probe_process_teardown", _TEARDOWN)
+assert _spec is not None and _spec.loader is not None
+_teardown = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_teardown)
+terminate_process_tree = _teardown.terminate_process_tree
 
 
 def _reader(stream, out: queue.Queue[str]) -> None:
@@ -34,6 +46,7 @@ def main() -> int:
         encoding="utf-8",
         errors="replace",
         bufsize=1,
+        start_new_session=os.name != "nt",
     )
     assert proc.stdin is not None and proc.stdout is not None and proc.stderr is not None
     stdout_q: queue.Queue[str] = queue.Queue()
@@ -58,10 +71,9 @@ def main() -> int:
             },
         },
     }
-    proc.stdin.write(json.dumps(request, separators=(",", ":")) + "\n")
-    proc.stdin.flush()
-
     try:
+        proc.stdin.write(json.dumps(request, separators=(",", ":")) + "\n")
+        proc.stdin.flush()
         while True:
             line = stdout_q.get(timeout=ns.timeout)
             try:
@@ -86,8 +98,7 @@ def main() -> int:
                 "authMethods": result.get("authMethods"),
                 "agentCapabilities": result.get("agentCapabilities"),
             }
-            print(json.dumps(summary, indent=2, ensure_ascii=False))
-            return 0
+            break
     except queue.Empty as exc:
         stderr_lines: list[str] = []
         while not stderr_q.empty():
@@ -104,11 +115,13 @@ def main() -> int:
             f"{len(raw)} byte(s), sha256={fingerprint}"
         ) from exc
     finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+        # On Windows the command may be a .cmd wrapper: terminate() only
+        # kills cmd.exe and leaves the server image locked. Preserve the
+        # live parent until the owning tree walk; never scan/kill by name.
+        if terminate_process_tree(proc) is not True:
+            raise RuntimeError("ACP probe owned process-tree cleanup was not verified")
+    print(json.dumps(summary, indent=2, ensure_ascii=False))
+    return 0
 
 
 if __name__ == "__main__":
