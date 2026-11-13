@@ -333,6 +333,16 @@ jobs:
       - name: Run the actual Windows installer
         shell: cmd
         run: call install-windows.cmd < NUL
+      - name: Verify owned probe cleanup and removal refusal contracts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $python = Get-ChildItem "$env:HERMES_HOME\tools\python-*\python.exe" | Select-Object -Last 1 -ExpandProperty FullName
+          if (-not $python) { throw 'Hermes managed Python is missing' }
+          & $python -m unittest discover -s tests -p test_acp_probe_cleanup.py -v
+          if ($LASTEXITCODE -ne 0) { throw 'Owned probe cleanup regression failed' }
+          & $python -m unittest discover -s tests -p test_windows_lifecycle_guards.py -v
+          if ($LASTEXITCODE -ne 0) { throw 'Native removal refusal regression failed' }
       - name: Verify architecture, provider registration and ACP initialize
         shell: pwsh
         run: |
@@ -463,6 +473,16 @@ jobs:
       - name: Run the actual Windows installer
         shell: cmd
         run: call install-windows.cmd < NUL
+      - name: Verify owned probe cleanup and removal refusal contracts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $python = Get-ChildItem "$env:HERMES_HOME\tools\python-*\python.exe" | Select-Object -Last 1 -ExpandProperty FullName
+          if (-not $python) { throw 'Hermes managed Python is missing' }
+          & $python -m unittest discover -s tests -p test_acp_probe_cleanup.py -v
+          if ($LASTEXITCODE -ne 0) { throw 'Owned probe cleanup regression failed' }
+          & $python -m unittest discover -s tests -p test_windows_lifecycle_guards.py -v
+          if ($LASTEXITCODE -ne 0) { throw 'Native removal refusal regression failed' }
       - name: Verify architecture, provider registration and ACP initialize
         shell: pwsh
         run: |

@@ -89,6 +89,16 @@ def test_failure_phase_is_reported_without_raw_error(tmp_path, installed, capsys
     assert "private" not in out and "secret" not in out and str(tmp_path) not in out
 
 
+@pytest.mark.parametrize("name", ("test_acp_probe_cleanup.py", "test_windows_lifecycle_guards.py"))
+def test_both_windows_lanes_execute_native_regressions(name):
+    import re
+    workflow = (Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml").read_text()
+    for lane in ("windows-x64", "windows-arm64"):
+        block = re.search(rf"^  {lane}:\n.*?(?=^  [a-z][\w-]*:\n|\Z)", workflow, re.M | re.S)
+        assert block and f"unittest discover -s tests -p {name} -v" in block.group(0)
+        assert block.group(0).index(name) < block.group(0).index("id: attest")
+
+
 def test_filename_is_reduced_to_official_executable_type(tmp_path):
     import errno
     exc = PermissionError(errno.EACCES, "not logged", str(tmp_path / "official/1.4.4/agy_acp_server.exe"))
