@@ -4,11 +4,12 @@ name: Credential-free ACP checks
 #   Fast PR (every event):      fake-acp, upstream-hermes-compat,
 #                               catalog-floor-gate
 #   Release / full OS:          acp-clean-room, windows-x64, macos-arm64 —
-#                               every main push, every manual dispatch, and
-#                               PRs that touch the install surface
-#   Extended ARM:               windows-arm64, linux-aarch64 — every main
-#                               push, every manual dispatch, and PRs that
-#                               touch the packaging surface only
+#                               every manual dispatch and risk-required
+#                               PR/main changes to the install surface
+#   Extended ARM:               windows-arm64, linux-aarch64 — every manual
+#                               dispatch and packaging/unknown PR/main changes
+# Main push narrowing additionally requires trusted before/after metadata,
+# exact execution/checkout binding, complete history and proven fast-forward.
 # The always-running `CI gate` job is the single honest verdict: a lane
 # that the detected scope required and then failed, skipped, or never
 # reported fails the gate. Required status checks should be set to
@@ -66,7 +67,12 @@ jobs:
           CI_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           CI_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           CI_BEFORE_SHA: ${{ github.event.before }}
-          CI_AFTER_SHA: ${{ github.sha }}
+          CI_AFTER_SHA: ${{ github.event.after }}
+          CI_EXECUTION_SHA: ${{ github.sha }}
+          CI_PUSH_REF: ${{ github.ref }}
+          CI_PUSH_FORCED: ${{ toJSON(github.event.forced) }}
+          CI_PUSH_CREATED: ${{ toJSON(github.event.created) }}
+          CI_PUSH_DELETED: ${{ toJSON(github.event.deleted) }}
           CI_DISPATCH_REASON: ${{ github.event.inputs.reason }}
         run: python3 scripts/ci_change_scope.py --output "$GITHUB_OUTPUT" --summary "$GITHUB_STEP_SUMMARY"
 

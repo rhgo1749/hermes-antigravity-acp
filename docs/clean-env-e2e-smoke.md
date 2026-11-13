@@ -75,8 +75,9 @@ suite still never executes the real binary.
 Windows x64 and Windows arm64 have
 real-binary hosted-CI execution evidence (installer + provider registration
 + unauthenticated `initialize`), one tier below clean-room; since issue #9
-the arm64 lane is extended-ARM scope (main pushes, dispatch, packaging
-PRs). macOS arm64 and Linux aarch64 are registry-pinned with first-party
+the arm64 lane is extended-ARM scope (dispatch and packaging/unknown
+PR/main changes; uncertain push metadata requires full coverage).
+macOS arm64 and Linux aarch64 are registry-pinned with first-party
 digests, covered by the credential-free CI install mechanics smoke, and
 have executed native lifecycle evidence: Actions run
 [43198795406](https://github.com/rhgo1749/hermes-antigravity-acp/actions/runs/43198795406)

@@ -482,9 +482,9 @@ verification tier:
   an unauthenticated ACP `initialize` (`install_acp.py verify`). This is
   executed evidence one tier below the dedicated-UID clean-room class: no
   dedicated OS UID isolation, and no authentication frame or model prompt is
-  ever sent. Since issue #9 the x64 lane runs on every main push, every
-  manual full-matrix dispatch, and install-surface PRs; the arm64 lane is
-  an extended-ARM lane (main pushes, dispatch, packaging-surface PRs) —
+  ever sent. The x64 lane runs on manual full-matrix dispatch and
+  install-surface PR/main changes; the arm64 lane is an extended-ARM
+  lane (dispatch and packaging/unknown PR/main changes) —
   its executed status for a given change is whatever the latest cited
   green run on the relevant scope shows, never an assumption.
 - **Native-lifecycle and provider hosted-CI executed tier (not dedicated-UID
@@ -524,12 +524,10 @@ job is the single required verdict:
   (official Hermes `main`), `catalog-floor-gate` (minimum supported Hermes
   `v0.21.6`).
 - **Release / full OS:** `acp-clean-room` (Ubuntu x86_64 dedicated-UID),
-  `windows-x64`, `macos-arm64` — every main push, every manual
-  `workflow_dispatch` (full matrix, tested SHA recorded), and PRs that
-  touch the install surface.
-- **Extended ARM:** `windows-arm64`, `linux-aarch64` — every main push,
-  every dispatch, and packaging-surface PRs only; removed from the
-  ordinary PR critical path.
+  `windows-x64`, `macos-arm64` — every manual `workflow_dispatch`
+  (full matrix, tested SHA recorded) and install-surface PR/main changes.
+- **Extended ARM:** `windows-arm64`, `linux-aarch64` — every dispatch and
+  packaging/architecture/unknown PR/main changes, not every routine push.
 - **Change detection is widen-only:** `scripts/ci_change_scope.py`
   classifies paths; unknown paths, empty diffs, or detection failures
   fall back to the strongest scope. `scripts/ci_gate_check.py` fails the
@@ -540,8 +538,9 @@ job is the single required verdict:
 Phase A of [issue #28](https://github.com/rhgo1749/hermes-antigravity-acp/issues/28)
 adds an exact, reviewed platform-neutral test classification, not a pytest
 selection list. Ordinary plugin changes still require the three OS lanes;
-unreviewed tests remain full-matrix, and main pushes still run all five native
-targets. See [the path matrix, measured baseline and estimate boundaries](docs/ci-cost-phase-a.md).
+unreviewed tests remain full-matrix. The separate main-push follow-up reuses
+this conservative policy only for trusted fast-forward before/after ranges.
+See [the historical Phase A baseline](docs/ci-cost-phase-a.md).
 
 Phase B of the same issue adds the **release-candidate verification gate**,
 using the existing `workflow_dispatch` with `candidate_sha` (see the
@@ -551,9 +550,13 @@ attests its executed stages and the gate rechecks the selected remote branch
 HEAD after all required jobs and `CI gate` succeed. Wrong/stale SHA, branch
 movement, skipped/cancelled/missing/failed lanes and optional substitution
 fail closed. A PASS preserves a run/attempt-bound JSON evidence artifact.
-Ordinary PR and main-push selection policy is unchanged, including the full
-main matrix. New provider/removal checks add coverage and work; Phase B
-itself makes no main-CI saving claim. See [measured costs](docs/ci-cost-phase-b.md).
+Phase B itself did not reduce main-CI cost; see its
+[historical measurements](docs/ci-cost-phase-b.md). The separate
+[main-push scope policy](docs/ci-main-push-scope.md) classifies trusted push
+`before`/`after` ranges and runs full coverage on uncertainty. Release dispatch
+remains all-five and exact-SHA bound. Optimized-scope Hosted savings are
+**NOT VERIFIED** until a real optimized run executes; a full-matrix PR is not
+speedup evidence.
 
 ### Four distinct evidence classes (never conflated)
 

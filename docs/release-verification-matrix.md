@@ -120,14 +120,16 @@ identity substitutions and missing lifecycle wiring are retained with PR
 verification evidence. Publisher pins and all existing cancel/security tests
 are unchanged.
 
-Phase B **does not reduce main CI time**. Main pushes and dispatches still
-force all native lanes. PR Fast/OS/ARM classification remains Phase A's
-conservative policy; unknown changes still widen to the full matrix.
+Phase B itself **did not reduce main CI time**: its merged baseline main
+push and dispatch forced all native lanes. The separate
+[main-push follow-up](ci-main-push-scope.md) reuses Phase A's conservative
+path policy for trusted fast-forward pushes; unknown paths or uncertain
+metadata still widen to full coverage. Every dispatch remains full-matrix.
 Measured Actions records, queue/runner definitions and estimated-vs-measured
 boundaries are documented in [ci-cost-phase-b.md](ci-cost-phase-b.md).
 
-Only after independent verification of this gate may a separate Phase A
-follow-up change `ci_change_scope.py::scope_for_event`'s push policy and its
+After independent review and successful post-merge exact-main verification,
+the separate Phase A follow-up changes `ci_change_scope.py::scope_for_event`'s push policy and its
 workflow/contract tests: routine main push = Fast + risk-required OS;
 packaging/architecture = affected full native coverage; unknown/detection
 failure = full coverage; release dispatch = all five exact-SHA targets.
