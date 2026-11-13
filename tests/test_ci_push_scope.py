@@ -9,6 +9,40 @@ import pytest
 from test_ci_tier_contract import _job_block, _make_scratch_repo, gate_mod, scope_mod
 
 
+def test_agents_ci_contract_matches_risk_based_push_and_exact_sha_dispatch():
+    root = Path(__file__).resolve().parents[1]
+    agents = (root / "AGENTS.md").read_text(encoding="utf-8")
+    row = next(line for line in agents.splitlines() if line.startswith("| CI tiers"))
+    for clause in (
+        "Fast checks are required on every PR and main push",
+        "trusted `before`/`after` range by risk",
+        "OS lanes are required for install-surface code changes",
+        "packaging/architecture or unknown changes",
+        "Uncertain push metadata/history/diff requires the full matrix",
+        "Every `workflow_dispatch` requires all five native platforms",
+        "a dispatch with `candidate_sha`",
+        "exact-candidate-SHA `Release gate`",
+        "always-running, stable required `CI gate` fails closed",
+        "cancelled, skipped, or never reported",
+        "Release verification does not grant publication or human approval",
+    ):
+        assert clause in row, clause
+    for owner in (
+        "scripts/ci_change_scope.py", "scripts/ci_gate_check.py",
+        "scripts/release_gate_check.py", "tests/test_ci_tier_contract.py",
+        "tests/test_ci_push_scope.py", "tests/test_release_gate_contract.py",
+    ):
+        assert f"`{owner}`" in row and (root / owner).is_file()
+    # The old unconditional-main contract must not survive beside the new one.
+    assert "OS lanes run on main pushes" not in agents
+    assert "run only on main pushes" not in agents
+    workflow = (root / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    assert "name: CI gate" in _job_block(workflow, "ci-gate")
+    assert "if: always()" in _job_block(workflow, "ci-gate")
+    dispatch = scope_mod.scope_for_event({"CI_EVENT": "workflow_dispatch"})
+    assert (dispatch.os_lanes, dispatch.extended_arm) == (True, True)
+
+
 @pytest.fixture
 def repo(tmp_path, monkeypatch):
     root = _make_scratch_repo(tmp_path)

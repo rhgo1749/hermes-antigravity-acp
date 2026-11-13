@@ -103,6 +103,7 @@ weaken a classifier or invent a main push merely to obtain a savings chart.
 Post-review rollout must observe actual routine main events and compare their
 selected lanes and allocated runner time. No follow-up merge is authorized here.
 
-The protected `AGENTS.md` baseline tier row still requires reconciliation before
-merge; it was left unchanged when its separate write approval was not granted.
-README, workflow comments and this policy describe the proposed behavior.
+The protected `AGENTS.md` tier row now matches this policy after the formal
+protected-file edit gate permitted the scoped correction. README, workflow
+comments and the classifier retain the same risk rules; release verification
+still does not grant publication or human approval.
