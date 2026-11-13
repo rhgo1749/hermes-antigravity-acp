@@ -125,7 +125,11 @@ run, with isolation BLOCKED. This does not approve a candidate or prove a port-r
 disk or Python-version cause. New `last_readiness` records contain only fixed HTTP,
 transport, expected-PID and allowlisted readiness check states, never raw errors,
 paths, prompt/session text or credentials. A later container PASS is not retrospective
-proof of the old failure's cause.
+proof of the old failure's cause. The harness now reserves its loopback port below
+the kernel ephemeral range (read from `ip_local_port_range`) and holds the
+reservation socket until the Gateway's own bind, closing it only at launch. This
+removes the kernel-allocation steal window entirely for the tested class; whether
+it was the prior failure's actual cause is only answered by a new-HEAD Hosted run.
 
 ## CI gating policy
 

@@ -10,6 +10,7 @@ import argparse
 import hashlib
 import json
 import os
+import random
 from pathlib import Path
 import re
 import secrets
@@ -147,6 +148,7 @@ class Run:
         self.home = root / "hermes"
         self.plugin = self.profile / "plugins" / "model-providers" / "antigravity-acp"
         self.process: subprocess.Popen | None = None
+        self.reservation: socket.socket | None = None
         self.contender: subprocess.Popen | None = None
         self.started = time.monotonic()
         self.key = secrets.token_urlsafe(24)  # transport-only fixture key, not a vendor credential
@@ -237,6 +239,9 @@ class Run:
         env = self.environment(self.profile if contender else self.home)
         if contender:
             env["PHASE_C_CONTENDER"] = "1"
+        elif self.reservation is not None:
+            self.reservation.close()
+            self.reservation = None
         command = [sys.executable, "-u", str(self.repo / "scripts" / "gateway_cli_envelope.py"),
                    str(self.core), str(self.root), str(self.plugin), "gateway", "run", "--no-supervise"]
         # Raw logs never go to Actions stdout or uploaded artifacts.
@@ -297,13 +302,30 @@ class Run:
         archive.unlink()
         self.need(_snapshot(self.source_core, self.core) == _snapshot(self.source_core), "exported_core_bytes_mismatch")
         self.record["core_launch_mode"] = "byte_identical_source_export"
-        with socket.socket() as reservation:
-            reservation.bind(("127.0.0.1", 0))
-            self.port = reservation.getsockname()[1]
+        # Reserve a loopback port below the kernel's ephemeral range so runner
+        # outbound connections cannot steal it, and hold the reservation until
+        # the Gateway's own bind, closing it only at launch.
+        low = 32768
+        try:
+            low = int(Path("/proc/sys/net/ipv4/ip_local_port_range").read_text().split()[0])
+        except (OSError, ValueError, IndexError):
+            pass
+        candidates = list(range(20000, max(20001, low - 1)))
+        random.Random(secrets.randbits(64)).shuffle(candidates)
+        for port in candidates[:64]:
+            reservation = socket.socket()
+            try:
+                reservation.bind(("127.0.0.1", port))
+            except OSError:
+                reservation.close()
+                continue
+            self.reservation, self.port = reservation, port
+            break
+        self.need(self.reservation is not None, "no_reserved_loopback_port")
         self.need(all(Path(value).is_relative_to(self.root) for key, value in self.environment(self.home).items()
                       if key in {"HOME", "HERMES_HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME",
                                  "XDG_STATE_HOME", "XDG_RUNTIME_DIR", "TMPDIR", "TMP", "TEMP"}), "home_isolation_failed")
-        self.pass_stage("isolation", "fresh_private_root_clean_environment_loopback_dynamic_port")
+        self.pass_stage("isolation", "fresh_private_root_clean_environment_loopback_reserved_nonephemeral_port")
         self.current = "candidate_install"
         config = {"model": {"provider": "antigravity-acp", "default": "phase-c-model", "context_length": 65536},
                   "agent": {"max_turns": 2, "environment_probe": False},
@@ -498,9 +520,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.keep_diagnostics and os.environ.get("GITHUB_ACTIONS") == "true":
         parser.error("raw diagnostic retention is local-only")
     directory = tempfile.mkdtemp(prefix="gw-")
+    run = None
     try:
         root = Path(directory).resolve()
-        result = Run(core, repo, root, args.candidate_sha, args.timeout).execute()
+        run = Run(core, repo, root, args.candidate_sha, args.timeout)
+        result = run.execute()
         clean = (clean and _git(repo, "rev-parse", "HEAD") == args.candidate_sha
                  and not _git(repo, "status", "--porcelain", "--untracked-files=normal"))
         result["candidate_source_dirty"] = not clean
@@ -515,6 +539,9 @@ def main(argv: list[str] | None = None) -> int:
         args.output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
         print(json.dumps(result, sort_keys=True))
     finally:
+        if run is not None and run.reservation is not None:
+            run.reservation.close()
+            run.reservation = None
         if args.keep_diagnostics:
             print("local_diagnostic_root=" + directory)
         else:

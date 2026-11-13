@@ -117,7 +117,8 @@ def config_verified(inspect: dict, uid: int, gid: int, mounts: list[Path], work:
     expected.update({"/gw": (str(work), True), POLICY: (str(policy), False)})
     actual = {m["Destination"]: (m["Source"], m["RW"]) for m in inspect.get("Mounts", [])}
     return (inspect.get("Config", {}).get("User") == f"{uid}:{gid}"
-            and host.get("Privileged") is False and host.get("ReadonlyRootfs") is True
+            and host.get("Privileged") is False and host.get("Init") is False
+            and host.get("ReadonlyRootfs") is True
             and host.get("NetworkMode") == "none" and host.get("PidMode") == ""
             and host.get("IpcMode") == "none" and host.get("PidsLimit") == LIMIT
             and host.get("Memory") == 2 * 1024**3 and host.get("MemorySwap") == 2 * 1024**3
@@ -128,13 +129,20 @@ def config_verified(inspect: dict, uid: int, gid: int, mounts: list[Path], work:
 
 
 def rootfs_bytes(uid: int, gid: int) -> bytes:
+    # The entry ELF's PT_INTERP is /lib64/ld-linux-x86-64.so.2. The container's
+    # /lib64 must therefore symlink to the directory that actually holds the
+    # linker on this host (multiarch or lib64), which mounts_for already binds.
+    linker_dir = Path("/lib64/ld-linux-x86-64.so.2").resolve(strict=True).parent
+    if linker_dir != Path("/usr/lib64") and not linker_dir.is_relative_to(Path("/usr/lib")):
+        raise ValueError("dynamic_linker_unmounted")
     output = io.BytesIO()
     with tarfile.open(fileobj=output, mode="w") as archive:
         for name in ("usr", "etc", "dev", "proc", "gw", "tmp", "run"):
             item = tarfile.TarInfo(name)
             item.type, item.mode = tarfile.DIRTYPE, 0o755
             archive.addfile(item)
-        for name, target in (("bin", "usr/bin"), ("sbin", "usr/bin"), ("lib", "usr/lib"), ("lib64", "usr/lib64")):
+        for name, target in (("bin", "usr/bin"), ("sbin", "usr/bin"), ("lib", "usr/lib"),
+                             ("lib64", str(linker_dir).lstrip("/"))):
             item = tarfile.TarInfo(name)
             item.type, item.linkname = tarfile.SYMTYPE, target
             archive.addfile(item)
@@ -148,15 +156,19 @@ def rootfs_bytes(uid: int, gid: int) -> bytes:
     return output.getvalue()
 
 
-def _open_denied(path: str, flags: int) -> bool:
+def _open_denied(path: str, flags: int, *, missing_ok: bool = False) -> bool:
     # No Python audit hooks are installed in this parent. Use libc as a negative
     # control anyway so Python hook refusals cannot masquerade as kernel proof.
+    # ENOENT counts only for deliberately-unmounted outside paths (missing_ok);
+    # for files known to exist in a mount, absence is never write-protection proof.
     libc = ctypes.CDLL(None, use_errno=True)
     fd = libc.open(os.fsencode(path), flags, 0o600)
     if fd >= 0:
         os.close(fd)
         return False
-    return ctypes.get_errno() in {errno.ENOENT, errno.EACCES, errno.EPERM, errno.EROFS}
+    error = ctypes.get_errno()
+    allowed = {errno.EACCES, errno.EPERM, errno.EROFS} | ({errno.ENOENT} if missing_ok else set())
+    return error in allowed
 
 
 def inside() -> int:
@@ -178,8 +190,8 @@ def inside() -> int:
               "pid_namespace": os.getpid() == 1 and os.readlink("/proc/self/ns/pid") != policy["host_pid_ns"],
               "network_namespace": os.readlink("/proc/self/ns/net") != policy["host_net_ns"],
               "proc_inventory": inventory == {1} and not Path(f'/proc/{policy["outside_pid"]}').exists(),
-              "outside_read_denied": _open_denied(policy["outside_file"], os.O_RDONLY),
-              "outside_write_denied": _open_denied(policy["outside_file"], os.O_WRONLY),
+              "outside_read_denied": _open_denied(policy["outside_file"], os.O_RDONLY, missing_ok=True),
+              "outside_write_denied": _open_denied(policy["outside_file"], os.O_WRONLY, missing_ok=True),
               "source_write_denied": _open_denied(policy["repo"] + "/AGENTS.md", os.O_WRONLY),
               "root_write_denied": _open_denied("/etc/passwd", os.O_WRONLY),
               "external_connect_denied": external in {errno.ENETUNREACH, errno.EHOSTUNREACH, errno.EACCES, errno.EPERM},
@@ -230,12 +242,21 @@ def inside() -> int:
     record = json.loads(Path("/gw/verification.json").read_text())
     record["regression"] = regression
     record["confinement"] = {key: boundary[key] for key in ("status", "checks", "pid_namespace_sha256", "host_pid_namespace_sha256")}
+    # PID 1 is this process: orphaned Core descendants are re-parented here.
+    # Drain them with a bounded wait instead of a single sweep, so a slow exit
+    # is given a chance to land before a leak is declared.
+    drain_deadline = time.monotonic() + 20
     while True:
         try:
-            if os.waitpid(-1, os.WNOHANG)[0] == 0:
-                break
+            while os.waitpid(-1, os.WNOHANG)[0] != 0:
+                pass
         except ChildProcessError:
+            pass
+        if {p.pid for p in psutil.process_iter()} == {os.getpid()}:
             break
+        if time.monotonic() >= drain_deadline:
+            break
+        time.sleep(0.25)
     record["final_namespace_live_count"] = sum(p.status() != psutil.STATUS_ZOMBIE for p in psutil.process_iter())
     record["final_namespace_process_count"] = sum(1 for _ in psutil.process_iter())
     if record["final_namespace_process_count"] != 1:

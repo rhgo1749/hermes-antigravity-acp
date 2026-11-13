@@ -15,7 +15,7 @@ from scripts.gateway_process_policy import shutdown_command_verified
 class DockerBoundaryTests(unittest.TestCase):
     def facts(self):
         return {"Config": {"User": "1001:1001"}, "HostConfig": {
-            "Privileged": False, "ReadonlyRootfs": True, "NetworkMode": "none", "PidMode": "", "IpcMode": "none",
+            "Privileged": False, "Init": False, "ReadonlyRootfs": True, "NetworkMode": "none", "PidMode": "", "IpcMode": "none",
             "PidsLimit": 128, "Memory": 2 * 1024**3, "MemorySwap": 2 * 1024**3, "NanoCpus": 2 * 10**9,
             "PortBindings": {}, "CapAdd": None, "CapDrop": ["ALL"], "SecurityOpt": ["no-new-privileges"],
             "Devices": [], "DeviceRequests": []},
@@ -38,7 +38,7 @@ class DockerBoundaryTests(unittest.TestCase):
 
     def test_real_inspect_contract_rejects_each_relaxed_boundary(self):
         self.assertTrue(self.verify(self.facts()))
-        for key, value in (("Privileged", True), ("ReadonlyRootfs", False), ("NetworkMode", "host"),
+        for key, value in (("Privileged", True), ("Init", True), ("ReadonlyRootfs", False), ("NetworkMode", "host"),
                            ("PidMode", "host"), ("IpcMode", "host"), ("PidsLimit", 0), ("Memory", 0),
                            ("MemorySwap", -1), ("NanoCpus", 0), ("CapDrop", []), ("SecurityOpt", []),
                            ("CapAdd", ["SYS_ADMIN"]), ("PortBindings", {"8080/tcp": []}),
@@ -78,6 +78,25 @@ class DockerBoundaryTests(unittest.TestCase):
                 self.assertTrue(docker.validate_confinement(bad))
         self.assertTrue(docker.validate_confinement({}))
         self.assertTrue(docker.validate_docker_receipt(good))
+
+    def test_rootfs_lib64_symlink_resolves_to_mounted_linker_dir(self):
+        import io
+        import tarfile
+        from pathlib import Path as P
+        if not P("/lib64/ld-linux-x86-64.so.2").exists():
+            self.skipTest("x86_64 linker path absent on this host")
+        with tarfile.open(fileobj=io.BytesIO(docker.rootfs_bytes(1001, 1001))) as archive:
+            targets = {member.name: member.linkname for member in archive.getmembers() if member.issym()}
+        self.assertEqual(targets["lib64"], str(P("/lib64/ld-linux-x86-64.so.2").resolve(strict=True).parent).lstrip("/"))
+        self.assertTrue((P("/") / targets["lib64"] / "ld-linux-x86-64.so.2").is_file())
+
+    def test_source_absence_is_not_write_protection_evidence(self):
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="gw-denial-control-") as directory:
+            missing = str(Path(directory) / "missing-source")
+            import os
+            self.assertFalse(docker._open_denied(missing, os.O_WRONLY))
+            self.assertTrue(docker._open_denied(missing, os.O_WRONLY, missing_ok=True))
 
     def test_outer_attestation_cleanup_and_regression_are_mandatory(self):
         good = {"confinement": {"status": "PASS", "checks": {name: True for name in docker.CHECKS},
