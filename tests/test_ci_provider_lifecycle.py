@@ -66,3 +66,31 @@ def test_cli_fails_without_claiming_pass(tmp_path, installed, capsys):
     output = capsys.readouterr().out
     assert '"status": "FAIL"' in output and '"status": "PASS"' not in output
     assert "private path" not in output
+
+
+@pytest.mark.parametrize("phase", ("status_before", "verify", "delete", "status_after"))
+def test_failure_phase_is_reported_without_raw_error(tmp_path, installed, capsys, phase):
+    import errno
+    import json
+
+    before, _, status, verify, delete = installed
+    failure = PermissionError(errno.EACCES, "private credential-shaped exception", str(tmp_path / "secret"))
+    if phase == "status_before":
+        status.side_effect = failure
+    elif phase == "status_after":
+        status.side_effect = [before, failure]
+    else:
+        (verify if phase == "verify" else delete).side_effect = failure
+    assert driver.main(["--hermes-home", str(tmp_path)]) == 1
+    out = capsys.readouterr().out
+    record = json.loads(out)
+    assert record["status"] == "FAIL" and record["phase"] == phase
+    assert record["error_class"] == "PermissionError"
+    assert "private" not in out and "secret" not in out and str(tmp_path) not in out
+
+
+def test_filename_is_reduced_to_official_executable_type(tmp_path):
+    import errno
+    exc = PermissionError(errno.EACCES, "not logged", str(tmp_path / "official/1.4.4/agy_acp_server.exe"))
+    result = driver.failure_record(exc, tmp_path / "home", tmp_path / "official", tmp_path / "bin")
+    assert result["path_type"] == "official_executable"
