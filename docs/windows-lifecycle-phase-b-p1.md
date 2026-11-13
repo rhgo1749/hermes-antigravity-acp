@@ -12,7 +12,9 @@ Diagnostic commit `c35d542539cc726f398d9ae44908293cf1358536` adds only fixed
 failure vocabulary (phase, operation, safe managed-path class, exception class,
 errno/winerror), not raw paths, exceptions, credentials or session information.
 The native x64 [job 131699865245](https://github.com/rhgo1749/hermes-antigravity-acp/actions/runs/43368911592/job/131699865245)
-confirmed:
+confirmed the following failure. ARM64
+[job 131699865188](https://github.com/rhgo1749/hermes-antigravity-acp/actions/runs/43368911592/job/131699865188)
+independently emitted the identical record and left five orphan official servers:
 
 ```json
 {"phase":"delete","operation":"remove_official","path_type":"official_executable","error_class":"PermissionError","errno":13,"winerror":5}
@@ -67,6 +69,15 @@ permission denial (exactly one attempt) and a genuine Windows locked-file
 negative. The lock case must fail and preserve the executable; only releasing
 the fixture's own handle permits a subsequent explicit removal. It is skipped
 on non-Windows, not reported as native-Windows PASS from Linux.
+
+The first fixed-candidate x64 job passed all three native probe cleanup tests,
+then rejected two negative fixtures as unmanaged **before** reaching deletion.
+Their direct `_write_launcher` fixture used an unresolved temporary-root alias,
+whereas production install and uninstall both resolve their roots. This was
+reproduced with a POSIX symlink alias (RED), then corrected solely by resolving
+the test root (GREEN); installer ownership checks remain byte-identical. A
+regression preserves that fixture/source parity. Native Windows requires no
+symlink privilege: its existing temp alias exercises the same fixture path.
 
 `tests/test_ci_provider_lifecycle.py` checks diagnostics never echo raw paths or
 error text and both native Windows lanes execute these regressions before

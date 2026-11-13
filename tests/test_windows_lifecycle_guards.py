@@ -23,7 +23,8 @@ class LifecycleRemovalGuards(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="acp-lifecycle-negative-")
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        # Match install()/uninstall(): Windows temp roots can use short aliases.
+        self.root = Path(self.temp.name).resolve()
         self.home = self.root / "home"
         self.prefix = self.root / "official"
         self.bin_dir = self.root / "bin"
@@ -35,6 +36,26 @@ class LifecycleRemovalGuards(unittest.TestCase):
         self.executable.write_bytes(b"owned fixture, never executed")
         self.launcher = self.bin_dir / official._launcher_name()
         official._write_launcher(self.launcher, self.executable, official.resolve_distribution().args)
+
+    @unittest.skipIf(os.name == "nt", "symlink creation requires privileges on Windows; native temp alias is exercised there")
+    def test_fixture_matches_installer_canonical_paths_even_through_temp_alias(self):
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory(prefix="acp-alias-control-") as directory:
+            outer = Path(directory)
+            real = outer / "real"
+            real.mkdir()
+            alias = outer / "alias"
+            alias.symlink_to(real, target_is_directory=True)
+            case = LifecycleRemovalGuards("test_permission_denial_is_not_retried_or_reclassified_success")
+            with patch.object(tempfile, "TemporaryDirectory", return_value=SimpleNamespace(name=str(alias), cleanup=lambda: None)):
+                case.setUp()
+            try:
+                # Production install() canonicalizes roots before writing its
+                # ownership launcher; the test fixture must do the same.
+                official.uninstall(case.prefix, case.bin_dir)
+                self.assertFalse(case.version_dir.exists())
+            finally:
+                case.doCleanups()
 
     def test_unmanaged_launcher_is_preserved_before_deletion(self):
         self.launcher.write_text("unmanaged fixture\n", encoding="utf-8")
