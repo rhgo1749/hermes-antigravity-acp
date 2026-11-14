@@ -70,7 +70,11 @@ class ProviderOriginTests(unittest.TestCase):
 
     def test_observed_original_loader_copy_passes_for_factory_and_cancel(self):
         frozen = self.snapshot()
-        self.bind(frozen)
+        self.loader.__dict__["result"] = frozen
+        previous = sys.getprofile()
+        with self.origin.observing():
+            self.loader.__dict__["_snapshot"](self.plugin, frozen.parent.name)
+        self.assertIs(previous, sys.getprofile())
         self.assertTrue(self.origin.accepts(frozen / "__init__.py", "__init__.py"))
         self.assertTrue(self.origin.accepts(frozen / "client.py", "client.py"))
         self.assertEqual(1, self.origin.receipt()["frozen_copies"])
