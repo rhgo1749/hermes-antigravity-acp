@@ -140,15 +140,15 @@ class DockerBoundaryTests(unittest.TestCase):
             self.assertFalse(docker._open_denied(missing, os.O_WRONLY))
             self.assertTrue(docker._open_denied(missing, os.O_WRONLY, missing_ok=True))
 
-    def test_outer_attestation_cleanup_and_regression_are_mandatory(self):
-        good = {"confinement": {"status": "PASS", "checks": {name: True for name in docker.CHECKS},
+    def test_outer_attestation_cleanup_and_contract_are_mandatory(self):
+        good = {"candidate_sha": "a" * 40, "confinement": {"status": "PASS", "checks": {name: True for name in docker.CHECKS},
                                 "pid_namespace_sha256": "1" * 64, "host_pid_namespace_sha256": "2" * 64},
                 "docker_execution": {"status": "PASS", "config_verified": True, "owned_pid_namespace_verified": True,
                                      "outside_canary_unchanged": True, "container_removed": True, "image_removed": True},
-                "regression": {"status": "PASS", "tests": 1, "errors": 0, "failures": 0, "skipped": 0},
+                "docker_contract_version": 2, "checkout_sha": "a" * 40,
                 "final_namespace_live_count": 1, "final_namespace_process_count": 1}
         self.assertEqual([], docker.validate_docker_receipt(good))
-        for key in ("docker_execution", "regression", "final_namespace_live_count", "final_namespace_process_count", "confinement"):
+        for key in ("docker_execution", "docker_contract_version", "checkout_sha", "final_namespace_live_count", "final_namespace_process_count", "confinement"):
             with self.subTest(missing=key):
                 bad = deepcopy(good)
                 bad.pop(key)

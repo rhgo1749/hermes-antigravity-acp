@@ -23,12 +23,6 @@ import sys
 import tarfile
 import tempfile
 import time
-import xml.etree.ElementTree as ET
-
-try:
-    import gateway_diagnostics as diagnostics
-except ImportError:
-    from scripts import gateway_diagnostics as diagnostics
 
 POLICY = "/phasec-policy.json"
 LIMIT = 128
@@ -68,7 +62,9 @@ def validate_confinement(record: dict) -> list[str]:
     return []
 
 
-def validate_docker_receipt(record: dict) -> list[str]:
+def validate_docker_receipt(record: object) -> list[str]:
+    if not isinstance(record, dict):
+        return ["docker_receipt_not_object"]
     errors = validate_confinement(record)
     docker = record.get("docker_execution")
     required = ("config_verified", "owned_pid_namespace_verified", "outside_canary_unchanged", "container_removed", "image_removed")
@@ -79,12 +75,14 @@ def validate_docker_receipt(record: dict) -> list[str]:
         errors.append("container_process_residue")
     if type(record.get("final_namespace_process_count")) is not int or record["final_namespace_process_count"] != 1:
         errors.append("container_zombie_residue")
-    regression = record.get("regression")
-    if (not isinstance(regression, dict) or regression.get("status") != "PASS"
-            or any(type(regression.get(name)) is not int for name in ("tests", "failures", "errors", "skipped"))
-            or regression["tests"] < 1 or regression["failures"] != 0 or regression["errors"] != 0
-            or not 0 <= regression["skipped"] <= regression["tests"]):
-        errors.append("container_regression_not_pass")
+    if type(record.get("docker_contract_version")) is not int or record["docker_contract_version"] != 2:
+        errors.append("docker_contract_version_mismatch")
+    candidate = record.get("candidate_sha")
+    if (not isinstance(candidate, str) or len(candidate) != 40 or any(c not in "0123456789abcdef" for c in candidate)
+            or record.get("checkout_sha") != candidate):
+        errors.append("docker_checkout_identity_mismatch")
+    if any(key == "regression" or key.startswith("regression_") for key in record):
+        errors.append("legacy_regression_evidence")
     return errors
 
 
@@ -209,47 +207,45 @@ def _open_denied(path: str, flags: int, *, missing_ok: bool = False) -> bool:
     return error in allowed
 
 
-def run_regression(repo: Path, environment: dict, work: Path = Path("/gw")) -> dict:
-    """Original suite/timeout plus optional diagnostics; no diagnostic can grant PASS."""
-    from importlib.metadata import PackageNotFoundError, version
-    import re
-
-    xml = work / "regression.xml"
-    before = diagnostics.memory_snapshot()
-    returncode = None
+def run_gateway(policy: dict, boundary: dict, work: Path = Path("/gw")) -> int:
+    """Boundary v2: run the real Gateway directly, never a duplicate test suite."""
+    proof = {key: boundary.get(key) for key in ("status", "checks", "pid_namespace_sha256", "host_pid_namespace_sha256")}
+    if validate_confinement({"confinement": proof}) or not namespace_verified():
+        return 1
+    import psutil
     try:
-        with (work / "regression.log").open("wb") as output:
-            completed = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "tests",
-                                        f"--junitxml={xml}"], cwd=repo, env=environment,
-                                       stdout=output, stderr=subprocess.STDOUT, timeout=180)
-        returncode = completed.returncode
-    except (OSError, subprocess.SubprocessError):
-        pass  # Still FAIL; preserve safe diagnostics on timeout/launch failure, never the exception text.
-    after = diagnostics.memory_snapshot()
-    summary = diagnostics.junit_summary(xml, repo)
-    try:
-        pytest_version = version("pytest")
-    except PackageNotFoundError:
-        pytest_version = diagnostics.NA
-    summary["runtime"] = {"python": ".".join(map(str, sys.version_info[:3])),
-                          "pytest": pytest_version if re.fullmatch(r"[0-9]{1,3}(?:\.[0-9]{1,3}){1,3}", pytest_version)
-                          else diagnostics.NA}
-    regression: dict = dict.fromkeys(("tests", "failures", "errors", "skipped"), -1)
-    try:
-        with xml.open("rb") as stream:
-            data = stream.read(diagnostics.MAX_XML_BYTES + 1)
-        if len(data) > diagnostics.MAX_XML_BYTES or b"<!" in data or b"\x00" in data:
-            raise ValueError("unsafe_or_oversized_xml")
-        suite = ET.fromstring(data).findall("testsuite")
-        if len(suite) == 1:
-            regression = {name: int(suite[0].get(name, "-1")) for name in regression}
-    except (OSError, ValueError, ET.ParseError):
-        pass
-    regression["status"] = "PASS" if (returncode == 0 and regression["tests"] > 0
-        and regression["errors"] == regression["failures"] == 0
-        and 0 <= regression["skipped"] <= regression["tests"]) else "FAIL"
-    return {"regression": regression, "regression_summary": summary,
-            "regression_memory": diagnostics.memory_diagnostics(before, after)}
+        from gateway_e2e import main as gateway_main, validate_receipt
+    except ImportError:
+        from scripts.gateway_e2e import main as gateway_main, validate_receipt
+    result = gateway_main(["--hermes-root", policy["core"], "--candidate-sha", policy["candidate"],
+                           "--output", str(work / "verification.json")])
+    record = json.loads((work / "verification.json").read_text())
+    record.update(docker_contract_version=2, checkout_sha=policy["candidate"])
+    record["confinement"] = proof
+    # PID 1 is this process: orphaned Core descendants are re-parented here.
+    # Drain them with a bounded wait instead of a single sweep, so a slow exit
+    # is given a chance to land before a leak is declared.
+    drain_deadline = time.monotonic() + 20
+    while True:
+        try:
+            while os.waitpid(-1, os.WNOHANG)[0] != 0:
+                pass
+        except ChildProcessError:
+            pass
+        if {p.pid for p in psutil.process_iter()} == {os.getpid()}:
+            break
+        if time.monotonic() >= drain_deadline:
+            break
+        time.sleep(0.25)
+    record["final_namespace_live_count"] = sum(p.status() != psutil.STATUS_ZOMBIE for p in psutil.process_iter())
+    record["final_namespace_process_count"] = sum(1 for _ in psutil.process_iter())
+    if record["final_namespace_process_count"] != 1:
+        record["status"] = "FAIL"
+        result = 1
+    if validate_receipt(record, policy["candidate"]):
+        record["status"], result = "FAIL", 1
+    (work / "verification.json").write_text(json.dumps(record, indent=2) + "\n")
+    return result
 
 
 def inside() -> int:
@@ -292,51 +288,8 @@ def inside() -> int:
         time.sleep(0.05)
     if not namespace_verified():
         return 1
-    # Run every test file with the same real Core dependencies, inside the
-    # exercised boundary. Raw test output and case/session IDs stay private.
-    environment = dict(os.environ)
-    for name in ("os-home", "regression-home", "regression-tmp", "regression-config"):
-        Path("/gw", name).mkdir(exist_ok=True)
-    environment.update({"HOME": "/gw/os-home", "HERMES_HOME": "/gw/regression-home",
-                        "TMPDIR": "/gw/regression-tmp", "XDG_CONFIG_HOME": "/gw/regression-config",
-                        "PYTHONPATH": policy["core"], "TZ": "UTC", "LANG": "C.UTF-8",
-                        "HERMES_DISABLE_LAZY_INSTALLS": "1", "OPENAI_API_KEY": "synthetic-offline-test-key"})
-    evidence = run_regression(Path(policy["repo"]), environment)
-    regression = evidence["regression"]
-    # Same real driver/CLI, inside this namespace; never execute it on the host.
-    from gateway_e2e import REQUIRED_STAGES, _git, main as gateway_main
-    if regression["status"] != "PASS":
-        Path("/gw/verification.json").write_text(json.dumps({"schema_version": 1, "status": "FAIL",
-            "candidate_sha": policy["candidate"], "hermes_commit": _git(Path(policy["core"]), "rev-parse", "HEAD"),
-            **evidence, "stages": {name: {"status": "NOT_RUN"} for name in REQUIRED_STAGES}}))
-        return 1
-    result = gateway_main(["--hermes-root", policy["core"], "--candidate-sha", policy["candidate"],
-                           "--output", "/gw/verification.json"])
-    record = json.loads(Path("/gw/verification.json").read_text())
-    record.update(evidence)
-    record["confinement"] = {key: boundary[key] for key in ("status", "checks", "pid_namespace_sha256", "host_pid_namespace_sha256")}
-    # PID 1 is this process: orphaned Core descendants are re-parented here.
-    # Drain them with a bounded wait instead of a single sweep, so a slow exit
-    # is given a chance to land before a leak is declared.
-    drain_deadline = time.monotonic() + 20
-    while True:
-        try:
-            while os.waitpid(-1, os.WNOHANG)[0] != 0:
-                pass
-        except ChildProcessError:
-            pass
-        if {p.pid for p in psutil.process_iter()} == {os.getpid()}:
-            break
-        if time.monotonic() >= drain_deadline:
-            break
-        time.sleep(0.25)
-    record["final_namespace_live_count"] = sum(p.status() != psutil.STATUS_ZOMBIE for p in psutil.process_iter())
-    record["final_namespace_process_count"] = sum(1 for _ in psutil.process_iter())
-    if record["final_namespace_process_count"] != 1:
-        record["status"] = "FAIL"
-        result = 1
-    Path("/gw/verification.json").write_text(json.dumps(record, indent=2) + "\n")
-    return result
+    Path("/gw/os-home").mkdir(exist_ok=True)
+    return run_gateway(policy, boundary)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -357,7 +310,8 @@ def main(argv: list[str] | None = None) -> int:
     repo, core = Path(__file__).resolve().parent.parent, args.hermes_root.resolve(strict=True)
     if _git(repo, "rev-parse", "HEAD") != args.candidate_sha:
         parser.error("candidate must equal checkout HEAD")
-    record = {"schema_version": 1, "status": "FAIL", "candidate_sha": args.candidate_sha,
+    record = {"schema_version": 1, "docker_contract_version": 2, "checkout_sha": args.candidate_sha,
+              "status": "FAIL", "candidate_sha": args.candidate_sha,
               "hermes_commit": _git(core, "rev-parse", "HEAD"),
               "stages": {name: {"status": "NOT_RUN", "detail": "not_executed"} for name in REQUIRED_STAGES}}
     image = container = None
@@ -425,7 +379,12 @@ def main(argv: list[str] | None = None) -> int:
         if not (work / "verification.json").exists():
             raise RuntimeError("container_gateway_receipt_missing")
         diagnostics = {key: value for key, value in record.items() if key.startswith("docker_config_")}
-        record = json.loads((work / "verification.json").read_text())
+        observed_record = json.loads((work / "verification.json").read_text())
+        if (not isinstance(observed_record, dict) or observed_record.get("candidate_sha") != args.candidate_sha
+                or observed_record.get("checkout_sha") != args.candidate_sha
+                or observed_record.get("hermes_commit") != record["hermes_commit"]):
+            raise RuntimeError("container_receipt_identity_mismatch")
+        record = observed_record
         record.update(diagnostics)
         if process.returncode != 0:
             record["status"] = "FAIL"
@@ -437,7 +396,8 @@ def main(argv: list[str] | None = None) -> int:
         args.output.write_text(json.dumps(record, indent=2) + "\n")
     except (RuntimeError, OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
         allowed = {"hosted_docker_unavailable", "nonroot_runner_required", "image_identity_missing", "docker_config_not_verified",
-                   "container_boundary_not_ready", "owned_container_namespace_not_verified", "container_gateway_receipt_missing"}
+                   "container_boundary_not_ready", "owned_container_namespace_not_verified", "container_gateway_receipt_missing",
+                   "container_receipt_identity_mismatch"}
         reason = str(exc) if isinstance(exc, RuntimeError) and str(exc) in allowed else type(exc).__name__
         record["status"] = "FAIL"
         record["stages"]["isolation"] = {"status": "BLOCKED", "detail": reason}

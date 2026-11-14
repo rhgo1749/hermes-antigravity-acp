@@ -30,7 +30,14 @@ def check_outputs(outputs: dict, *, required: bool, candidate: str | None = None
     sha = candidate if candidate is not None else outputs.get("attested_sha", "")
     if not isinstance(sha, str):
         return ["gateway_candidate_missing"]
-    return [*validate_receipt(record, sha), *validate_docker_receipt(record)] if isinstance(record, dict) else ["gateway_record_malformed"]
+    if not isinstance(record, dict):
+        return ["gateway_record_malformed"]
+    problems = [*validate_receipt(record, sha), *validate_docker_receipt(record)]
+    if outputs.get("attested_sha") != sha or record.get("checkout_sha") != sha:
+        problems.append("gateway_checkout_identity_mismatch")
+    if not isinstance(outputs.get("gateway_core"), str) or record.get("hermes_commit") != outputs["gateway_core"]:
+        problems.append("gateway_core_identity_mismatch")
+    return problems
 
 
 def main() -> int:

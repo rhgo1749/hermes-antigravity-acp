@@ -779,6 +779,7 @@ jobs:
     outputs:
       attested_sha: ${{ steps.attest.outputs.sha }}
       gateway_result: ${{ steps.gateway.outcome }}
+      gateway_core: ${{ steps.hermes-target.outputs.commit }}
       gateway_record: ${{ steps.gateway-attest.outputs.record }}
     steps:
       - uses: actions/checkout@v4

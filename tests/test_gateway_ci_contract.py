@@ -16,7 +16,7 @@ SHA = "a" * 40
 
 
 def good_outputs():
-    return {"attested_sha": SHA, "gateway_result": "success", "gateway_record": json.dumps({
+    return {"attested_sha": SHA, "gateway_core": "b" * 40, "gateway_result": "success", "gateway_record": json.dumps({
         "schema_version": 1, "candidate_sha": SHA, "hermes_commit": "b" * 40, "status": "PASS", "candidate_source_dirty": False,
                 "provider_origin": {"status": "PASS", "candidate_sha": SHA, "tree_sha256": "3" * 64,
                                     "home_sha256": "4" * 64, "frozen_copies": 0, "errors": []},
@@ -25,7 +25,7 @@ def good_outputs():
                 "confinement": {"status": "PASS", "checks": {name: True for name in CHECKS}, "pid_namespace_sha256": "1" * 64, "host_pid_namespace_sha256": "2" * 64},
                 "docker_execution": {"status": "PASS", "config_verified": True, "owned_pid_namespace_verified": True, "outside_canary_unchanged": True,
                                      "container_removed": True, "image_removed": True},
-                "regression": {"status": "PASS", "tests": 1, "failures": 0, "errors": 0, "skipped": 0},
+                "docker_contract_version": 2, "checkout_sha": SHA,
                 "final_namespace_live_count": 1, "final_namespace_process_count": 1,
         "stages": {name: {"status": "PASS"} for name in REQUIRED_STAGES}})}
 

@@ -20,7 +20,7 @@ class GatewayEvidenceTests(unittest.TestCase):
                 "confinement": {"status": "PASS", "checks": {name: True for name in CHECKS}, "pid_namespace_sha256": "1" * 64, "host_pid_namespace_sha256": "2" * 64},
                 "docker_execution": {"status": "PASS", "config_verified": True, "owned_pid_namespace_verified": True, "outside_canary_unchanged": True,
                                      "container_removed": True, "image_removed": True},
-                "regression": {"status": "PASS", "tests": 1, "failures": 0, "errors": 0, "skipped": 0},
+                "docker_contract_version": 2, "checkout_sha": "a" * 40,
                 "final_namespace_live_count": 1, "final_namespace_process_count": 1,
                 "stages": {name: {"status": "PASS", "detail": "executed"} for name in gateway.REQUIRED_STAGES}}
 

@@ -94,6 +94,45 @@ The observed current official Core contender contract is a successful no-op:
 requires the original owner PID and unchanged lock plus a subsequent real request;
 exit zero alone is insufficient. This is safe reuse, not rejection.
 
+## Validation responsibility contract v2 (PR #39 redesign)
+
+The operator explicitly approved removing full in-container pytest as a Gateway
+prerequisite. This is a **changed assurance**, not equivalent coverage or a PASS
+for historical failures. Run 43603573261 had 180 failures / 0 errors / 2 skips
+in 1,693 JUnit records; cgroup OOM-kill delta was zero and memory peak 924,061,696
+bytes. Gateway's fourteen stages were NOT_RUN. Those failures remain unresolved
+observations, not established ACP product defects.
+
+| Owner | Required evidence | Does not establish |
+|---|---|---|
+| Fast | Entire automatically discovered credential-free suite, Ruff, public-tree audit | Compatibility of that entire suite with the restricted container filesystem/process budget |
+| Latest + floor strict Core | Official unmodified provider API, candidate/home/frozen-byte provenance, credential boundary and delegate affinity | A running Gateway |
+| Docker boundary | Non-root, empty capabilities, no-new-privileges, separate PID/network namespaces, network none, read-only roots and exact mounts, loopback, host-verified ownership | Full-suite PASS inside the container |
+| Real Gateway in that boundary | All fourteen required stages, original scratch/shutdown checks, source bytes unchanged, PID1-only final inventory | Authenticated Google inference or vendor-side cancellation |
+
+Only after actual kernel controls AND the host ownership handshake pass does the
+same container process call the existing Gateway driver. No pytest process runs
+there first. The 2-GiB/128-PID limits, all platform/strict lanes and scope policy
+are unchanged. No skip/xfail, synthetic regression PASS or ignored failed suite is
+used. There is no extra Hosted job, diagnostic framework or direct-host fallback.
+
+Docker receipts add integer `docker_contract_version: 2` and `checkout_sha` equal
+to the executed candidate SHA. The Gateway receipt itself retains schema 1 and
+all fourteen stages. CI and Release reject missing/old/wrong-typed Docker contract
+versions, conflicting checkout/candidate/Core identities, legacy `regression*`
+fields, incomplete confinement, process residue, failed owned cleanup and any
+non-PASS required Gateway stage. The workflow exports the independently resolved
+official Core SHA alongside the receipt so both outer gates bind the same target.
+For a PR the executed candidate/checkout is the synthetic merge; the PR source
+HEAD is separately recorded from GitHub. Dispatch-only exact-SHA Release semantics
+are unchanged; no Release dispatch is authorized by this redesign.
+
+The unused whole-suite JUnit/memory/PID diagnostics and their dedicated tests are
+removed, not repurposed as an isolation gate. The validated uncommitted PID work
+is preserved in an operator-local evidence bundle outside the repository with
+full source copies, `pid-work.patch` and validation hashes. Historical Hosted
+receipts remain evidence only for their original SHA/Core/run identities.
+
 ## Conditionally approved Hosted Docker boundary
 
 The operator authorized a non-root container **only on the existing Linux GitHub
@@ -119,13 +158,12 @@ container loopback bind works. The host separately inspects exact Docker setting
 mount set and the owned live container PID namespace before releasing execution.
 Only compared namespace hashes, fixed statuses and counts enter the receipt.
 
-Every pytest file runs inside the exercised boundary with the real dependency
-interpreter (180-second suite deadline; sanitized JUnit counts only), followed by
-the original Gateway driver in the same container. Native Fast/OS/Extended ARM,
-latest/floor strict seams and the stable CI/Release aggregators remain unchanged.
-This extra full regression is measured as part of container cost, not concealed
-as free reuse. The local CI-equivalent credential-free suite remains separate
-from this full real-Core run.
+The original Gateway driver runs directly after the exercised boundary passes.
+Full pytest remains in Fast and the purpose-specific official Core strict lanes,
+not as a duplicate in-container prerequisite. This intentionally drops the
+whole-suite-in-container guarantee described in the historical v1 contract.
+Native Fast/OS/Extended ARM and latest/floor strict obligations remain required;
+the stable CI/Release aggregators enforce the v2 Docker/Gateway receipt.
 
 The original Core `python -I` scratch child is admitted only after exact executable,
 argv, import-path and canonical owned-target checks **and actual namespace proof**.
