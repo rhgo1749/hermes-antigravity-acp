@@ -136,6 +136,23 @@ Re-audit of every Hermes-core import in `hermes_compat.py` against the official 
 - **Enforcer added (reworked after independent review).** `tests/test_plugin_manifest.py::test_hermes_compat_core_import_surface_is_the_documented_inventory` pins the exact core-import surface of `hermes_compat.py` (6 catalog-listed + 4 documented private) in the credential-free lane, and it is the **blocking** gate — the upstream `hermes plugins validate` Rule 9 warning exits 0 and is never claimed as a blocker. Detection mirrors the official validator's `_imported()` semantics: static `import`/non-relative `from` imports **and** string-literal `importlib.import_module(...)`/`import_module(...)` calls. Hermes-owned namespaces come from `HERMES_TOP_LEVEL_SNAPSHOT`, the union of the two official Core definitions (`plugin_validate_private_imports._hermes_packages`, `plugin_validate_core_override._hermes_top_level`) over `v0.21.6`/`v0.23.0`/`v0.23.1`/`main@67664e23`; the sync check `tests/test_upstream_hermes_runtime_contracts.py::test_credential_free_namespace_snapshot_covers_installed_core` fails both upstream CI lanes if the installed Core ever reports a namespace outside the snapshot. Tightening-only deviations from the official pass, documented in the test docstring: `TYPE_CHECKING` imports are counted, per-symbol exactness replaces module-level allowance, plugin-own relative imports are skipped. Honest boundary (shared with the official static pass): computed module names (f-strings, variables) are invisible to AST scanning; the gate covers literal import spellings. Negative regressions (isolated temp files, production file untouched): unregistered `import hermes_state`, dynamic `importlib.import_module("agent.file_safety")`, unregistered `from cron import ...`, and removal of a registered import each fail; registered spellings and relative plugin imports pass.
 - **Method note.** Findings were computed by importing each ref's own `hermes_cli/plugin_validate_private_imports` from a detached worktree of the official clone and running `private_import_findings`/`private_attribute_findings` against the plugin directory (the `v0.23.0` pass used the installed v0.23.0 validator). This is the static catalog pass only; the authoritative full `hermes plugins validate` + strict seam pair runs in the `upstream-hermes-compat` and `catalog-floor-gate` CI jobs on the PR carrying this record.
 
+### Namespace inventory synchronization (2026-11-14)
+
+Official Core `422ad1861856dd9b80b947fbad9f39d1580f6b41` contains the root modules
+`hermes_state_loop_guard.py` and `hermes_state_write.py`. Both are Hermes-owned
+names under the original [`_hermes_packages()`](https://github.com/NousResearch/hermes-agent/blob/422ad1861856dd9b80b947fbad9f39d1580f6b41/hermes_cli/plugin_validate_private_imports.py)
+and [`_hermes_top_level()`](https://github.com/NousResearch/hermes-agent/blob/422ad1861856dd9b80b947fbad9f39d1580f6b41/hermes_cli/plugin_validate_core_override.py)
+definitions: both include root `*.py` stems. Extend the historical snapshot union
+above with these **two names only**; do not remove historical names.
+
+This is an import-inventory classification update, **not two new ACP Core API
+dependencies**. The public/private dependency sets and `hermes_compat.py` imports
+are unchanged. An attempted import of either new name is now inventoried and
+rejected as unregistered. The shared namespace-coverage assertion retains the
+original `reported namespaces - snapshot` rejection in both actual-Core and
+credential-free tests; omitted-module and future-unknown-name controls must fail.
+Latest/floor actual namespace checks and strict frozen-copy seams remain mandatory.
+
 ## Upstream contract proposals
 
 Proposal status as of the [2026-11-12 promotion record](#public-api-promotion-record--issue-12-2026-11-12): **1 partially shipped** (upstream `9788899694` catalog-listed four `file_safety` path helpers on `main`; `get_nt_namespace_error` remains unlisted — it is the plugin's only remaining need from this proposal since `cd9b8bb` retired the write helpers), **2 shipped** (upstream `79109635df`, released in `v0.23.1`; closed), **3–6 open**. The open remainder is the 4 Rule 9 findings that `hermes plugins validate` still reports against `main`. The smallest upstream changes that would retire each remaining private import (no behavior change requested — Hermes exposes what it already enforces):

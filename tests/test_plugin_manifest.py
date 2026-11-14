@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 import re
+import unittest
 from pathlib import Path
 
 PLUGIN_DIR = Path(__file__).resolve().parents[1] / "hermes-plugin" / "antigravity-acp"
@@ -132,7 +133,8 @@ def test_no_secret_environment_reads_outside_declared_surface() -> None:
 # Hermes-owned namespaces: snapshot of the two official Core definitions
 # (`plugin_validate_private_imports._hermes_packages` and
 # `plugin_validate_core_override._hermes_top_level`), taken as the union over
-# the audited refs v0.21.6, v0.23.0, v0.23.1, main@67664e23 on 2026-11-12.
+# the audited refs v0.21.6, v0.23.0, v0.23.1, main@67664e23 on 2026-11-12,
+# plus the two newly reported root modules at main@422ad186 on 2026-11-14.
 # The credential-free lane has no Core checkout, so the sync check lives in
 # tests/test_upstream_hermes_runtime_contracts.py: in both upstream CI lanes
 # the installed Core's own namespaces must stay inside this snapshot. A new
@@ -152,6 +154,7 @@ HERMES_TOP_LEVEL_SNAPSHOT = frozenset({
     "hermes_state_guard", "hermes_state_health", "hermes_state_holders", "hermes_state_identity",
     "hermes_state_ids", "hermes_state_keys", "hermes_state_legacy_refusal", "hermes_state_local",
     "hermes_state_local_lineage", "hermes_state_local_migration", "hermes_state_lockguard", "hermes_state_lockowners",
+    "hermes_state_loop_guard",
     "hermes_state_maintenance", "hermes_state_media", "hermes_state_messages", "hermes_state_mutation_binding",
     "hermes_state_mutation_branch", "hermes_state_mutation_chat_pick", "hermes_state_mutation_compress", "hermes_state_mutation_guards",
     "hermes_state_mutation_prepared", "hermes_state_mutation_reset", "hermes_state_mutation_retirement", "hermes_state_mutation_transcript",
@@ -162,7 +165,8 @@ HERMES_TOP_LEVEL_SNAPSHOT = frozenset({
     "hermes_state_sessions", "hermes_state_sessions_model_config", "hermes_state_stored_reads", "hermes_state_telegram",
     "hermes_state_terminal", "hermes_state_timeline", "hermes_state_titles", "hermes_state_todo",
     "hermes_state_tool_retries", "hermes_state_usage", "hermes_state_user_copy", "hermes_state_wal",
-    "hermes_state_worker_compression", "hermes_state_worker_context", "hermes_state_worker_lifecycle", "hermes_time",
+    "hermes_state_worker_compression", "hermes_state_worker_context", "hermes_state_worker_lifecycle", "hermes_state_write",
+    "hermes_time",
     "hermes_yaml", "mcp_serve", "mini_swe_runner", "model_tools",
     "plugins", "pm", "providers", "registration_lifecycle",
     "run_agent", "tests", "tools", "toolset_distributions",
@@ -191,6 +195,15 @@ PRIVATE_CORE_IMPORTS = frozenset({
 })
 
 DOCUMENTED_CORE_IMPORTS = PUBLIC_CORE_IMPORTS | PRIVATE_CORE_IMPORTS
+
+
+def _assert_namespace_snapshot_covers(name, namespaces, snapshot) -> None:
+    """Same fail-closed predicate for real Core and credential-free regressions."""
+    unknown = namespaces - snapshot
+    assert not unknown, (
+        f"official Core {name} reports top-level namespaces outside the "
+        f"credential-free snapshot: {sorted(unknown)}"
+    )
 
 
 def _core_import_targets(source: str) -> set[str]:
@@ -268,6 +281,33 @@ def test_inventory_flags_unregistered_core_namespace_import(tmp_path) -> None:
     assert extra == {"hermes_state"}, (
         f"an unregistered `import hermes_state` must be an inventory violation, got extra={sorted(extra)}"
     )
+
+
+def test_namespace_snapshot_covers_new_official_core_modules() -> None:
+    _assert_namespace_snapshot_covers(
+        "verified main@422ad186 root modules",
+        {"hermes_state_loop_guard", "hermes_state_write"},
+        HERMES_TOP_LEVEL_SNAPSHOT,
+    )
+
+
+def test_namespace_snapshot_rejects_omitted_or_future_core_modules() -> None:
+    for name in ("hermes_state_loop_guard", "hermes_state_write"):
+        with unittest.TestCase().assertRaisesRegex(AssertionError, name):
+            _assert_namespace_snapshot_covers(
+                "omitted module control", {name}, HERMES_TOP_LEVEL_SNAPSHOT - {name}
+            )
+    with unittest.TestCase().assertRaisesRegex(AssertionError, "hermes_future_unregistered"):
+        _assert_namespace_snapshot_covers(
+            "future namespace control", {"hermes_future_unregistered"}, HERMES_TOP_LEVEL_SNAPSHOT
+        )
+
+
+def test_new_namespace_imports_are_not_new_registered_dependencies() -> None:
+    names = {"hermes_state_loop_guard", "hermes_state_write"}
+    found = _core_import_targets("\n".join(f"import {name}" for name in sorted(names)))
+    assert found == names
+    assert found - DOCUMENTED_CORE_IMPORTS == names
 
 
 def test_inventory_flags_dynamic_core_import(tmp_path) -> None:
