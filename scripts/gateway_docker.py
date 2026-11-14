@@ -25,6 +25,11 @@ import tempfile
 import time
 import xml.etree.ElementTree as ET
 
+try:
+    import gateway_diagnostics as diagnostics
+except ImportError:
+    from scripts import gateway_diagnostics as diagnostics
+
 POLICY = "/phasec-policy.json"
 LIMIT = 128
 CHECKS = ("nonroot", "capabilities_empty", "no_new_privileges", "readonly_root", "pid_namespace",
@@ -204,6 +209,49 @@ def _open_denied(path: str, flags: int, *, missing_ok: bool = False) -> bool:
     return error in allowed
 
 
+def run_regression(repo: Path, environment: dict, work: Path = Path("/gw")) -> dict:
+    """Original suite/timeout plus optional diagnostics; no diagnostic can grant PASS."""
+    from importlib.metadata import PackageNotFoundError, version
+    import re
+
+    xml = work / "regression.xml"
+    before = diagnostics.memory_snapshot()
+    returncode = None
+    try:
+        with (work / "regression.log").open("wb") as output:
+            completed = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "tests",
+                                        f"--junitxml={xml}"], cwd=repo, env=environment,
+                                       stdout=output, stderr=subprocess.STDOUT, timeout=180)
+        returncode = completed.returncode
+    except (OSError, subprocess.SubprocessError):
+        pass  # Still FAIL; preserve safe diagnostics on timeout/launch failure, never the exception text.
+    after = diagnostics.memory_snapshot()
+    summary = diagnostics.junit_summary(xml, repo)
+    try:
+        pytest_version = version("pytest")
+    except PackageNotFoundError:
+        pytest_version = diagnostics.NA
+    summary["runtime"] = {"python": ".".join(map(str, sys.version_info[:3])),
+                          "pytest": pytest_version if re.fullmatch(r"[0-9]{1,3}(?:\.[0-9]{1,3}){1,3}", pytest_version)
+                          else diagnostics.NA}
+    regression: dict = dict.fromkeys(("tests", "failures", "errors", "skipped"), -1)
+    try:
+        with xml.open("rb") as stream:
+            data = stream.read(diagnostics.MAX_XML_BYTES + 1)
+        if len(data) > diagnostics.MAX_XML_BYTES or b"<!" in data or b"\x00" in data:
+            raise ValueError("unsafe_or_oversized_xml")
+        suite = ET.fromstring(data).findall("testsuite")
+        if len(suite) == 1:
+            regression = {name: int(suite[0].get(name, "-1")) for name in regression}
+    except (OSError, ValueError, ET.ParseError):
+        pass
+    regression["status"] = "PASS" if (returncode == 0 and regression["tests"] > 0
+        and regression["errors"] == regression["failures"] == 0
+        and 0 <= regression["skipped"] <= regression["tests"]) else "FAIL"
+    return {"regression": regression, "regression_summary": summary,
+            "regression_memory": diagnostics.memory_diagnostics(before, after)}
+
+
 def inside() -> int:
     policy = json.loads(Path(POLICY).read_text())
     status = dict(line.split(":", 1) for line in Path("/proc/self/status").read_text().splitlines() if ":" in line)
@@ -253,27 +301,19 @@ def inside() -> int:
                         "TMPDIR": "/gw/regression-tmp", "XDG_CONFIG_HOME": "/gw/regression-config",
                         "PYTHONPATH": policy["core"], "TZ": "UTC", "LANG": "C.UTF-8",
                         "HERMES_DISABLE_LAZY_INSTALLS": "1", "OPENAI_API_KEY": "synthetic-offline-test-key"})
-    with Path("/gw/regression.log").open("wb") as output:
-        regression_run = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "tests",
-                                         "--junitxml=/gw/regression.xml"], cwd=policy["repo"], env=environment,
-                                        stdout=output, stderr=subprocess.STDOUT, timeout=180)
-    suite = ET.parse("/gw/regression.xml").getroot().findall("testsuite")
-    if len(suite) != 1:
-        return 1
-    regression: dict = {name: int(suite[0].get(name, "-1")) for name in ("tests", "failures", "errors", "skipped")}
-    regression["status"] = "PASS" if (regression_run.returncode == 0 and regression["tests"] > 0
-                                        and regression["errors"] == regression["failures"] == 0) else "FAIL"
+    evidence = run_regression(Path(policy["repo"]), environment)
+    regression = evidence["regression"]
     # Same real driver/CLI, inside this namespace; never execute it on the host.
     from gateway_e2e import REQUIRED_STAGES, _git, main as gateway_main
     if regression["status"] != "PASS":
         Path("/gw/verification.json").write_text(json.dumps({"schema_version": 1, "status": "FAIL",
             "candidate_sha": policy["candidate"], "hermes_commit": _git(Path(policy["core"]), "rev-parse", "HEAD"),
-            "regression": regression, "stages": {name: {"status": "NOT_RUN"} for name in REQUIRED_STAGES}}))
+            **evidence, "stages": {name: {"status": "NOT_RUN"} for name in REQUIRED_STAGES}}))
         return 1
     result = gateway_main(["--hermes-root", policy["core"], "--candidate-sha", policy["candidate"],
                            "--output", "/gw/verification.json"])
     record = json.loads(Path("/gw/verification.json").read_text())
-    record["regression"] = regression
+    record.update(evidence)
     record["confinement"] = {key: boundary[key] for key in ("status", "checks", "pid_namespace_sha256", "host_pid_namespace_sha256")}
     # PID 1 is this process: orphaned Core descendants are re-parented here.
     # Drain them with a bounded wait instead of a single sweep, so a slow exit
