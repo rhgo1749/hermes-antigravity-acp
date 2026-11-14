@@ -29,12 +29,54 @@ class DockerBoundaryTests(unittest.TestCase):
     def test_options_have_no_privilege_network_socket_or_port_escape(self):
         options = docker.docker_options(1001, 1001, [Path("/source")], Path("/private/work"), Path("/private/policy"))
         for required in ("--cap-drop=ALL", "--network=none", "--read-only", "--security-opt=no-new-privileges",
-                         "--pids-limit", "--memory=2g", "--cpus=2", "--restart=no", "--pull=never"):
+                         "--pids-limit", "--memory=2g", "--cpus=2", "--restart=no", "--pull=never", "--init=false"):
             self.assertIn(required, options)
         for forbidden in ("--privileged", "--pid=host", "--network=host", "--publish", "docker.sock", "--cap-add"):
             self.assertNotIn(forbidden, " ".join(options))
         with self.assertRaises(ValueError):
             docker.docker_options(0, 0, [], Path("/private/work"), Path("/private/policy"))
+
+    def test_init_null_is_not_false_and_missing_is_not_a_default(self):
+        def checks(facts):
+            return docker.config_checks(facts, 1001, 1001, [Path("/source")], Path("/private/work"), Path("/private/policy"))
+        facts = self.facts()
+        self.assertTrue(all(status == "PASS" for status in checks(facts).values()))
+        for value, status in ((None, "MISMATCH"), (False, "PASS"), (True, "MISMATCH"), (0, "MISMATCH")):
+            with self.subTest(init=value):
+                facts["HostConfig"]["Init"] = value
+                self.assertEqual(status, checks(facts)["HostConfig.Init"])
+                self.assertEqual(value is False, self.verify(facts))
+        for section, key in (("Config", "User"), *(("HostConfig", key) for key in self.facts()["HostConfig"])):
+            with self.subTest(missing=f"{section}.{key}"):
+                facts = self.facts()
+                del facts[section][key]
+                self.assertEqual("MISSING", checks(facts)[f"{section}.{key}"])
+                self.assertFalse(self.verify(facts))
+        facts = self.facts()
+        facts["Config"]["Env"] = ["PRIVATE=must-not-be-serialized"]
+        rendered = str(checks(facts))
+        for forbidden in ("must-not-be-serialized", "/private/", "/source", "1001"):
+            self.assertNotIn(forbidden, rendered)
+        facts["HostConfig"]["SecurityOpt"] = ["no-new-privileges=true"]
+        self.assertTrue(self.verify(facts))
+
+    def test_removal_requires_successful_structured_absence_readback(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        for kind, identity in (("container", "a" * 64), ("image", "sha256:" + "b" * 64)):
+            for rm_code, list_code, residual, expected in ((0, 0, False, True), (1, 0, False, False),
+                                                          (0, 1, False, False), (0, 0, True, False)):
+                with self.subTest(kind=kind, rm_code=rm_code, list_code=list_code, residual=residual):
+                    caller = Mock(side_effect=[SimpleNamespace(returncode=rm_code), SimpleNamespace(
+                        returncode=list_code, stdout=identity.encode() + b"\n" if residual else b"", stderr=b"Error: no such object")])
+                    self.assertEqual(expected, docker.remove_owned(caller, kind, identity))
+                    arguments = caller.call_args_list[1].args
+                    self.assertIn("--no-trunc", arguments)
+                    self.assertEqual((kind, "ls"), arguments[:2])
+                    if kind == "container":
+                        self.assertIn("id=" + identity, arguments)
+        with self.assertRaises(ValueError):
+            docker.remove_owned(Mock(), "unknown", "unused")
 
     def test_real_inspect_contract_rejects_each_relaxed_boundary(self):
         self.assertTrue(self.verify(self.facts()))

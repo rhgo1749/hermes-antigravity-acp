@@ -101,7 +101,7 @@ def docker_options(uid: int, gid: int, mounts: list[Path], work: Path, policy: P
         raise ValueError("nonroot_identity_required")
     options = ["--user", f"{uid}:{gid}", "--cap-drop=ALL", "--security-opt=no-new-privileges",
                "--network=none", "--ipc=none", "--read-only", "--pids-limit", str(LIMIT),
-               "--memory=2g", "--memory-swap=2g", "--cpus=2", "--restart=no", "--pull=never"]
+               "--memory=2g", "--memory-swap=2g", "--cpus=2", "--restart=no", "--pull=never", "--init=false"]
     for source in mounts:
         if "," in str(source):
             raise ValueError("unsafe_mount_spelling")
@@ -111,21 +111,54 @@ def docker_options(uid: int, gid: int, mounts: list[Path], work: Path, policy: P
     return options
 
 
+def config_checks(inspect: dict, uid: int, gid: int, mounts: list[Path], work: Path, policy: Path) -> dict[str, str]:
+    """Fixed field names/statuses only; never serialize inspect paths, values or env."""
+    expected = {"Config": {"User": f"{uid}:{gid}"}, "HostConfig": {
+        "Privileged": False, "Init": False, "ReadonlyRootfs": True, "NetworkMode": "none", "PidMode": "",
+        "IpcMode": "none", "PidsLimit": LIMIT, "Memory": 2 * 1024**3, "MemorySwap": 2 * 1024**3,
+        "NanoCpus": 2 * 10**9, "CapDrop": ["ALL"]}}
+    checks: dict[str, str] = {}
+    for section, fields in expected.items():
+        actual = inspect.get(section, {})
+        for key, value in fields.items():
+            checks[f"{section}.{key}"] = ("MISSING" if not isinstance(actual, dict) or key not in actual else
+                "PASS" if type(actual[key]) is type(value) and actual[key] == value else "MISMATCH")
+    host = inspect["HostConfig"] if isinstance(inspect.get("HostConfig"), dict) else {}
+    for key, allowed in {"PortBindings": (None, {}), "CapAdd": (None, []), "Devices": (None, []), "DeviceRequests": (None, [])}.items():
+        checks[f"HostConfig.{key}"] = ("MISSING" if key not in host else "PASS" if host[key] in allowed else "MISMATCH")
+    options = host.get("SecurityOpt")
+    checks["HostConfig.SecurityOpt"] = ("MISSING" if "SecurityOpt" not in host else "PASS" if isinstance(options, list)
+        and any(s in ("no-new-privileges", "no-new-privileges=true") for s in options) else "MISMATCH")
+    expected_mounts = {str(path): (str(path), False) for path in mounts}
+    expected_mounts.update({"/gw": (str(work), True), POLICY: (str(policy), False)})
+    try:
+        entries = inspect["Mounts"]
+        actual_mounts = {m["Destination"]: (m["Source"], m["RW"]) for m in entries}
+        correct = (len(entries) == len(expected_mounts) and actual_mounts == expected_mounts
+                   and all(type(m["RW"]) is bool for m in entries))
+        checks["Mounts"] = "PASS" if correct else "MISMATCH"
+    except (TypeError, KeyError):
+        checks["Mounts"] = "MISSING" if "Mounts" not in inspect else "MISMATCH"
+    return checks
+
+
 def config_verified(inspect: dict, uid: int, gid: int, mounts: list[Path], work: Path, policy: Path) -> bool:
-    host = inspect.get("HostConfig", {})
-    expected = {str(path): (str(path), False) for path in mounts}
-    expected.update({"/gw": (str(work), True), POLICY: (str(policy), False)})
-    actual = {m["Destination"]: (m["Source"], m["RW"]) for m in inspect.get("Mounts", [])}
-    return (inspect.get("Config", {}).get("User") == f"{uid}:{gid}"
-            and host.get("Privileged") is False and host.get("Init") is False
-            and host.get("ReadonlyRootfs") is True
-            and host.get("NetworkMode") == "none" and host.get("PidMode") == ""
-            and host.get("IpcMode") == "none" and host.get("PidsLimit") == LIMIT
-            and host.get("Memory") == 2 * 1024**3 and host.get("MemorySwap") == 2 * 1024**3
-            and host.get("NanoCpus") == 2 * 10**9 and not host.get("PortBindings")
-            and not host.get("CapAdd") and host.get("CapDrop") == ["ALL"]
-            and any(s in {"no-new-privileges", "no-new-privileges=true"} for s in host.get("SecurityOpt", []))
-            and not host.get("Devices") and not host.get("DeviceRequests") and actual == expected)
+    return all(value == "PASS" for value in config_checks(inspect, uid, gid, mounts, work, policy).values())
+
+
+def remove_owned(docker, kind: str, identity: str) -> bool:
+    """Read back exact owned-object absence without parsing human error messages."""
+    if kind == "container":
+        removal = docker("container", "rm", "--force", identity, check=False)
+        remaining = docker("container", "ls", "--all", "--quiet", "--no-trunc", "--filter", f"id={identity}", check=False)
+        absent = not remaining.stdout.strip()
+    elif kind == "image":
+        removal = docker("image", "rm", identity, check=False)
+        remaining = docker("image", "ls", "--all", "--quiet", "--no-trunc", check=False)
+        absent = identity.encode() not in remaining.stdout.split()
+    else:
+        raise ValueError("unknown_owned_object_kind")
+    return removal.returncode == remaining.returncode == 0 and absent
 
 
 def rootfs_bytes(uid: int, gid: int) -> bytes:
@@ -329,6 +362,7 @@ def main(argv: list[str] | None = None) -> int:
         options += ["--workdir", str(repo), "--entrypoint", sys.executable]
         container = docker("create", *options, image, "-B", str(Path(__file__).resolve()), "--inside").stdout.decode().strip()
         facts = json.loads(docker("inspect", container).stdout)[0]
+        record["docker_config_prestart_checks"] = config_checks(facts, os.getuid(), os.getgid(), mounts, work, policy_file)
         if not config_verified(facts, os.getuid(), os.getgid(), mounts, work, policy_file):
             raise RuntimeError("docker_config_not_verified")
         with (root / "container.log").open("wb") as log:
@@ -339,6 +373,7 @@ def main(argv: list[str] | None = None) -> int:
                     raise RuntimeError("container_boundary_not_ready")
                 time.sleep(0.05)
             facts = json.loads(docker("inspect", container).stdout)[0]
+            record["docker_config_running_checks"] = config_checks(facts, os.getuid(), os.getgid(), mounts, work, policy_file)
             pid = facts["State"]["Pid"]
             observed = json.loads((work / "confinement.json").read_text())
             host_verified = (pid > 0 and os.readlink(f"/proc/{pid}/ns/pid") == observed["pid_namespace"] != policy["host_pid_ns"]
@@ -349,7 +384,9 @@ def main(argv: list[str] | None = None) -> int:
             process.wait(timeout=360)
         if not (work / "verification.json").exists():
             raise RuntimeError("container_gateway_receipt_missing")
+        diagnostics = {key: value for key, value in record.items() if key.startswith("docker_config_")}
         record = json.loads((work / "verification.json").read_text())
+        record.update(diagnostics)
         if process.returncode != 0:
             record["status"] = "FAIL"
         record["docker_execution"] = {"status": "FAIL", "config_verified": True,
@@ -367,15 +404,11 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         removed = image_removed = False
         if container:
-            removal = docker("rm", "--force", container, check=False)
-            inspect = docker("inspect", container, check=False)
-            removed = removal.returncode == 0 and inspect.returncode != 0 and b"No such" in inspect.stderr
+            removed = remove_owned(docker, "container", container)
         if process is not None:
             process.wait(timeout=15)
         if image:
-            removal = docker("image", "rm", image, check=False)
-            inspect = docker("image", "inspect", image, check=False)
-            image_removed = removal.returncode == 0 and inspect.returncode != 0 and b"No such" in inspect.stderr
+            image_removed = remove_owned(docker, "image", image)
         if directory is not None and (container is None or removed):
             shutil.rmtree(directory)
         record["docker_duration_seconds"] = round(time.monotonic() - started, 3)

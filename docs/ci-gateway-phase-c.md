@@ -169,6 +169,52 @@ is not measured Hosted runner-min or a verified CI overhead delta. Prior Hosted 
 Core b51a30c (READY timeout). New-HEAD Hosted and Release results remain NOT RUN
 until that exact candidate actually executes; previous results cannot be reused.
 
+## Scope realignment and Docker preflight follow-up
+
+The original Phase C contract is real Gateway boot/candidate load, synthetic ACP
+request/denial/cancel/ownership and clean disposable teardown. Non-root Docker,
+cap-drop ALL, no-new-privileges, private PID/network, readonly root/source inputs,
+limited fresh writes and no operating state are the later explicitly approved
+execution boundary; they remain unchanged. `Init=false`, PID1-only inventory,
+2-GiB/2-CPU/128-PID limits and the second full pytest are implementation choices,
+not additional original Issue #28 requirements. No such choice is silently removed.
+
+Hosted run 43491983597 on PR head `f7786ee` actually checked out synthetic merge
+`a65c9c5011515e2fcbeb799322d8cb9178460723`, official Core
+`438008f475fd89dd661ab2fda8355303a9f7bda6`. It stopped before container start at
+`docker_config_not_verified`; all Gateway functional stages were NOT_RUN. The old
+receipt did not retain inspect fields, so it cannot establish a complete historical
+field-by-field verdict or prove that Init was the only mismatch.
+
+A concrete command/verifier defect is source-backed: Docker CLI v28.5.1
+`cli/command/container/opts.go` only sets `HostConfig.Init` when the flag changed;
+Moby's API uses an optional bool, and its OCI launcher treats unset as the daemon's
+setting. The old command omitted `--init` while requiring literal `false`.
+The fix explicitly sends `--init=false`; null/missing remain rejected. The RED
+option-contract test failed before the fix, then passed. This does not broaden
+security policy or claim an old Hosted field observation that was never recorded.
+
+Fixed-name PASS/MISMATCH/MISSING checks now explain every prestart/running inspect
+condition without dumping values, paths, environment or credentials. Teardown
+uses successful structured exact-container-ID listing / exact-image-ID absence
+rather than matching the human `No such` error string. Offline tests reject rm
+failure, list failure and actual residue. Actual container cleanup is not inferred
+from these unit fixtures. A failed removal/readback still fails closed.
+
+No CI tier, workflow trigger, test discovery, protected check or Release requirement
+changes. Full pytest inside Docker duplicates Fast discovery; native Docker init
+could replace the custom reaper only with revised inventory evidence; the custom
+rootfs avoids pulling an image but adds loader-layout risk. These are review
+candidates, not authorization for a broad rewrite. Readonly host-process reads on
+a disposable Hosted VM were not explicitly prohibited by the original Issue, but
+the later approved private-PID/no-outside-process boundary still controls. Relaxing
+it requires separate approval even if process identities are less sensitive there.
+
+The watcher now runs `gh run watch --exit-status` directly (or preserves its saved
+exit code explicitly). The already-failed run was read back with actual exit 1,
+without creating a new CI run. This fixes shell-status distortion only: notification
+arrival does not prove admission, model execution or automatic continuation.
+
 Production profiles, operating accounts/session databases, s6 and Multiplexer
 settings remain outside this work. The existing operating `gateway-eval` is not
 stopped or removed. Live vendor/account canaries and post-deployment smoke remain
