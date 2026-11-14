@@ -110,7 +110,7 @@ def test_gate_always_runs_and_needs_every_lane(ci: str) -> None:
 def test_fast_lanes_are_unconditional(ci: str) -> None:
     for job_id in ("fake-acp", "upstream-hermes-compat", "catalog-floor-gate"):
         block = _job_block(ci, job_id)
-        assert "if: needs" not in block, f"{job_id} must not be conditional"
+        assert not re.search(r"^    if:", block, re.M), f"{job_id} must not be conditional"
 
 
 def test_os_lanes_gate_on_os_scope(ci: str) -> None:
@@ -426,11 +426,32 @@ def test_pr_detection_failure_falls_back_to_strongest_scope() -> None:
 
 # -- gate: skipped-is-never-green -----------------------------------------
 
-ALL_SUCCESS = {lane: {"result": "success"} for lane in ALL_LANES}
+def _gateway_outputs(candidate="a" * 40):
+    from scripts.gateway_e2e import REQUIRED_STAGES
+    from scripts.gateway_docker import CHECKS
+    # Synthetic UNIT input, never an execution receipt.
+    return {"attested_sha": candidate, "gateway_core": "b" * 40, "gateway_result": "success", "gateway_record": json.dumps({
+        "schema_version": 1, "candidate_sha": candidate, "hermes_commit": "b" * 40, "status": "PASS",
+        "candidate_source_dirty": False,
+        "provider_origin": {"status": "PASS", "candidate_sha": candidate, "tree_sha256": "3" * 64,
+                            "home_sha256": "4" * 64, "frozen_copies": 0, "errors": []},
+        "scratch_cleanup": {"status": "PASS", "launch_count": 1},
+        "shutdown_diagnostic": {"status": "PASS", "launch_count": 1},
+        "confinement": {"status": "PASS", "checks": {name: True for name in CHECKS}, "pid_namespace_sha256": "1" * 64, "host_pid_namespace_sha256": "2" * 64},
+        "docker_execution": {"status": "PASS", "config_verified": True, "owned_pid_namespace_verified": True, "outside_canary_unchanged": True,
+                             "container_removed": True, "image_removed": True},
+        "docker_contract_version": 2, "checkout_sha": candidate,
+                "final_namespace_live_count": 1, "final_namespace_process_count": 1,
+        "stages": {name: {"status": "PASS"} for name in REQUIRED_STAGES}})}
+
+
+ALL_SUCCESS: dict = {lane: {"result": "success"} for lane in ALL_LANES}
+ALL_SUCCESS["upstream-hermes-compat"]["outputs"] = _gateway_outputs()
 
 
 def _results(**overrides: str) -> dict:
-    results = {lane: {"result": "success"} for lane in ALL_LANES}
+    results: dict = {lane: {"result": "success"} for lane in ALL_LANES}
+    results["upstream-hermes-compat"]["outputs"] = _gateway_outputs()
     for lane, result in overrides.items():
         results[lane] = {"result": result}
     return results

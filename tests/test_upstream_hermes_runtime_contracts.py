@@ -756,7 +756,10 @@ def test_credential_free_namespace_snapshot_covers_installed_core() -> None:
     """
     from hermes_cli.plugin_validate_core_override import _hermes_top_level
 
-    from test_plugin_manifest import HERMES_TOP_LEVEL_SNAPSHOT
+    from test_plugin_manifest import (
+        HERMES_TOP_LEVEL_SNAPSHOT,
+        _assert_namespace_snapshot_covers,
+    )
 
     computed = {
         "plugin_validate_core_override._hermes_top_level": set(_hermes_top_level()),
@@ -769,8 +772,4 @@ def test_credential_free_namespace_snapshot_covers_installed_core() -> None:
         computed["plugin_validate_private_imports._hermes_packages"] = set(_hermes_packages())
 
     for name, namespaces in computed.items():
-        unknown = namespaces - HERMES_TOP_LEVEL_SNAPSHOT
-        assert not unknown, (
-            f"official Core {name} reports top-level namespaces outside the "
-            f"credential-free snapshot: {sorted(unknown)}"
-        )
+        _assert_namespace_snapshot_covers(name, namespaces, HERMES_TOP_LEVEL_SNAPSHOT)

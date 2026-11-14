@@ -47,6 +47,11 @@ except ImportError:  # Imported as scripts.release_gate_check by repository test
 
 HEX40_RE = re.compile(r"^[0-9a-f]{40}$")
 
+try:
+    from gateway_attestation import check_outputs as check_gateway_outputs
+except ImportError:
+    from scripts.gateway_attestation import check_outputs as check_gateway_outputs
+
 NATIVE_LANES = (*OS_LANES, *ARM_LANES)
 INFRA_JOBS = ("change-scope", "candidate-identity", "ci-gate")
 
@@ -148,6 +153,10 @@ def evaluate(
                 f"(attested: {sorted(attested_stages) or 'none'}) — not executed is never PASS"
             )
 
+    gateway_outputs = (results.get("upstream-hermes-compat") or {}).get("outputs") or {}
+    for problem in check_gateway_outputs(gateway_outputs, required=True, candidate=candidate):
+        fail("gateway_e2e: " + problem)
+
     for entry in matrix.cells():
         if not entry.required:
             lines.append(
@@ -226,6 +235,7 @@ def evidence_document(candidate: str, identity: dict, results: dict, matrix: Mat
         "workflow_ref": os.environ.get("GITHUB_WORKFLOW_REF", ""),
         "workflow_sha": os.environ.get("GITHUB_WORKFLOW_SHA", ""),
         "jobs": results, "platform_checks": cells,
+        "gateway_e2e": json.loads(_lane_output(results, "upstream-hermes-compat", "gateway_record")),
     }
 
 
