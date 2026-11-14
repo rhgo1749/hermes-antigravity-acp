@@ -13,6 +13,8 @@ class GatewayEvidenceTests(unittest.TestCase):
     def receipt(self):
         return {"schema_version": 1, "status": "PASS", "candidate_sha": "a" * 40,
                 "hermes_commit": "b" * 40, "candidate_source_dirty": False,
+                "provider_origin": {"status": "PASS", "candidate_sha": "a" * 40, "tree_sha256": "3" * 64,
+                                    "home_sha256": "4" * 64, "frozen_copies": 0, "errors": []},
                 "scratch_cleanup": {"status": "PASS", "launch_count": 1},
                 "shutdown_diagnostic": {"status": "PASS", "launch_count": 1},
                 "confinement": {"status": "PASS", "checks": {name: True for name in CHECKS}, "pid_namespace_sha256": "1" * 64, "host_pid_namespace_sha256": "2" * 64},
@@ -24,6 +26,17 @@ class GatewayEvidenceTests(unittest.TestCase):
 
     def test_complete_receipt_is_accepted(self):
         self.assertEqual([], gateway.validate_receipt(self.receipt(), "a" * 40))
+
+    def test_origin_missing_wrong_sha_unbound_home_or_bad_tree_never_passes(self):
+        value = self.receipt()
+        del value["provider_origin"]
+        self.assertIn("provider_origin_not_verified", gateway.validate_receipt(value, "a" * 40))
+        for key, bad in (("status", "NOT_RUN"), ("candidate_sha", "b" * 40), ("errors", ["drift"]),
+                         ("tree_sha256", ""), ("home_sha256", None), ("frozen_copies", True), ("frozen_copies", -1)):
+            with self.subTest(key=key, bad=bad):
+                value = self.receipt()
+                value["provider_origin"][key] = bad
+                self.assertIn("provider_origin_not_verified", gateway.validate_receipt(value, "a" * 40))
 
     def test_every_required_stage_missing_or_nonpass_fails_closed(self):
         for stage in gateway.REQUIRED_STAGES:

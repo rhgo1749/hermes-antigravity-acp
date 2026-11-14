@@ -28,9 +28,11 @@ import urllib.request
 try:
     import deploy_hermes_profiles as deployment
     from gateway_docker import namespace_verified, validate_confinement
+    from provider_origin import ProviderOrigin
 except ImportError:
     from scripts import deploy_hermes_profiles as deployment
     from scripts.gateway_docker import namespace_verified, validate_confinement
+    from scripts.provider_origin import ProviderOrigin
 
 REQUIRED_STAGES = (
     "isolation", "candidate_install", "enablement", "gateway_ready", "provider_factory",
@@ -63,6 +65,12 @@ def validate_receipt(receipt: object, candidate: str) -> list[str]:
     if (not isinstance(diagnostic, dict) or diagnostic.get("status") != "PASS"
             or type(diagnostic.get("launch_count")) is not int or diagnostic["launch_count"] < 1):
         problems.append("shutdown_diagnostic_not_pass")
+    origin = receipt.get("provider_origin")
+    if (not isinstance(origin, dict) or origin.get("status") != "PASS" or origin.get("candidate_sha") != candidate
+            or origin.get("errors") != [] or type(origin.get("frozen_copies")) is not int or origin["frozen_copies"] < 0
+            or any(not isinstance(origin.get(key), str) or re.fullmatch(r"[0-9a-f]{64}", origin[key]) is None
+                   for key in ("tree_sha256", "home_sha256"))):
+        problems.append("provider_origin_not_verified")
     problems.extend(validate_confinement(receipt))
     stages = receipt.get("stages")
     if not isinstance(stages, dict):
@@ -368,6 +376,11 @@ class Run:
             expected = hashlib.sha256((self.plugin / "__init__.py").read_bytes()).hexdigest()
             self.need(envelope["core_bootstrap_from_requested_source"] and expected in envelope["loaded_provider_sha256"],
                       "candidate_factory_not_executed")
+            actual_origin = envelope.get("provider_origin", {})
+            expected_origin = ProviderOrigin(self.plugin, self.profile, self.core).receipt()
+            self.need(all(actual_origin.get(key) == expected_origin[key] for key in ("tree_sha256", "home_sha256"))
+                      and actual_origin.get("errors") == [], "candidate_home_runtime_provenance_mismatch")
+            self.record["provider_origin"] = {"status": "PASS", "candidate_sha": self.record["candidate_sha"], **actual_origin}
             self.pass_stage("provider_factory", "original_candidate_factory_observed_in_real_gateway_worker")
             self.current = "initialize"
             self.need(self.event_count("initialize") > 0, "initialize_not_executed")

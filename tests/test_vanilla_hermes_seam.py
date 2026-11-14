@@ -22,6 +22,8 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
+from scripts.provider_origin import ProviderOrigin
+
 PLUGIN_DIR = (
     Path(__file__).resolve().parent.parent / "hermes-plugin" / "antigravity-acp"
 )
@@ -57,14 +59,18 @@ def _load_real_plugin(monkeypatch, tmp_path):
     spec.loader.exec_module(deployer)
     deployer.install(deployer.SOURCE, hermes_home, apply=True)
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-    profile = providers.get_provider_profile("antigravity-acp")
+    installed = hermes_home / "plugins/model-providers/antigravity-acp"
+    core = Path(providers.__file__).resolve().parent.parent
+    origin = ProviderOrigin(installed, hermes_home, core)
+    with origin.observing():
+        profile = providers.get_provider_profile("antigravity-acp")
     module = sys.modules.get(profile.__class__.__module__)
     assert module is not None
     module_path = getattr(module, "__file__", None)
     assert isinstance(module_path, str)
-    assert Path(module_path).resolve() == (
-        hermes_home / "plugins" / "model-providers" / "antigravity-acp" / "__init__.py"
-    ).resolve()
+    assert origin.accepts(module_path, "__init__.py"), "candidate/home/runtime provenance unverified"
+    if "providers.plugin_reload" in sys.modules:
+        _assert_genuine_core_provenance("providers.plugin_reload", core)
     return module, profile
 
 

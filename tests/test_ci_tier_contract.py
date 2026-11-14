@@ -433,6 +433,8 @@ def _gateway_outputs(candidate="a" * 40):
     return {"attested_sha": candidate, "gateway_result": "success", "gateway_record": json.dumps({
         "schema_version": 1, "candidate_sha": candidate, "hermes_commit": "b" * 40, "status": "PASS",
         "candidate_source_dirty": False,
+        "provider_origin": {"status": "PASS", "candidate_sha": candidate, "tree_sha256": "3" * 64,
+                            "home_sha256": "4" * 64, "frozen_copies": 0, "errors": []},
         "scratch_cleanup": {"status": "PASS", "launch_count": 1},
         "shutdown_diagnostic": {"status": "PASS", "launch_count": 1},
         "confinement": {"status": "PASS", "checks": {name: True for name in CHECKS}, "pid_namespace_sha256": "1" * 64, "host_pid_namespace_sha256": "2" * 64},

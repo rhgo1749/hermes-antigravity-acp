@@ -18,6 +18,7 @@ import traceback
 
 from gateway_docker import namespace_verified
 from gateway_process_policy import PRUNE_BODY, scratch_command_verdict, shutdown_command_verified
+from provider_origin import ProviderOrigin
 
 
 def main() -> None:
@@ -31,6 +32,7 @@ def main() -> None:
     confined = namespace_verified()
     if not confined:
         raise PermissionError("verified_container_required")
+    provider_origin = ProviderOrigin(plugin, plugin.parents[2], core, owned_root=root)
     dependency_roots = [Path(sys.prefix).resolve(), Path(sys.base_prefix).resolve()]
     protected = [Path("/opt/data").resolve(), Path("/home/hermes").resolve()]
     allowed = [root, core, *dependency_roots]
@@ -142,8 +144,9 @@ def main() -> None:
         with receipt_lock:
             bootstrap = sys.modules.get("hermes_bootstrap")
             origin = Path(getattr(bootstrap, "__file__", "")).resolve()
-            value = {"pid": os.getpid(), "refusals": sorted(set(refused)),
+            value = {"pid": os.getpid(), "refusals": sorted(set(refused + provider_origin.errors)),
                      "core_bootstrap_from_requested_source": origin == core / "hermes_bootstrap.py",
+                     "provider_origin": provider_origin.receipt(),
                      "loaded_provider_sha256": sorted(factory_hashes), "client_cancel_calls": client_cancel_calls,
                      "housekeeping": [{"kind": kind, "target": target, "returncode": process.poll()}
                                       for kind, target, process in owned_processes]}
@@ -153,14 +156,15 @@ def main() -> None:
 
     def profile(frame, event, arg) -> None:
         nonlocal client_cancel_calls
+        provider_origin.observe(frame, event, arg)
         # Observe the ORIGINAL factory, including executor threads. No Core callable is replaced.
         # Core intentionally uses os._exit after its graceful drain, so atexit alone is insufficient.
         if (event == "return" and frame.f_code.co_name == "create_client"
-                and Path(frame.f_code.co_filename).resolve() == plugin / "__init__.py" and arg is not None):
+                and provider_origin.accepts_frame(frame, "__init__.py") and arg is not None):
             factory_hashes.add(hashlib.sha256((plugin / "__init__.py").read_bytes()).hexdigest())
             finish()
         elif (event == "return" and frame.f_code.co_name == "cancel"
-              and Path(frame.f_code.co_filename).resolve() == plugin / "client.py"):
+              and provider_origin.accepts_frame(frame, "client.py")):
             client_cancel_calls += 1
             finish()
         elif (event == "return" and frame.f_code.co_name == "__init__"

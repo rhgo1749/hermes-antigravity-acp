@@ -14,6 +14,8 @@ class GatewayAttestationTests(unittest.TestCase):
     def receipt(self):
         return {"schema_version": 1, "status": "PASS", "candidate_sha": "a" * 40,
                 "hermes_commit": "b" * 40, "candidate_source_dirty": False,
+                "provider_origin": {"status": "PASS", "candidate_sha": "a" * 40, "tree_sha256": "3" * 64,
+                                    "home_sha256": "4" * 64, "frozen_copies": 0, "errors": []},
                 "scratch_cleanup": {"status": "PASS", "launch_count": 1},
                 "shutdown_diagnostic": {"status": "PASS", "launch_count": 1},
                 "confinement": {"status": "PASS", "checks": {name: True for name in CHECKS}, "pid_namespace_sha256": "1" * 64, "host_pid_namespace_sha256": "2" * 64},

@@ -1,6 +1,40 @@
 # Issue #28 Phase C: disposable real-Core Gateway verification
 
-## Status: implementation draft, NO-GO for adoption
+## Status: Draft; acceptance is bound to an executed exact-candidate receipt
+
+This document is not a PASS stamp. See Draft PR #39 for the latest candidate,
+Core SHA, real Hosted outcomes and remaining unverified items. Historical failed
+runs below remain evidence for their own identities only.
+
+## Approved frozen-copy compatibility
+
+The operator approved a bounded frozen-copy adaptation and negative tests. Core
+is not patched and no registry/callable is replaced. `scripts/provider_origin.py`
+observes the original `providers/plugin_reload.py::_snapshot` return before its
+code is imported. A copy is bound only to the exact installed provider directory
+of the expected HOME, under the canonical owner-private original Core snapshot
+root (and the existing disposable root for Gateway execution).
+
+The installed and runtime **entire payload file/hash maps** must match the
+pre-lookup candidate baseline, ignoring only bytecode cache directories. Core's
+size/mtime cache fingerprint is not treated as content identity. Unobserved copies,
+identical sibling-home copies, stale bytes with preserved size/mtime, symlinks,
+missing/extra files, nonprivate roots and post-binding drift are negative controls.
+The minimum-Core direct installed path remains supported under the same byte map.
+
+The strict SDK helper retains genuine Core module provenance and calls the real
+public lookup. The Gateway's existing profiler now validates both the bound
+source tree and the executing factory/cancel code object against compiled exact
+candidate source; a fabricated matching `co_filename` is not sufficient. Receipts
+carry only tree/HOME hashes, copy counts and fixed error codes. Missing/malformed
+origin evidence or wrong candidate SHA fails the existing CI/Release validators.
+This instrumentation is for trusted CI code, not a hostile-Python sandbox.
+
+Local loader-shape fixtures are explicitly offline mocks, not real Core runtime
+proof. Real latest/floor compatibility and Gateway acceptance still require their
+unchanged Hosted lanes. No local Gateway/Docker fallback or additional security
+grant is introduced by frozen-copy compatibility.
+
 
 The credential-free functional path has executed in a disposable local fixture.
 It is **not yet a compliant replacement for operating `gateway-eval` verification**.
