@@ -118,6 +118,8 @@ class ProviderOriginTests(unittest.TestCase):
         self.bind(frozen)
         (frozen / "client.py").write_text("# changed after binding\n")
         self.assertFalse(self.origin.accepts(frozen / "client.py", "client.py"))
+        self.assertIn("runtime_payload_drift", self.origin.receipt()["errors"])
+        self.assertFalse(self.origin.accepts(frozen / "__init__.py", "__init__.py"))
 
     def test_untrusted_loader_file_cannot_bind_identical_copy(self):
         frozen = self.snapshot()
@@ -191,6 +193,43 @@ class ProviderOriginTests(unittest.TestCase):
             sys.setprofile(previous)
         self.assertEqual([True, False], results)
         self.assertIn("runtime_code_mismatch", origin.errors)
+
+
+    def test_multiplex_plugin_parents_two_is_the_profile_not_the_base_home(self):
+        profile = self.root / "hermes/profiles/phasec"
+        installed = profile / "plugins/model-providers/antigravity-acp"
+        shutil.copytree(self.plugin, installed)
+        self.assertEqual(profile, installed.parents[2])
+        actual = ProviderOrigin(installed, installed.parents[2], self.core).receipt()
+        expected = ProviderOrigin(installed, profile, self.core).receipt()
+        self.assertEqual(actual["home_sha256"], expected["home_sha256"])
+
+    def test_warm_compilation_cache_does_not_bypass_installed_byte_revalidation(self):
+        source = "def create_client():\n    return 42\n"
+        entry = self.plugin / "__init__.py"
+        entry.write_text(source)
+        origin = ProviderOrigin(self.plugin, self.home, self.core, owned_root=self.root)
+        frozen = self.snapshot()
+        self.bind(frozen, origin=origin)
+        namespace = {}
+        exec(compile(source, str(frozen / "__init__.py"), "exec", dont_inherit=True), namespace)
+        results = []
+        def observe(frame, event, value):
+            if event == "return" and frame.f_code.co_name == "create_client":
+                results.append(origin.accepts_frame(frame, "__init__.py"))
+        previous = sys.getprofile()
+        try:
+            sys.setprofile(observe)
+            namespace["create_client"]()
+            self.assertEqual(1, len(origin.compiled))
+            entry.write_text(source.replace("42", "99"))
+            namespace["create_client"]()
+            entry.write_text(source)
+            namespace["create_client"]()
+        finally:
+            sys.setprofile(previous)
+        self.assertEqual([True, False, False], results)
+        self.assertIn("runtime_payload_drift", origin.errors)
 
 
 if __name__ == "__main__":
