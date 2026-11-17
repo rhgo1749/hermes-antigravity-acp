@@ -1,12 +1,18 @@
-# Issue #25 — cgroup-v2 containment spike: preflight verdict BLOCKED (spike NOT RUN)
+# Issue #25 — cgroup-v2 containment spike: container preflight BLOCKED; spike EXECUTED PASS on a host delegated scope
 
 Slice mandate: test-only spike proving cgroup membership survives
 `setsid`/`setpgid` escape and `cgroup.kill` sweeps escaped descendants,
 runnable ONLY on an already-delegated writable subtree; fail closed with
 no sudo/chmod/mount/pre-existing-cgroup mutation otherwise.
 
-**Verdict: BLOCKED — spike NOT RUN on the deployment environment.
-F4 Gate B recommendation remains NO-GO.**
+**Verdicts, kept environment-separate:
+- Deployment container `hermes`: preflight BLOCKED — spike NOT RUN
+  there (§1–§2, historical record, unchanged).
+- Host gonus-X870E, transient delegated scope at HEAD `fd03122`:
+  spike EXECUTED — 10 passed / 0 skipped, RC=0, zero residue (§8).
+  Linux cgroup-v2 containment hypothesis CONFIRMED on the host.
+F4 Gate B recommendation remains NO-GO: no production mux wiring or
+deployment-level delegation exists yet.**
 
 ## 1. Preflight evidence (2026-11-17 KST, container `hermes`; all probes
 read-only except one explicitly non-destructive failed-create probe —
@@ -83,11 +89,10 @@ No sudo/root used; no chmod; no pre-existing cgroup touched; the single
   direct child reap → empty proof → own-dir removal), strict failures
   fail the test.
 
-On this host: containment spike **SKIPPED (NOT RUN)**; fail-closed unit
-passes. Once this rework passes independent review, the spike is
-intended to run as-is on a host that delegates a subtree (e.g. a
-systemd user scope with `Delegate=`, or a container runtime that mounts
-a writable delegated cgroup subtree).
+On the deployment container: containment spike **SKIPPED (NOT RUN)**;
+fail-closed units pass. The spike has since run AS-IS (test file
+unmodified, HEAD `fd03122`) on a host transient delegated scope and
+**PASSED** — see §8.
 
 ## 4. Platform contract assessment (design only, per mandate §5)
 
@@ -110,16 +115,21 @@ a writable delegated cgroup subtree).
 ## 5. Gate B recommendation
 
 **NO-GO (unchanged).** Candidate B is blocked by the deployment
-environment, not by the primitive's semantics. ACK additionally requires
-deployment-level cgroup delegation + live-tree attestation, or the
-vendor-contract route (candidate A).
+environment, not by the primitive's semantics — the §8 host run now
+CONFIRMS the primitive's semantics (membership survives `setsid`,
+`cgroup.kill` sweeps escaped descendants, sibling untouched). ACK
+additionally requires deployment-level cgroup delegation + live-tree
+attestation in the production topology, or the vendor-contract route
+(candidate A).
 
-## 6. Next minimal action (proposed, not run)
+## 6. Next minimal action (proposed 2026-11-17; EXECUTED — see §8)
 
 Run this spike (after this ownership rework passes review) on a
 delegated environment — requires an operator-approved deployment change
 to delegate a cgroup subtree to this container, or a separate delegated
-host. No production wiring until the spike PASSes there.
+host. No production wiring until the spike PASSes there. Executed
+2026-11-18 on the host via a transient delegated scope (§8); the
+container-side deployment delegation remains the open production item.
 
 ## 7. Real-kernel run (2026-11-17 KST, host gonus-X870E, operator-executed) — FAIL, root-cause split
 
@@ -169,9 +179,77 @@ ACP_TEST_CGROUP_ROOT="/sys/fs/cgroup${R}" \
   pytest tests/test_issue25_cgroup_spike.py
 ```
 
+**One-shot pitfall:** the interactive `--scope` route above derives `R`
+inside the scope's own shell, so it is unaffected. A ONE-SHOT
+`systemd-run` invocation must pass `--expand-environment=no`: the
+default `--expand-environment=yes` pre-expands `$R` in the unit command
+argv against systemd-run's CLIENT environment (where `R` is unset)
+before the unit ever starts, silently corrupting
+`ACP_TEST_CGROUP_ROOT`. The executed one-shot recipe is §8.
+
 Inside the delegated scope the spike creates only its own nonce child
 cgroups and moves only its own spawned children — every join stays
 within the delegated subtree, satisfying migration containment. Gate B
 recommendation remains **NO-GO** until a run on such a delegated scope
-PASSes; the three leftover dirs stay as known residue until the
-operator removes them.
+PASSes (since satisfied by §8 — Gate B itself stays NO-GO pending
+production delegation/attestation); the three leftover dirs were
+operator-cleared (§8 fresh host read confirms `app.slice` `acp25-*`
+residue 0).
+
+## 8. Delegated-scope real run (2026-11-18 KST, host gonus-X870E, operator-executed, HEAD `fd03122`) — EXECUTED, PASS
+
+The spike test file was UNMODIFIED from `fd03122` (this section is
+docs-only evidence closure; tests/source untouched).
+
+Invocation actually used — a transient delegated SERVICE (not the §7
+interactive scope); `…` abbreviates the pytest command carrying
+`ACP_TEST_CGROUP_ROOT` derived inside the unit:
+
+```sh
+systemd-run --user --unit=acp25-spike-004214 \
+  --wait --collect --pipe --expand-environment=no \
+  -p Delegate=yes …
+```
+
+Observed (operator-reported live state + reviewer fresh host read):
+
+- Live cgroup inside the unit:
+  `/user.slice/user-1000.slice/user@1000.service/app.slice/acp25-spike-004214.service`
+  — the transient unit's OWN cgroup, i.e. the running pytest process's
+  own subtree; `Delegate=yes` makes it a writable delegated branch, so
+  every join stays inside the delegated subtree and the §7
+  migration-containment contract is satisfied by construction.
+- Result: **10 passed / 0 skipped** (9 fail-closed/regression units +
+  the gated containment spike), pytest status 0 / unit SUCCESS,
+  `systemd-run` RC=0.
+- Reviewer fresh host read after the run: pytest/leader/sleep.py
+  processes 0; transient-unit residue 0; `app.slice` `acp25-*`
+  residue 0. The §7 residue bug did not recur — deterministic cleanup
+  held on the real kernel.
+
+Reproduction recipe (one-shot; reflects the confirmed flags of the
+executed invocation; run from the host repo checkout at `fd03122` as
+the user owning the systemd user manager):
+
+```sh
+systemd-run --user --unit="acp25-spike-$(date +%H%M%S)" \
+  --wait --collect --pipe --expand-environment=no \
+  -p Delegate=yes \
+  bash -c 'R="$(awk -F: "\$1==\"0\"{print \$3}" /proc/self/cgroup)"; \
+    ACP_TEST_CGROUP_ROOT="/sys/fs/cgroup${R}" \
+    exec pytest tests/test_issue25_cgroup_spike.py'
+```
+
+`--expand-environment=no` is REQUIRED (§7 pitfall note); `--wait
+--collect --pipe` leaves the transient unit fully collected after exit
+(residue 0 confirmed above).
+
+**Assessment: the Linux cgroup-v2 containment hypothesis is CONFIRMED
+on the host** — membership survived the `setsid` escape, `cgroup.kill`
+swept leader + same-group + escaped descendant while the sibling
+cgroup stayed alive, and `populated=0` + empty `cgroup.procs` +
+owned-dir removal all held. This is a HOST delegated-scope proof, NOT
+production attestation: the container's cgroupfs is still `ro` (§1)
+and no production mux wiring exists. Gate B remains **NO-GO** until
+the production topology delegates a subtree and live-tree attestation
+passes.
