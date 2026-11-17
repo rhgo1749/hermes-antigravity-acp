@@ -307,6 +307,44 @@ def test_confirm_true_only_on_join_and_exec_eof(tmp_path):
     assert handle.confirmed is True
 
 
+def test_production_spawn_sequence_confirms_exec_eof(tmp_path):
+    # Round-2 regression: the PRODUCTION sequence wrap_argv -> Popen(
+    # pass_fds) -> confirm must reach exec EOF.  The parent's own write
+    # ends must not keep the errpipe open forever (that timeout degraded
+    # every otherwise-successful contained spawn to UNKNOWN).  Uses the
+    # container-root target="" trick: directory "." resolves the procs
+    # path to a regular file in cwd, membership passes against our real
+    # (unchanged) root cgroup — zero cgroup mutation.
+    if next(
+        (line[3:].strip() for line in open("/proc/self/cgroup") if line.startswith("0::")), "?"
+    ) != "/":
+        pytest.skip("exec-EOF integration trick needs cgroup root '/'")
+    handle = cgc.Containment(Path("."), os.stat(Path(".")))
+    handle.killfile_ready = True
+    handle._notify_read, handle._notify_write = os.pipe()
+    handle._err_read, handle._err_write = os.pipe()
+    argv = handle.wrap_argv([sys.executable, "-c", "import time; time.sleep(300)"])
+    proc = subprocess.Popen(
+        argv,
+        cwd=str(tmp_path),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+        pass_fds=handle.pass_fds(),
+    )
+    try:
+        assert handle.confirm(timeout=10.0) is True, (
+            "parent-held write ends must never block the exec verdict"
+        )
+        assert proc.poll() is None, "confirmed mux must be the live exec'd process"
+        assert (tmp_path / "cgroup.procs").read_text().strip().isdigit()
+    finally:
+        proc.kill()
+        proc.wait(timeout=10)
+
+
 # -- 3. spawn-side abort: sweeps own cgroup, touches nothing else ------------
 
 

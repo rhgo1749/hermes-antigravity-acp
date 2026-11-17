@@ -27,7 +27,9 @@ Containment is claimed ONLY when every one of these holds (fail closed):
   closes it (parent observes EOF), an ``execvp`` failure writes "E" and
   exits 87.  A parent that saw "J" but not EOF is NOT confirmed: a trampoline
   that joined but never exec'd the mux can never be mistaken for a contained
-  mux.  The trampoline forks nothing before the join, so no mux/vendor
+  mux.  The parent retires its own write ends of both pipes at confirm()
+  time, so EOF reflects only the trampoline/mux side of the pipes.  The
+  trampoline forks nothing before the join, so no mux/vendor
   descendant can ever be born outside the cgroup (pre-join fork race closed
   at the only place it could occur).  A parent that moves a pid in AFTER
   ``Popen`` would race the child's first fork — that design is deliberately
@@ -305,6 +307,17 @@ class Containment:
         if read_fd is None:  # pipes already consumed: verdict is unrecoverable
             self.confirmed = False
             return False
+        # The parent NEVER writes to the verdict pipes: retire our write
+        # ends NOW, before waiting.  EOF on the errpipe must reflect ONLY
+        # the trampoline/mux side — a parent-held writer would keep the
+        # pipe open forever and every otherwise-successful contained spawn
+        # would time out into the UNKNOWN fallback.
+        for attr in ("_notify_write", "_err_write"):
+            fd = getattr(self, attr)
+            if fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+                setattr(self, attr, None)
         deadline = time.monotonic() + timeout
         verdict = self._read_one(read_fd, deadline)
         joined = verdict == b"J"
