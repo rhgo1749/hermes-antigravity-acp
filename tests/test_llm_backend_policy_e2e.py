@@ -704,6 +704,21 @@ def test_single_mode_backend_child_never_receives_mux_declaration_env(
     assert "ACP_MUX_SESSION_LIFECYCLE" not in env
 
 
+@pytest.mark.parametrize("extra_arg", ["acp_mux.py", "unrelated-mux"])
+def test_single_official_launcher_ignores_unrelated_mux_named_args(
+    monkeypatch, tmp_path, extra_arg
+) -> None:
+    """Only the executable or entry script can select MUX mode."""
+    launcher = _env_probe_stub(tmp_path, "antigravity-acp-official")
+    env = _spawn_env(
+        _load_module(monkeypatch, tmp_path)[0], tmp_path,
+        command=str(launcher), args=["--config", str(tmp_path / extra_arg)],
+        policy="llm_backend",
+    )
+    assert "ACP_MUX_SESSION_ORIGIN" not in env
+    assert "ACP_MUX_SESSION_LIFECYCLE" not in env
+
+
 def test_agent_mode_never_declares_even_for_a_mux_launch(monkeypatch, tmp_path) -> None:
     stub = _env_probe_stub(tmp_path, "acp_mux.py")
     env = _spawn_env(

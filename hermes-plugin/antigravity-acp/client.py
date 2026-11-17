@@ -715,8 +715,8 @@ def _acp_launch_is_mux(command: str, args: Sequence[str]) -> bool:
 
     MUX-only declaration metadata must follow the mux and never reach a
     directly spawned (Single-mode) official ACP server.  Matching is on
-    the command itself or any launch argument basename, so an interpreter
-    invocation of a mux module and an installed mux launcher both resolve.
+    the actual command basename or the Python interpreter's first script
+    argument only. Unrelated flags and trailing argument paths do not count.
     Anything not named as a mux — the official launcher, a bare
     interpreter, a .par path, or an unrecognized launch shape — is
     conservatively treated as not-a-mux and declares nothing, which keeps
@@ -727,7 +727,13 @@ def _acp_launch_is_mux(command: str, args: Sequence[str]) -> bool:
         base = str(name).replace("\\", "/").rsplit("/", 1)[-1]
         return bool(_MUX_COMPONENT_BASENAME_RE.search(base))
 
-    return _is_mux(command) or any(_is_mux(arg) for arg in args)
+    if _is_mux(command):
+        return True
+    interpreter_base = str(command).replace("\\", "/").rsplit("/", 1)[-1]
+    is_python = re.fullmatch(
+        r"python(?:\d+(?:\.\d+)?)?(?:\.exe)?", interpreter_base, re.IGNORECASE
+    )
+    return bool(is_python and args and _is_mux(args[0]))
 
 
 def _jsonrpc_result(message_id: Any, result: Any) -> dict[str, Any]:
