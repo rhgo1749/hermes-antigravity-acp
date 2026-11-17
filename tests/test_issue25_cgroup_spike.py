@@ -10,24 +10,33 @@ separate cgroup is untouched.
 
 Fail-closed contract (reviewer-mandated):
 - The spike runs ONLY when the environment explicitly points at a
-  writable, delegated cgroup subtree via ``ACP_TEST_CGROUP_ROOT``
-  (absolute, pre-existing, WRITABLE, exposes a writable ``cgroup.kill``,
-  and is not the mount root).  Anything else — missing, read-only,
-  root-owned, no ``cgroup.kill`` — SKIPS with a BLOCKED reason.  A
-  delegated root whose freshly created CHILD cgroup lacks a writable
+  delegated cgroup subtree via ``ACP_TEST_CGROUP_ROOT`` (absolute,
+  pre-existing, and EFFECTIVELY WRITABLE for this process — the gate is
+  a capability check via ``os.access``, not an owner check — with a
+  writable ``cgroup.kill``, and not the mount root).  Anything else —
+  missing, read-only, no ``cgroup.kill`` — SKIPS with a BLOCKED reason.
+  A delegated root whose freshly created CHILD cgroup lacks a writable
   ``cgroup.kill`` or is not a plain ``domain`` is ALSO a BLOCKED skip.
   No sudo, no chmod, no mounts, no mutation of any pre-existing cgroup,
   no moving of any pre-existing process.
-- Only processes this test spawns are ever written into a cgroup, and
-  only into directories this test created under the delegated root.
+- Resource ownership: every resource is owned ONLY after its own
+  creation call succeeded (``dir_created`` / ``work_created`` flags);
+  cgroup names carry a nonce; the work dir comes from
+  ``tempfile.mkdtemp`` and a pre-existing path is NEVER deleted, only
+  ever our own creations.
+- Pid publication from the fake leader is atomic (temp file +
+  ``os.replace``) and the parent tolerates empty/partial JSON while
+  waiting; if construction dies before pids are known, cleanup still
+  sweeps every member of OUR OWN created cgroup via its ``cgroup.kill``.
 - Termination truth: zombies are never "running" (``/proc`` state ``Z``
   is checked); the authoritative whole-cgroup proof is
   ``cgroup.events populated=0`` plus an empty ``cgroup.procs``; the
   direct leader child is explicitly reaped and its exit status
   inspected (signal death => negative returncode).
-- Cleanup is safe against any partial-construction state, always reaps
-  its direct child, and ``rmdir``s only its own directories — a failed
-  or incomplete removal FAILS the test (no silent residue).
+- Cleanup order is deterministic (own cgroup.kill -> known grandchildren
+  -> direct child kill+reap -> populated=0 -> own dir rmdir -> own work
+  rmtree).  Strict cleanup failures FAIL the test; non-strict cleanup
+  never masks the original exception (residue is chained into it).
 
 On the deployment container (hermes) the preflight is BLOCKED: the only
 cgroup2 mount is ``ro`` and root-owned (see
@@ -41,7 +50,9 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
+import uuid
 from pathlib import Path
 
 import pytest
@@ -55,7 +66,10 @@ ROOT_ENV = "ACP_TEST_CGROUP_ROOT"
 
 
 def _delegated_root() -> Path | None:
-    """Return a usable delegated cgroup subtree, or None (fail closed)."""
+    """Return a usable delegated cgroup subtree, or None (fail closed).
+
+    Capability check (effective writability), not an ownership check.
+    """
     raw = os.environ.get(ROOT_ENV, "").strip()
     if not raw or not os.path.isabs(raw):
         return None
@@ -83,8 +97,8 @@ DELEGATED = _delegated_root()
 _spike_gate = pytest.mark.skipif(
     DELEGATED is None,
     reason=(
-        "BLOCKED (fail-closed): no writable delegated cgroup subtree via "
-        f"${ROOT_ENV}; the spike is NOT RUN, never recorded as PASS"
+        "BLOCKED (fail-closed): no effectively writable delegated cgroup "
+        f"subtree via ${ROOT_ENV}; the spike is NOT RUN, never recorded as PASS"
     ),
 )
 
@@ -100,6 +114,26 @@ def _wait(pred, timeout=20.0, step=0.05):
             return True
         time.sleep(step)
     return False
+
+
+def _read_pids(path: Path, timeout: float = 25.0) -> dict | None:
+    """Wait for an ATOMICALLY published, complete pids.json.
+
+    ``exists`` may become true before the write completes; only a fully
+    parseable dict with all keys counts.  Empty/partial content is
+    retried, never read as truth.
+    """
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        try:
+            data = json.loads(path.read_text())
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            time.sleep(0.05)
+            continue
+        if isinstance(data, dict) and {"leader", "same", "det"} <= data.keys():
+            return data
+        time.sleep(0.05)
+    return None
 
 
 def _running(pid: int) -> bool:
@@ -132,69 +166,93 @@ while expect not in Path("/proc/self/cgroup").read_text():
 same = subprocess.Popen([sys.executable, str(here / "sleep.py")])
 det = subprocess.Popen([sys.executable, str(here / "sleep.py")],
                        start_new_session=True)   # setsid escape model
-here.joinpath("pids.json").write_text(json.dumps(
-    {"leader": os.getpid(), "same": same.pid, "det": det.pid}))
+# Atomic publication: temp file + os.replace, so the parent never sees
+# a half-written pids.json.
+payload = {"leader": os.getpid(), "same": same.pid, "det": det.pid}
+tmp = here / "pids.json.tmp"
+tmp.write_text(json.dumps(payload))
+os.replace(tmp, here / "pids.json")
 time.sleep(600)
 """
 
 
 class _Spike:
-    """One disposable child cgroup + fake tree joined into it.
+    """One disposable nonce-named child cgroup + fake tree joined into it.
 
-    Every resource is tracked the moment it comes into existence; the
-    constructor cleans up on ANY partial-construction failure, and
-    ``cleanup`` tolerates every partially-built state.
+    Ownership flags (``dir_created``/``work_created``) are set ONLY after
+    the corresponding creation call succeeded; cleanup touches nothing
+    it does not own.
     """
 
-    def __init__(self, name: str):
+    def __init__(self, role: str):
         assert DELEGATED is not None
+        self._init_attrs()
+        try:
+            self._build(role)
+        except _BlockedEnv as exc:
+            self.cleanup(strict=False)
+            self._chain_cleanup_errors(exc)
+            pytest.skip(f"BLOCKED (fail-closed): {exc}")
+        except BaseException as exc:
+            self.cleanup(strict=False)
+            self._chain_cleanup_errors(exc)
+            raise
+
+    def _init_attrs(self) -> None:
         self.dir: Path | None = None
+        self.dir_created = False
         self.work: Path | None = None
+        self.work_created = False
         self.proc: subprocess.Popen | None = None
         self.pids: dict | None = None
         self.procs: Path | None = None
         self.killfile: Path | None = None
-        try:
-            self.dir = DELEGATED / name
-            self.dir.mkdir()
-            self.killfile = self.dir / "cgroup.kill"
-            if not self.killfile.is_file() or not os.access(
-                self.killfile, os.W_OK
-            ):
-                raise _BlockedEnv(
-                    f"{name}: child cgroup lacks a writable cgroup.kill"
-                )
-            try:
-                ctype = (self.dir / "cgroup.type").read_text().strip()
-            except OSError:
-                ctype = ""
-            if ctype != "domain":
-                raise _BlockedEnv(
-                    f"{name}: child cgroup.type={ctype!r}, not domain"
-                )
-            self.procs = self.dir / "cgroup.procs"
-            self.work = Path(f"/tmp/{name}-work-{os.getuid()}")
-            if self.work.exists():
-                shutil.rmtree(self.work)
-            self.work.mkdir()
-            (self.work / "leader.py").write_text(LEADER_SRC)
-            (self.work / "sleep.py").write_text("import time; time.sleep(600)\n")
-            self.proc = subprocess.Popen(
-                [sys.executable, str(self.work / "leader.py"),
-                 str(self.work), self.dir.name],
+        self.cleanup_errors: list[str] = []
+
+    def _chain_cleanup_errors(self, exc: BaseException) -> None:
+        if self.cleanup_errors:
+            raise RuntimeError(
+                f"original failure: {exc!r}; cleanup residue: "
+                f"{self.cleanup_errors}"
+            ) from exc
+
+    def _build(self, role: str) -> None:
+        """Construct every resource in order, tracking ownership."""
+        delegated = DELEGATED
+        assert delegated is not None
+        # Nonce name: never collide with a foreign/pre-existing cgroup.
+        self.dir = delegated / f"acp25-{role}-{uuid.uuid4().hex[:10]}"
+        self.dir.mkdir()  # EEXIST propagates; dir_created stays False
+        self.dir_created = True
+        self.killfile = self.dir / "cgroup.kill"
+        if not self.killfile.is_file() or not os.access(self.killfile, os.W_OK):
+            raise _BlockedEnv(
+                f"{self.dir.name}: child cgroup lacks a writable cgroup.kill"
             )
-            # The documented join path for a delegatee moving its own child.
-            self.procs.write_text(f"{self.proc.pid}\n")
-            pids = self.work / "pids.json"
-            if not _wait(lambda: pids.exists(), 25):
-                raise RuntimeError("fake tree failed to start")
-            self.pids = json.loads(pids.read_text())
-        except _BlockedEnv as exc:
-            self.cleanup(strict=False)
-            pytest.skip(f"BLOCKED (fail-closed): {exc}")
-        except BaseException:
-            self.cleanup(strict=False)
-            raise
+        try:
+            ctype = (self.dir / "cgroup.type").read_text().strip()
+        except OSError:
+            ctype = ""
+        if ctype != "domain":
+            raise _BlockedEnv(
+                f"{self.dir.name}: child cgroup.type={ctype!r}, not domain"
+            )
+        self.procs = self.dir / "cgroup.procs"
+        # mkdtemp creates a fresh unique dir; a pre-existing path is
+        # never adopted or deleted.
+        self.work = Path(tempfile.mkdtemp(prefix=f"acp25-{role}-work-"))
+        self.work_created = True
+        (self.work / "leader.py").write_text(LEADER_SRC)
+        (self.work / "sleep.py").write_text("import time; time.sleep(600)\n")
+        self.proc = subprocess.Popen(
+            [sys.executable, str(self.work / "leader.py"),
+             str(self.work), self.dir.name],
+        )
+        # The documented join path for a delegatee moving its own child.
+        self.procs.write_text(f"{self.proc.pid}\n")
+        self.pids = _read_pids(self.work / "pids.json")
+        if self.pids is None:
+            raise RuntimeError("fake tree failed to publish pids atomically")
 
     def members(self) -> set[int]:
         try:
@@ -218,8 +276,22 @@ class _Spike:
         return "?"
 
     def cleanup(self, strict: bool = True):
-        # Grandchildren first (their parent is our direct child), then the
-        # direct child — which is ALWAYS reaped.
+        """Deterministic order; owns-only; strict failures raise.
+
+        1. OUR OWN created cgroup: cgroup.kill sweeps every member
+           (covers grandchildren whose pids were never published).
+        2. Known grandchildren.
+        3. Direct child: kill + ALWAYS reap.
+        4. populated=0 proof.
+        5. Own dir rmdir (only if we created it).
+        6. Own work rmtree (only if we created it).
+        """
+        errors: list[str] = []
+        if self.dir_created and self.killfile is not None:
+            try:
+                self.killfile.write_text("1")
+            except OSError as exc:
+                errors.append(f"cgroup.kill: {exc}")
         if self.pids is not None:
             for pid in (self.pids["det"], self.pids["same"]):
                 try:
@@ -233,25 +305,27 @@ class _Spike:
                 pass
             try:
                 self.proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                if strict:
-                    raise
-        if self.dir is not None:
+            except subprocess.TimeoutExpired as exc:
+                errors.append(f"direct child unreaped: {exc}")
+        if self.dir_created and self.dir is not None:
             state = self.populated()
             if state == "1":
-                empty = _wait(lambda: self.populated() == "0", 20)
+                if not _wait(lambda: self.populated() == "0", 20):
+                    errors.append("populated stuck at 1")
+            try:
+                self.dir.rmdir()
+            except OSError as exc:
+                errors.append(f"rmdir {self.dir.name}: {exc}")
             else:
-                # "0" (real, empty) or "?" (no cgroup.events — construction
-                # failed before a real cgroup existed): attempt removal.
-                empty = True
-            if strict and not empty:
-                raise AssertionError("spike cgroup never reached populated=0")
-            if empty:
-                self.dir.rmdir()  # R3: failures propagate in strict mode
-                if strict and self.dir.exists():
-                    raise AssertionError(f"residue: {self.dir} still exists")
-        if self.work is not None:
+                if self.dir.exists():
+                    errors.append(f"residue: {self.dir} still exists")
+        if self.work_created and self.work is not None:
             shutil.rmtree(self.work, ignore_errors=True)
+            if self.work.exists():
+                errors.append(f"residue: {self.work} still exists")
+        self.cleanup_errors.extend(errors)
+        if errors and strict:
+            raise AssertionError(f"cleanup failed: {errors}")
 
 
 # ---------------------------------------------------------------------------
@@ -261,9 +335,9 @@ class _Spike:
 def test_membership_survives_setsid_escape_and_cgroup_kill_sweeps():
     spikes: list[_Spike] = []
     try:
-        target = _Spike("acp25-target")
+        target = _Spike("target")
         spikes.append(target)
-        sibling = _Spike("acp25-sibling")
+        sibling = _Spike("sibling")
         spikes.append(sibling)
         # Construction completed: these attributes exist by contract.
         assert target.pids and target.dir and target.proc and target.killfile
@@ -303,6 +377,110 @@ def test_membership_survives_setsid_escape_and_cgroup_kill_sweeps():
     finally:
         for spike in spikes:
             spike.cleanup()
+
+
+# -- resource-ownership regression tests (run everywhere) -------------------
+
+
+def _fake_delegated(tmp_path, monkeypatch) -> Path:
+    """A fake delegated root that passes the capability gate."""
+    root = tmp_path / "fakecg"
+    root.mkdir()
+    (root / "cgroup.procs").touch()
+    (root / "cgroup.kill").touch()
+    monkeypatch.setenv(ROOT_ENV, str(root))
+    monkeypatch.setattr(
+        sys.modules[__name__], "DELEGATED", _delegated_root()
+    )
+    assert sys.modules[__name__].DELEGATED == root
+    return root
+
+
+def test_cgroup_name_collision_leaves_existing_dir_untouched(tmp_path, monkeypatch):
+    root = _fake_delegated(tmp_path, monkeypatch)
+    # Pin the nonce so _build's name deterministically hits a pre-existing
+    # directory we do NOT own.
+    monkeypatch.setattr(
+        "uuid.uuid4", lambda: type("_U", (), {"hex": "a" * 32})()
+    )
+    existing = root / "acp25-target-aaaaaaaaaa"
+    existing.mkdir()
+    sentinel = existing / "sentinel"
+    sentinel.write_text("not mine")
+    spike = _Spike.__new__(_Spike)
+    spike._init_attrs()
+    with pytest.raises(FileExistsError):
+        spike._build("target")
+    assert spike.dir_created is False, "ownership flag set without mkdir success"
+    spike.cleanup(strict=False)
+    assert spike.cleanup_errors == []
+    assert sentinel.exists(), "cleanup touched a cgroup dir it never created"
+    assert existing.exists(), "pre-existing colliding dir must survive"
+
+
+def test_existing_work_path_is_never_deleted(tmp_path, monkeypatch):
+    _fake_delegated(tmp_path, monkeypatch)
+    legacy = Path(tempfile.gettempdir()) / f"acp25-target-work-{os.getuid()}"
+    legacy.mkdir(exist_ok=True)
+    sentinel = legacy / "sentinel"
+    sentinel.write_text("pre-existing")
+    spike = _Spike.__new__(_Spike)
+    spike._init_attrs()
+    with pytest.raises(_BlockedEnv):
+        spike._build("target")  # fake child fails the cgroup.kill gate
+    spike.cleanup(strict=False)
+    assert spike.work_created is False and spike.work is None
+    assert sentinel.exists(), "work-dir logic deleted a pre-existing path"
+    shutil.rmtree(legacy, ignore_errors=True)
+
+
+def test_partial_pid_publication_never_read_as_truth(tmp_path):
+    path = tmp_path / "pids.json"
+    # Empty file: never truth.
+    path.write_text("")
+    assert _read_pids(path, timeout=0.3) is None
+    # Partial JSON: never truth.
+    path.write_text('{"leader": 1, "same"')
+    assert _read_pids(path, timeout=0.3) is None
+    # Incomplete keys: never truth.
+    path.write_text('{"leader": 1}')
+    assert _read_pids(path, timeout=0.3) is None
+    # Complete atomic publication: truth.
+    path.write_text('{"leader": 1, "same": 2, "det": 3}')
+    assert _read_pids(path, timeout=0.3) == {"leader": 1, "same": 2, "det": 3}
+
+
+def test_cleanup_sweeps_unknown_members_via_own_cgroup_kill_only(tmp_path):
+    """pids unknown -> cleanup must use OUR created cgroup's cgroup.kill.
+
+    The fake dir's regular files make ``rmdir`` return ENOTEMPTY (real
+    cgroup files are virtual and vanish with the cgroup); that single
+    documented artifact is the only tolerated cleanup error here.
+    """
+    spike = _Spike.__new__(_Spike)
+    spike._init_attrs()
+    owned = tmp_path / "owned"
+    owned.mkdir()
+    spike.dir = owned
+    spike.dir_created = True
+    killfile = owned / "cgroup.kill"
+    procs = owned / "cgroup.procs"
+    spike.killfile = killfile
+    killfile.touch()
+    spike.procs = procs
+    procs.write_text("")  # already empty (fake)
+    spike.cleanup(strict=False)  # must not raise
+    assert killfile.read_text() == "1", (
+        "cleanup must sweep unknown members via the owned cgroup.kill"
+    )
+    assert len(spike.cleanup_errors) == 1 and spike.cleanup_errors[0].startswith(
+        "rmdir owned:"
+    ), spike.cleanup_errors
+    # Finish removal manually (fake files are not virtual cgroup files).
+    killfile.unlink()
+    procs.unlink()
+    owned.rmdir()
+    assert not owned.exists()
 
 
 def test_preflight_never_touches_non_delegated_roots():

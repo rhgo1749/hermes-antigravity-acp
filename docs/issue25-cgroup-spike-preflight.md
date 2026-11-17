@@ -43,25 +43,40 @@ No sudo/root used; no chmod; no pre-existing cgroup touched; the single
 
 ## 3. Spike protocol (implemented, fail-closed; `tests/test_issue25_cgroup_spike.py`)
 
-- Gated on `ACP_TEST_CGROUP_ROOT`: absolute, pre-existing, writable,
-  non-root, with a writable `cgroup.kill`; anything else → skip with
-  BLOCKED reason (never PASS). The gate itself is unit-tested against
-  malformed/unsafe roots (`test_preflight_never_touches_non_delegated_roots`
-  — this part RUNs and passes everywhere).
-- When runnable: fake leader is spawned then joined via `cgroup.procs`;
-  it refuses to fork descendants until its OWN `/proc/self/cgroup`
+- Gate: `ACP_TEST_CGROUP_ROOT` must be absolute, pre-existing,
+  EFFECTIVELY WRITABLE (capability check via `os.access`, not an owner
+  check), non-mount-root, with a writable `cgroup.kill`; anything else →
+  skip with BLOCKED reason, never PASS. A created CHILD cgroup without a
+  writable `cgroup.kill` or with `cgroup.type != domain` is also a
+  BLOCKED skip. The gate unit (`test_preflight_never_touches_non_delegated_roots`
+  — always RUNs) plus ownership regression tests cover malformed roots,
+  name collisions, work-path safety, partial pid publication, and the
+  cleanup sweep order.
+- Ownership: cgroup names carry a nonce; the work dir comes from
+  `tempfile.mkdtemp`; `dir_created`/`work_created` flip only after the
+  creation call succeeded; cleanup never deletes or removes anything it
+  did not create.
+- Protocol: fake leader is spawned then joined via `cgroup.procs`;
+  it refuses to fork descendants until its own `/proc/self/cgroup`
   confirms membership (kills the pre-join fork race that would leak
-  children into the parent cgroup). Same-group child + `setsid`-escaped
-  child; sibling tree in a separate child cgroup.
+  children into the parent cgroup); pids are published atomically
+  (temp + `os.replace`) and only accepted once fully parseable.
+  Same-group child + `setsid`-escaped child; sibling tree in a separate
+  cgroup.
 - Proofs: escaped child's `/proc/<pid>/cgroup` still names the target;
-  membership in `cgroup.procs`; `cgroup.kill=1` → target leader + same +
-  escaped all dead, sibling all alive; `cgroup.events populated=0`;
-  cleanup `rmdir`s only its own empty dirs.
+  membership in `cgroup.procs`; `cgroup.kill=1` → target leader (explicit
+  reap, negative exit code) + same + escaped all not-running
+  (zombie-aware); sibling all alive; `cgroup.events populated=0` plus
+  empty `cgroup.procs` as the authoritative whole-cgroup proof;
+  deterministic cleanup (own `cgroup.kill` sweep → known grandchildren →
+  direct child reap → empty proof → own-dir removal), strict failures
+  fail the test.
 
 On this host: containment spike **SKIPPED (NOT RUN)**; fail-closed unit
-passes. The spike is ready to run unmodified on any host that delegates
-a subtree (e.g. a systemd user scope with `Delegate=`, or a container
-runtime that mounts a writable delegated cgroup subtree).
+passes. Once this rework passes independent review, the spike is
+intended to run as-is on a host that delegates a subtree (e.g. a
+systemd user scope with `Delegate=`, or a container runtime that mounts
+a writable delegated cgroup subtree).
 
 ## 4. Platform contract assessment (design only, per mandate §5)
 
@@ -90,7 +105,7 @@ vendor-contract route (candidate A).
 
 ## 6. Next minimal action (proposed, not run)
 
-Run the existing spike unmodified on a delegated environment (requires
-an operator-approved deployment change to delegate a cgroup subtree to
-this container, or a separate delegated host). No production wiring
-until the spike PASSes there.
+Run this spike (after this ownership rework passes review) on a
+delegated environment — requires an operator-approved deployment change
+to delegate a cgroup subtree to this container, or a separate delegated
+host. No production wiring until the spike PASSes there.
