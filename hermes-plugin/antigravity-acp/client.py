@@ -4778,6 +4778,15 @@ class AntigravityACPClient:
             else "0"
         )
         child_env["ACP_MUX_AFFINITY_PIN"] = "1" if pin_affinity else "0"
+        # Session-class declaration (issue #24 F2): the explicit llm_backend
+        # one-shot policy is the only caller that may declare backend/
+        # ephemeral, and only as a plugin-owned constant here (never an
+        # inherited value).  The mux stamps it into the owner record at
+        # session/new and strips both variables before the vendor spawn;
+        # agent mode declares nothing, so absence stays unknown.
+        if self._llm_backend_postprocessing:
+            child_env["ACP_MUX_SESSION_ORIGIN"] = "backend"
+            child_env["ACP_MUX_SESSION_LIFECYCLE"] = "ephemeral"
         # Stage tracing (issue #26): the child env filter strips operator
         # ACP_MUX_* keys by design, so mux trace enablement must be explicit
         # here (a plugin-owned constant, never an inherited value). The mux

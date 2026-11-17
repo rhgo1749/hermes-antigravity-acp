@@ -57,7 +57,11 @@ and marked as not observed here — never guessed.
   `ACP_MUX_SESSION_ID` and `ACP_MUX_AFFINITY` (opaque continuation/affinity
   values for a resumed session), `ACP_MUX_SESSION_GC`,
   `ACP_MUX_AFFINITY_PIN`, affinity TTL and entry limits, and `ACP_MUX_PAR`
-  when pinned. These are Hermes-side continuation bookkeeping values — not
+  when pinned. The issue #24 F2 session-class declarations
+  `ACP_MUX_SESSION_ORIGIN`/`ACP_MUX_SESSION_LIFECYCLE` are set by the
+  plugin only for the explicit `llm_backend` one-shot policy and are
+  consumed by the mux itself — the mux strips both before spawning the
+  official server. These are Hermes-side continuation bookkeeping values — not
   Google credentials — and the child gets no general environment inheritance
   beyond the allowlist.
 - **Installer** writes are limited to: the versioned server under
@@ -138,11 +142,54 @@ operations on different stores, and neither one authorizes the other:
   during it.  A lock file that appears mid-walk, or a contended lock,
   yields `status: "incomplete"` and no candidate claims.
 - Candidate counts are a policy prediction, **not** a reclamation
-  verdict: the current GC has no process lease and no origin tag, so a
-  reported candidate may still belong to a live or parked ACP child
-  (issue #24 counterexamples C1/C4).  Enabling the GC is a separately
-  reviewed decision with its own bounds and rollback evidence (issue #24
-  Phases 2-3).
+  verdict: the current GC has no process lease and consults no session
+  class declaration, so a reported candidate may still belong to a live
+  or parked ACP child (issue #24 counterexamples C1/C4).  Enabling the GC
+  is a separately reviewed decision with its own bounds and rollback
+  evidence (issue #24 Phases 2-3).
+
+### Session origin and lifecycle declarations (issue #24 Phase 2 / F2)
+
+Three cleanups share the word "delete" and must never be conflated:
+**Hermes session pruning** (Core's own session records — see above),
+**MUX owner-record metadata cleanup** (`prune_session_owners`, metadata
+only, never touches a bundle), and **Google ACP native bundle deletion**
+(the opt-in native GC, still disabled by default).
+
+F2 adds classification only — it changes zero GC behavior:
+
+- Two orthogonal fields, declared explicitly by the launching client at
+  mux bind via `ACP_MUX_SESSION_ORIGIN` ∈ {`agent`, `backend`} and
+  `ACP_MUX_SESSION_LIFECYCLE` ∈ {`ephemeral`, `durable`}.  The mux stamps
+  the validated values into the owner record it writes at `session/new`
+  — the only moment the creator's intent is known first-hand.
+- Absent, empty, mis-cased, or unknown values record `unknown`.  Absence
+  of a checkpoint, of resume history, or of prior tool calls is **never**
+  evidence of `ephemeral`.  `origin` alone never licenses deletion.
+- Storage stays `version: 2` with optional additive keys: legacy records
+  read as `unknown`, no migration or backfill is ever performed, and
+  every rewrite path (prune kept entries, repeated `session/new`)
+  preserves existing declarations verbatim.  Old mux builds keep reading
+  and writing these files unchanged.
+- The only shipped declaration today is the explicit `llm_backend`
+  one-shot policy declaring `backend`/`ephemeral`.  Agent-mode auxiliary
+  calls share the main connection and cannot be individually declared;
+  they stay undeclared (`unknown`) until a per-creation channel is a
+  separate product decision.  No consumer declares anything ⇒ everything
+  stays `unknown` ⇒ nothing becomes reclaimable: the correct resting
+  state.
+- The read-only inventory gains a per-lane `origin_lifecycle` count
+  matrix (the `unknown` bucket is always present; unowned bundles carry
+  no declaration and never enter the matrix).  It reports counts only —
+  never raw ids, labels, homes, or paths — and `deletions_performed`
+  remains a constant 0.
+
+A `safe_to_reclaim` decision still requires everything F2 does not
+provide: F3 process leases and in-flight protection (interacting with
+#23 cancellation and #25 warm-pool parked children), continuation-
+checkpoint checks, a retention/recovery grace, and F4 bounded per-pass
+deletion with audit evidence.  Until then no declaration — including
+`backend`/`ephemeral` — makes any bundle reclaimable.
 
 ## 4. Telemetry
 

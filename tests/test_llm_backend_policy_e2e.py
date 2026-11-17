@@ -174,6 +174,8 @@ def log(payload):
     row = {
         "affinity": os.environ.get("ACP_MUX_AFFINITY", ""),
         "mux_session_id": os.environ.get("ACP_MUX_SESSION_ID", ""),
+        "session_origin": os.environ.get("ACP_MUX_SESSION_ORIGIN", ""),
+        "session_lifecycle": os.environ.get("ACP_MUX_SESSION_LIFECYCLE", ""),
         **payload,
     }
     with open(log_path, "a", encoding="utf-8") as fh:
@@ -592,3 +594,34 @@ def test_backend_mode_concurrent_identical_requests_get_fresh_sessions(
     assert all(row["affinity"] == "" for row in rows)
     assert counters == {"get": 0, "put": 0}
     assert not (tmp_path / "acp-conversation-state.json").exists()
+
+
+def test_backend_mode_declares_backend_ephemeral_to_mux(monkeypatch, tmp_path) -> None:
+    """Issue #24 F2: the llm_backend one-shot policy declares its session class.
+
+    The declaration is a plugin-owned constant in the ACP child env (the mux
+    stamps it into the owner record at session/new and strips it before the
+    official subprocess).  Default agent-mode clients declare nothing.
+    """
+    _write_fake_server(tmp_path, "answer")
+    module, _client_module = _load_module(monkeypatch, tmp_path)
+    default_client = _make_client(module, tmp_path)
+    default_client.chat.completions.create(
+        model="gemini-3-pro", messages=[{"role": "user", "content": "agent turn"}]
+    )
+    agent_rows = _rows(tmp_path / "fake_acp_log.jsonl")
+    assert agent_rows, "fake server must have logged the agent request"
+    assert all(row["session_origin"] == "" for row in agent_rows), (
+        "agent mode must not declare an origin: absence stays unknown"
+    )
+    assert all(row["session_lifecycle"] == "" for row in agent_rows)
+
+    backend_client = _make_client(module, tmp_path, postprocessing_policy="llm_backend")
+    backend_client.chat.completions.create(
+        model="gemini-3-pro", messages=[{"role": "user", "content": "one-shot note"}]
+    )
+    rows = _rows(tmp_path / "fake_acp_log.jsonl")
+    backend_rows = rows[len(agent_rows):]
+    assert backend_rows, "fake server must have logged the backend request"
+    assert all(row["session_origin"] == "backend" for row in backend_rows)
+    assert all(row["session_lifecycle"] == "ephemeral" for row in backend_rows)

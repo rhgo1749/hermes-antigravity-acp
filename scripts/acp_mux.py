@@ -52,6 +52,17 @@ Environment:
   ACP_MUX_OWNER_GRACE_SECONDS  minimum age before an ownership record whose
                           native bundle and checkpoint are both gone may be
                           retired; defaults to the affinity retention TTL
+  ACP_MUX_SESSION_ORIGIN  optional per-connection session-class declaration
+                          stamped into the owner record at session/new
+                          (issue #24 F2); strict enum agent|backend, any
+                          other or absent value records unknown.
+  ACP_MUX_SESSION_LIFECYCLE  optional per-connection declaration of whether
+                          the creator intends future reuse (issue #24 F2);
+                          strict enum ephemeral|durable, anything else
+                          records unknown.  A declaration is classification
+                          metadata only: it never licenses deletion by
+                          itself (F3/F4 are separate phases).  Neither
+                          variable is passed to the official subprocess.
   ACP_MUX_AUTH_COOLDOWN   auth failure cooldown seconds (default 300)
   ACP_MUX_QUOTA_COOLDOWN  quota/rate-limit cooldown seconds (default 900)
   ACP_MUX_CRASH_COOLDOWN  unexpected process failure cooldown seconds (default 60)
@@ -266,6 +277,19 @@ OWNER_GRACE_SECONDS = _configured_positive_int(
     "ACP_MUX_OWNER_GRACE_SECONDS",
     "HERMES_ANTIGRAVITY_ACP_OWNER_GRACE_SECONDS",
     _DEFAULT_AFFINITY_TTL_SECONDS,
+)
+
+# Issue #24 F2: the only values an origin/lifecycle declaration may hold.
+# Anything else (including absence) is "unknown", which is deliberately not
+# part of the declaration enum: it is the reader's default, never stamped.
+SESSION_ORIGIN_VALUES = ("agent", "backend")
+SESSION_LIFECYCLE_VALUES = ("ephemeral", "durable")
+SESSION_CLASS_UNKNOWN = "unknown"
+# Inventory matrix axes: declared values plus the always-present unknown
+# bucket (absent or invalid declarations land there).
+_SESSION_CLASS_MATRIX = (
+    SESSION_ORIGIN_VALUES + (SESSION_CLASS_UNKNOWN,),
+    SESSION_LIFECYCLE_VALUES + (SESSION_CLASS_UNKNOWN,),
 )
 
 _QUOTA_RE = re.compile(
@@ -799,7 +823,10 @@ def _read_session_owners() -> dict[str, dict] | None:
     Version 2 stores ``{"lane": hash, "at": epoch}`` per entry so record
     cleanup can apply a grace period.  Version 1 (hash -> hash) is accepted
     read-only and back-dated to the file mtime; the next write upgrades the
-    file in place.
+    file in place.  Since issue #24 F2 a v2 entry may additionally carry
+    optional ``origin``/``lifecycle`` declaration keys; they are passed
+    through only when they hold an exact declared value, and missing or
+    invalid values read as absent (``unknown``) without failing the ledger.
     """
     path = STATE_PATH + ".owners.json"
     try:
@@ -838,19 +865,64 @@ def _read_session_owners() -> dict[str, dict] | None:
                 or not math.isfinite(value["at"])
             ):
                 return None
-            entries[key] = {"lane": value["lane"], "at": float(value["at"])}
+            entry = {"lane": value["lane"], "at": float(value["at"])}
+            # F2 declarations are additive optional keys: an exact enum value
+            # is preserved verbatim; anything else reads as unknown.  Never
+            # backfill: absence is a first-class unknown, not a defect.
+            for field, allowed in (
+                ("origin", SESSION_ORIGIN_VALUES),
+                ("lifecycle", SESSION_LIFECYCLE_VALUES),
+            ):
+                declared = value.get(field)
+                if isinstance(declared, str) and declared in allowed:
+                    entry[field] = declared
+            entries[key] = entry
         return entries
     except (OSError, ValueError, UnicodeError):
         return None
+
+
+def _declared_session_class(env: Mapping[str, str] | None = None) -> tuple[str, str]:
+    """Validate the per-connection F2 declarations (issue #24).
+
+    Strict enum matching only: absent, empty, mis-cased, or unknown values
+    resolve to ``unknown``.  Absence of a declaration is never evidence of
+    ephemerality, and no value here licenses deletion by itself.
+    """
+    env = os.environ if env is None else env
+    origin = env.get("ACP_MUX_SESSION_ORIGIN", "")
+    lifecycle = env.get("ACP_MUX_SESSION_LIFECYCLE", "")
+    return (
+        origin if origin in SESSION_ORIGIN_VALUES else "unknown",
+        lifecycle if lifecycle in SESSION_LIFECYCLE_VALUES else "unknown",
+    )
 
 
 def _owner_hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8", errors="surrogatepass")).hexdigest()
 
 
-def _record_session_owner(session_id: str, home: str, label: str) -> bool:
+def _record_session_owner(
+    session_id: str,
+    home: str,
+    label: str,
+    *,
+    origin: str = SESSION_CLASS_UNKNOWN,
+    lifecycle: str = SESSION_CLASS_UNKNOWN,
+) -> bool:
+    """Record (or keep) the lane that owns a freshly created native session.
+
+    Issue #24 F2: a brand-new entry is stamped with the caller's validated
+    ``origin``/``lifecycle`` declarations (unknown values are omitted, not
+    written).  An existing entry is never restamped: its declarations were
+    made first-hand at creation, and re-declaring later would be inference.
+    """
     if not isinstance(session_id, str) or not session_id or len(session_id) > 512:
         return False
+    origin = origin if origin in SESSION_ORIGIN_VALUES else SESSION_CLASS_UNKNOWN
+    lifecycle = (
+        lifecycle if lifecycle in SESSION_LIFECYCLE_VALUES else SESSION_CLASS_UNKNOWN
+    )
     with _session_gc_lock() as locked:
         if not locked:
             return False
@@ -867,7 +939,12 @@ def _record_session_owner(session_id: str, home: str, label: str) -> bool:
             if existing["lane"] != lane:
                 return False
         else:
-            owners[digest] = {"lane": lane, "at": time.time()}
+            entry: dict = {"lane": lane, "at": time.time()}
+            if origin != SESSION_CLASS_UNKNOWN:
+                entry["origin"] = origin
+            if lifecycle != SESSION_CLASS_UNKNOWN:
+                entry["lifecycle"] = lifecycle
+            owners[digest] = entry
         path = STATE_PATH + ".owners.json"
         tmp = ""
         try:
@@ -988,8 +1065,14 @@ class _SessionOwnerRelay:
             self._new_requests.remove(request_id)
         result = payload.get("result")
         session_id = result.get("sessionId") if isinstance(result, dict) else None
-        if session_id is not None and not _record_session_owner(session_id, home, label):
-            return self._error(request_id, "Session ownership could not be persisted")
+        if session_id is not None:
+            # F2: the creator's per-connection declarations are only valid
+            # at this first-hand creation moment; stamp them into the entry.
+            origin, lifecycle = _declared_session_class()
+            if not _record_session_owner(
+                session_id, home, label, origin=origin, lifecycle=lifecycle
+            ):
+                return self._error(request_id, "Session ownership could not be persisted")
         return line
 
 
@@ -1491,6 +1574,14 @@ def _lane_inventory(
         "gc_candidate_capacity": 0,
         "gc_candidate_bytes": 0,
         "unsafe": 0,
+        # Issue #24 F2: declared session classes of owner-linked bundles.
+        # Classification evidence only — a bucket is never a reclamation
+        # verdict (F3 leases and F4 budgets are separate phases).  Bundles
+        # without an owner record carry no declaration and never appear here.
+        "origin_lifecycle": {
+            origin: {lifecycle: 0 for lifecycle in _SESSION_CLASS_MATRIX[1]}
+            for origin in _SESSION_CLASS_MATRIX[0]
+        },
     }
     store_dir = Path(home) / ".gemini" / "antigravity-acp"
     try:
@@ -1544,10 +1635,16 @@ def _lane_inventory(
         else:
             out["age_buckets"][_AGE_BUCKET_LABELS[-1]] += 1
         protected = session_id in active
-        linked = _owner_hash(session_id) in owners
+        owner_digest = _owner_hash(session_id)
+        linked = owner_digest in owners
         out["checkpoint_protected"] += int(protected)
         out["owner_linked"] += int(linked)
         out["unowned_unprotected"] += int(not protected and not linked)
+        if linked:
+            entry = owners[owner_digest]
+            out["origin_lifecycle"][entry.get("origin", SESSION_CLASS_UNKNOWN)][
+                entry.get("lifecycle", SESSION_CLASS_UNKNOWN)
+            ] += 1
     return out
 
 
@@ -1560,8 +1657,9 @@ def session_inventory(
     applies the same decision helpers as ``prune_session_stores`` and only
     reports what the opt-in native GC *would* select under current policy.
     A candidate is NOT a reclamation verdict: the current GC has no process
-    lease and no origin tag, so a candidate may still belong to a live or
-    parked ACP child (issue #24 C1/C4; F2/F3/F4 are separate phases).
+    lease and consults no origin/lifecycle declaration, so a candidate may
+    still belong to a live or parked ACP child (issue #24 C1/C4; F3/F4 are
+    separate phases).
 
     Privacy: raw session ids, account labels, homes, and paths never
     appear; lanes are positional indexes and every value is a count, a
@@ -1595,8 +1693,9 @@ def session_inventory(
         },
         "deletions_performed": 0,
         "reclaim_certainty": (
-            "gc_candidate_prediction_only; no process lease, origin tag, or "
-            "bounded-deletion checks exist yet (issue #24 C1-C4)"
+            "gc_candidate_prediction_only; no process lease or "
+            "bounded-deletion checks exist yet and origin/lifecycle "
+            "declarations are never consulted (issue #24 C1-C4)"
         ),
         "lanes": [],
         "totals": {},
@@ -1640,6 +1739,10 @@ def session_inventory(
             "gc_candidate_bytes": 0,
             "unsafe": 0,
         }
+        totals_matrix: dict[str, dict[str, int]] = {
+            origin: {lifecycle: 0 for lifecycle in _SESSION_CLASS_MATRIX[1]}
+            for origin in _SESSION_CLASS_MATRIX[0]
+        }
         for lane, home in enumerate(sorted(homes)):
             lane_report = _lane_inventory(lane, home, active, owners, now=now)
             report["lanes"].append(lane_report)
@@ -1652,6 +1755,10 @@ def session_inventory(
                     totals[key] = None  # never present an unknown as zero
                 elif totals[key] is not None:
                     totals[key] = int(totals[key]) + int(value)
+            for origin, buckets in lane_report["origin_lifecycle"].items():
+                for lifecycle, count in buckets.items():
+                    totals_matrix[origin][lifecycle] += count
+        totals["origin_lifecycle"] = totals_matrix
         report["totals"] = totals
         if lock_state == "absent" and os.path.exists(_gc_lock_path()):
             # A GC or owner-prune pass started mid-walk (every pass creates
@@ -2330,6 +2437,10 @@ def main() -> int:
         env.pop("ACP_MUX_AFFINITY_MAX_ENTRIES", None)
         env.pop("ACP_MUX_SESSION_ID", None)
         env.pop("ACP_MUX_SESSION_GC", None)
+        # F2 declarations belong to the mux's owner ledger, never to the
+        # official server: strip them before the vendor subprocess spawn.
+        env.pop("ACP_MUX_SESSION_ORIGIN", None)
+        env.pop("ACP_MUX_SESSION_LIFECYCLE", None)
         env["HOME"] = home
         env["GEMINI_HOME"] = pinned_gemini_home(home)
         violation = mcp_config_violation(env["GEMINI_HOME"])
