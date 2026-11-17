@@ -1596,8 +1596,17 @@ def _safe_tree_size(path: Path) -> int | None:
     return None if errors else total
 
 
-def _delete_session_bundle(store: Path, record: dict) -> tuple[bool, int]:
-    """Delete only one validated DB/meta/brain bundle under the ACP store."""
+def _delete_session_bundle(
+    store: Path, record: dict, *, max_bytes: int | None = None
+) -> tuple[bool, int]:
+    """Delete only one validated DB/meta/brain bundle under the ACP store.
+
+    ``max_bytes`` (issue #24 F4 review R8) is the footprint the caller has
+    already reserved: immediately before the first mutation the real
+    delete-target footprint is re-measured here, and anything larger (or
+    unreadable) is refused non-destructively with zero mutation.  ``None``
+    keeps the legacy unbounded behavior for direct callers.
+    """
     if record["unsafe"]:
         return False, 0
     session_id = record["session_id"]
@@ -1631,6 +1640,12 @@ def _delete_session_bundle(store: Path, record: dict) -> tuple[bool, int]:
         if measured is None:
             return False, 0
         brain_size = measured
+
+    if max_bytes is not None and size + brain_size > max_bytes:
+        # R8: the footprint grew past the reserved estimate between the
+        # slot's single measurement and this point.  The byte hard bound
+        # is never retroactively widened: refuse, touch nothing.
+        return False, 0
 
     try:
         if brain_path.exists():
@@ -1822,13 +1837,17 @@ def _prune_session_store(
     def _reserve_and_delete(session_id: str, kind: str, estimate: int) -> str:
         """Returns ``ok`` or ``stop``.  Reserved cost is never refunded."""
         record = records[session_id]
+        if deadline is not None and time.monotonic() >= deadline:
+            # R9: fresh evidence ran past the wall-clock budget after the
+            # verdict; stop with zero reservation and zero mutation.
+            return "stop"
         budget["deletions"] += 1
         budget["bytes"] += estimate
         if audit:
             result[kind] += 1
             result["bytes"] += estimate
             return "ok"
-        deleted, freed = _delete_session_bundle(store, record)
+        deleted, freed = _delete_session_bundle(store, record, max_bytes=estimate)
         if deleted:
             result[kind] += 1
             result["bytes"] += freed

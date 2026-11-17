@@ -299,7 +299,7 @@ def test_bundle_revived_after_planning_is_skipped(lanes, monkeypatch):
     seen: list[str] = []
     revived: set[str] = set()
 
-    def spy_delete(store, record):
+    def spy_delete(store, record, **kwargs):
         sid = record["session_id"]
         if not seen:
             # Revive the other still-pending bundle right before the
@@ -311,7 +311,7 @@ def test_bundle_revived_after_planning_is_skipped(lanes, monkeypatch):
                     revived.add(other_sid)
                     break
         seen.append(sid)
-        return real_delete(store, record)
+        return real_delete(store, record, **kwargs)
 
     monkeypatch.setattr(mux, "_delete_session_bundle", spy_delete)
     result = mux.prune_session_stores(now=now)
@@ -596,14 +596,14 @@ def test_r4_capacity_ranking_is_recomputed_before_eviction(lanes, monkeypatch):
     _clear_lease(Path(_b), "lane-beta")
     real_delete = mux._delete_session_bundle
 
-    def spy_delete(store, record):
+    def spy_delete(store, record, **kwargs):
         if record["session_id"] == SID_1:
             # Revive the planned-oldest live bundle mid-pass: by the time
             # the capacity slot runs it is the NEWEST bundle, so evicting
             # it would be executing a stale ranking.
             fresh = time.time()
             os.utime(old_live, (fresh, fresh))
-        return real_delete(store, record)
+        return real_delete(store, record, **kwargs)
 
     monkeypatch.setattr(mux, "_delete_session_bundle", spy_delete)
     result = mux.prune_session_stores(now=now)
@@ -631,9 +631,9 @@ def test_r5_unmeasurable_footprint_never_deletes(lanes, monkeypatch):
     delete_calls = {"n": 0}
     real_delete = mux._delete_session_bundle
 
-    def spy_delete(store, record):
+    def spy_delete(store, record, **kwargs):
         delete_calls["n"] += 1
-        return real_delete(store, record)
+        return real_delete(store, record, **kwargs)
 
     monkeypatch.setattr(mux, "_delete_session_bundle", spy_delete)
     result = mux.prune_session_stores(now=now)
@@ -664,6 +664,75 @@ def test_r5_footprint_is_measured_once_per_slot(lanes, monkeypatch):
     # One candidate slot means one measurement: the budget verdict and the
     # reservation must never re-read (a re-read is a budget TOCTOU, R5).
     assert reads["n"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Review R8 — a bundle that grows past its reserved estimate between the
+# slot's single measurement and the first mutation is refused
+# non-destructively; the byte hard bound is enforced at the deleter.
+# ---------------------------------------------------------------------------
+
+def test_r8_bundle_grown_after_reservation_is_refused(lanes, monkeypatch):
+    a, _b, _state = lanes
+    now = time.time()
+    db = _seed_expired(a, SID_1, now)
+    _clear_lease(a, "lane-alpha")
+    _clear_lease(Path(_b), "lane-beta")
+    real_active = mux._active_hermes_session_ids
+    original_mtime = db.stat().st_mtime
+    calls = {"n": 0}
+
+    def spy_active(*, now=None, env=None):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            # After the slot's footprint measurement and before any
+            # mutation the payload grows far past the reserved estimate.
+            db.write_text("x" * 100_000)
+            os.utime(db, (original_mtime, original_mtime))  # stay expired
+        return real_active(now=now, env=env)
+
+    monkeypatch.setattr(mux, "_active_hermes_session_ids", spy_active)
+    result = mux.prune_session_stores(now=now)
+    assert result is not None and result["expired"] == 0
+    assert result["failed"] == 1
+    # The bundle survives exactly as the race left it: the GC itself
+    # performed zero mutations (no unlink, no partial destruction).
+    assert db.exists() and db.stat().st_size == 100_000, (
+        "grown bundle must survive untouched, not be deleted or truncated"
+    )
+    brain = a / ".gemini" / "antigravity-acp" / "brain" / SID_1
+    assert brain.exists(), "refusal must be non-destructive (zero mutation)"
+
+
+# ---------------------------------------------------------------------------
+# Review R9 — fresh evidence that runs past the wall-clock budget stops the
+# slot before any reservation or mutation (deadline hard bound).
+# ---------------------------------------------------------------------------
+
+def test_r9_deadline_elapsing_during_fresh_evidence_stops_before_mutation(
+    lanes, monkeypatch
+):
+    a, _b, _state = lanes
+    now = time.time()
+    db = _seed_expired(a, SID_1, now)
+    _clear_lease(a, "lane-alpha")
+    _clear_lease(Path(_b), "lane-beta")
+    monkeypatch.setattr(mux, "GC_PASS_DEADLINE_SECONDS", 1)
+    real_active = mux._active_hermes_session_ids
+    calls = {"n": 0}
+
+    def slow_active(*, now=None, env=None):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            # The slot's fresh checkpoint read alone blows the budget.
+            time.sleep(1.5)
+        return real_active(now=now, env=env)
+
+    monkeypatch.setattr(mux, "_active_hermes_session_ids", slow_active)
+    result = mux.prune_session_stores(now=now)
+    assert result is not None and result["expired"] == 0 and result["failed"] == 0
+    assert db.exists(), "a slot past its deadline must never mutate"
+    assert "budget-stopped" in _log_text()
 
 
 # ---------------------------------------------------------------------------

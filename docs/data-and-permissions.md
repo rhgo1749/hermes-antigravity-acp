@@ -331,14 +331,21 @@ gone; nothing here pretends to roll them back.
   alone never licenses a deletion.  The evidence is re-read per slot (no
   lock-scoped snapshot is reused), and the inventory's candidate
   prediction applies the same gate so the two never drift.
-- **Partial failure semantics (review R3):** each bundle's full budget
-  cost (count + measured byte estimate) is *reserved* before its first
-  destructive mutation and is never refunded — a bundle whose brain tree
-  was removed but whose DB unlink failed still consumes the reservation.
-  The first deletion failure or uncertain postcondition stops the rest of
-  the pass immediately (fail-closed); later candidates stay untouched.
-  There is no rollback and none is claimed — the safety property is the
-  bound itself plus per-bundle postconditions, not recovery.
+- **Partial failure semantics (review R3/R8/R9):** each bundle's full
+  budget cost (count + measured byte estimate) is *reserved* before its
+  first destructive mutation and is never refunded — a bundle whose brain
+  tree was removed but whose DB unlink failed still consumes the
+  reservation.  Immediately before the deleter's first mutation the real
+  delete-target footprint is re-measured and anything larger than the
+  reserved estimate is refused non-destructively with zero mutation (R8 —
+  the byte hard bound is never retroactively widened).  The wall-clock
+  deadline is re-checked after all fresh evidence reads and before the
+  reservation itself (R9), so a slow evidence read can never spend past
+  the budget.  The first deletion failure or uncertain postcondition
+  stops the rest of the pass immediately (fail-closed); later candidates
+  stay untouched.  There is no rollback and none is claimed — the safety
+  property is the bound itself plus per-bundle postconditions, not
+  recovery.
 - The inventory reports the budgets and both acks under `policy`
   (`gc_max_deletions`, `gc_max_bytes`, `gc_pass_deadline_seconds`,
   `process_tree_ack`); `deletions_performed` remains a constant 0.
