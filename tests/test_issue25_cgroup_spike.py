@@ -19,6 +19,14 @@ Fail-closed contract (reviewer-mandated):
   ``cgroup.kill`` or is not a plain ``domain`` is ALSO a BLOCKED skip.
   No sudo, no chmod, no mounts, no mutation of any pre-existing cgroup,
   no moving of any pre-existing process.
+- Migration containment: cgroup v2 only lets a process move between
+  cgroups sharing a writable common ancestor INSIDE the delegated
+  branch.  ``ACP_TEST_CGROUP_ROOT`` must therefore be the RUNNING
+  pytest process's own cgroup subtree (e.g. a transient
+  ``systemd-run --user --scope -p Delegate=yes`` scope — see
+  docs/issue25-cgroup-spike-preflight.md §7); an arbitrary writable
+  sibling (e.g. bare ``app.slice`` from a login shell) fails with
+  EACCES on the child join, as observed in the 2026-11-17 real run.
 - Resource ownership: every resource is owned ONLY after its own
   creation call succeeded (``dir_created`` / ``work_created`` flags);
   cgroup names carry a nonce; the work dir comes from
@@ -146,6 +154,23 @@ def _running(pid: int) -> bool:
     except (PermissionError, IndexError):
         return True
     return state != "Z"
+
+
+def _parse_populated(text: str) -> str:
+    """Parse the canonical ``cgroup.events`` line ``populated <0|1>``.
+
+    The kernel writes whitespace-separated key/value pairs (real format:
+    ``populated 0\\nfrozen 0``).  Key and value are matched strictly; any
+    malformed input fails closed to ``"?"`` — never an IndexError, never a
+    guess.  (Real-run bug, 2026-11-17: a ``split("=", 1)[1]`` parser
+    IndexError'd on the canonical format and aborted cleanup, leaving
+    owned cgroup dirs behind.)
+    """
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0] == "populated" and parts[1] in {"0", "1"}:
+            return parts[1]
+    return "?"
 
 
 LEADER_SRC = """
@@ -277,12 +302,9 @@ class _Spike:
 
     def populated(self) -> str:
         try:
-            for line in (self.dir / "cgroup.events").read_text().splitlines():
-                if line.startswith("populated"):
-                    return line.split("=", 1)[1].strip()
+            return _parse_populated((self.dir / "cgroup.events").read_text())
         except (AttributeError, OSError):
-            pass
-        return "?"
+            return "?"
 
     def cleanup(self, strict: bool = True):
         """Deterministic order; owns-only; strict failures raise.
@@ -540,3 +562,74 @@ def test_preflight_never_touches_non_delegated_roots():
                 os.environ.pop(ROOT_ENV, None)
             else:
                 os.environ[ROOT_ENV] = saved
+
+
+# -- cgroup.events parser regressions (run everywhere) ----------------------
+
+
+def test_parse_populated_canonical_and_malformed():
+    # Real kernel format is whitespace-separated key/value.
+    assert _parse_populated("populated 0\nfrozen 0\n") == "0"
+    assert _parse_populated("populated 1\nfrozen 0\n") == "1"
+    # Malformed or non-canonical shapes fail closed to "?", never raise.
+    for malformed in (
+        "",
+        "populated\n",
+        "populated=0\n",       # legacy wrong assumption (the real-run bug)
+        "populated 2\n",       # value outside {0,1}
+        "populated 0 extra\n",  # not exactly key+value
+        "frozen 0\n",          # key absent
+        "POPULATED 0\n",       # key must match exactly
+        "populated0\n",        # not whitespace-separated
+    ):
+        assert _parse_populated(malformed) == "?", repr(malformed)
+
+
+def test_populated_method_parses_real_events_format(tmp_path):
+    """Real-run bug: the old ``split('=', 1)[1]`` parser IndexError'd on
+    ``populated 0``; the method must return the value, never raise."""
+    spike = _Spike.__new__(_Spike)
+    spike._init_attrs()
+    d = tmp_path / "cg"
+    d.mkdir()
+    spike.dir = d
+    (d / "cgroup.events").write_text("populated 0\nfrozen 0\n")
+    assert spike.populated() == "0"
+    (d / "cgroup.events").write_text("populated 1\nfrozen 0\n")
+    assert spike.populated() == "1"
+    (d / "cgroup.events").write_text("populated=0\n")
+    assert spike.populated() == "?"
+    spike.dir = d / "gone"
+    assert spike.populated() == "?"
+
+
+def test_cleanup_survives_real_events_format(tmp_path):
+    """Real-run residue bug: cleanup aborted with IndexError on the
+    canonical events format and left the owned dir behind.  Here the only
+    tolerated artifact is the fake-file ENOTEMPTY rmdir (real cgroup files
+    are virtual and vanish with the cgroup)."""
+    spike = _Spike.__new__(_Spike)
+    spike._init_attrs()
+    owned = tmp_path / "owned"
+    owned.mkdir()
+    killfile = owned / "cgroup.kill"
+    spike.dir = owned
+    spike.dir_created = True
+    spike.killfile = killfile
+    spike.killfile_ready = True
+    killfile.touch()
+    spike.procs = owned / "cgroup.procs"
+    spike.procs.write_text("")
+    events = owned / "cgroup.events"
+    events.write_text("populated 0\nfrozen 0\n")
+    spike.cleanup(strict=False)  # must not raise IndexError
+    assert killfile.read_text() == "1"
+    assert len(spike.cleanup_errors) == 1 and spike.cleanup_errors[0].startswith(
+        "rmdir owned:"
+    ), spike.cleanup_errors
+    # Finish removal manually (fake files are not virtual cgroup files).
+    events.unlink()
+    killfile.unlink()
+    (owned / "cgroup.procs").unlink()
+    owned.rmdir()
+    assert not owned.exists()

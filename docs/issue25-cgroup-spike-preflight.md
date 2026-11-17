@@ -46,7 +46,10 @@ No sudo/root used; no chmod; no pre-existing cgroup touched; the single
 - Gate: `ACP_TEST_CGROUP_ROOT` must be absolute, pre-existing,
   EFFECTIVELY WRITABLE (capability check via `os.access`, not an owner
   check), non-mount-root, with a writable `cgroup.kill`; anything else →
-  skip with BLOCKED reason, never PASS. A created CHILD cgroup without a
+  skip with BLOCKED reason, never PASS. The root must additionally be
+  inside the RUNNING pytest process's own cgroup subtree — see §7 for
+  the migration-containment requirement proven by the 2026-11-17 real
+  run. A created CHILD cgroup without a
   writable `cgroup.kill` or with `cgroup.type != domain` is also a
   BLOCKED skip. The gate unit (`test_preflight_never_touches_non_delegated_roots`
   — always RUNs) plus ownership regression tests cover malformed roots,
@@ -117,3 +120,58 @@ Run this spike (after this ownership rework passes review) on a
 delegated environment — requires an operator-approved deployment change
 to delegate a cgroup subtree to this container, or a separate delegated
 host. No production wiring until the spike PASSes there.
+
+## 7. Real-kernel run (2026-11-17 KST, host gonus-X870E, operator-executed) — FAIL, root-cause split
+
+Operator ran HEAD 2b2acbc as `gonus` with
+`ROOT=/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice`:
+**1 failed, 6 passed, RC=1**; three empty `acp25-target-*` dirs left
+(gonus-owned, `populated 0`, `cgroup.procs` empty — no process leak,
+known residue, operator-cleared, not agent-cleared).
+
+Two independent real-kernel findings:
+
+1. **Migration containment (test-environment error, not a code bug).**
+   The failing join was `PermissionError` writing the target child's
+   `cgroup.procs`: the leader was spawned from `session-80.scope`, and
+   `app.slice` is a SIBLING under `user@1000.service`. cgroup v2 only
+   allows moving a process between cgroups whose common ancestor
+   (`user-1000.slice` here) is itself inside the writable delegated
+   branch; the ancestor was outside it, so EACCES is expected regardless
+   of the destination file mode. **Contract: `ACP_TEST_CGROUP_ROOT` must
+   be the RUNNING pytest process's own cgroup subtree**, not an
+   arbitrary writable sibling.
+2. **`cgroup.events` parser bug (code bug, fixed in this rework).**
+   `populated()` parsed with `line.split("=", 1)[1]`, but the canonical
+   kernel format is whitespace (`populated 0`). The resulting
+   `IndexError` aborted cleanup before the owned-dir rmdir — that is why
+   the three empty dirs remained. Fixed by a strict `_parse_populated()`
+   (exact key, value in `{0,1}`, fail closed to `"?"`) plus real-format
+   unit and cleanup regression tests.
+
+### Recommended execution route (host systemd 259.5, Ubuntu)
+
+`Delegate=` on transient user scopes is supported at this systemd
+version. The agent could not exercise the user bus (DevSpace uid 997 has
+no access to the gonus user manager), so **step 0 is the operator-run
+on-host verification of the exact invocation** before the real run:
+
+```sh
+# 0) verify the invocation is accepted (transient scope running `true`):
+systemd-run --user --scope -p Delegate=yes --unit=acp25-verify true
+
+# 1) enter a disposable delegated scope (auto-named if --unit omitted):
+systemd-run --user --scope -p Delegate=yes
+
+# 2) inside the scope, derive the root from the LIVE cgroup and run:
+R="$(awk -F: '$1=="0"{print $3}' /proc/self/cgroup)"
+ACP_TEST_CGROUP_ROOT="/sys/fs/cgroup${R}" \
+  pytest tests/test_issue25_cgroup_spike.py
+```
+
+Inside the delegated scope the spike creates only its own nonce child
+cgroups and moves only its own spawned children — every join stays
+within the delegated subtree, satisfying migration containment. Gate B
+recommendation remains **NO-GO** until a run on such a delegated scope
+PASSes; the three leftover dirs stay as known residue until the
+operator removes them.
