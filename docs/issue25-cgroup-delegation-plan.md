@@ -238,21 +238,33 @@ tree + rw delegate subtree + env var), removed entirely afterwards.
    - **Stop semantics:** `docker stop hermes-acp-canary` completes within
      `stop_grace_period` (no SIGKILL fallback needed). Then on the host,
      with `SCOPE=/sys/fs/cgroup/system.slice/docker-<canary-id>.scope`,
-     distinguish the FOUR states explicitly (GNU find's `-exec … +`
-     PROPAGATES grep's exit: 1 on "no file matched" is the DESIRED empty
-     state, so raw nonzero-find-exit must not be the criterion):
-     `if [ ! -d "$SCOPE" ]; then echo "SCOPE-ABSENT (vacuous pass — recorded)";
-     else out=$(find "$SCOPE" -name cgroup.procs -exec grep -l . {} + 2>/dev/null); rc=$?;
-     if [ "$rc" -ge 2 ]; then echo "TRAVERSAL ERROR rc=$rc (FAIL)"; exit 1; fi;
-     if [ -n "$out" ]; then echo "ORPHANS: $out (FAIL)"; exit 1; fi;
-     echo "SCOPE-PRESENT, ALL cgroup.procs EMPTY (PASS)"; fi`
-     — `grep -l .` lists any `cgroup.procs` whose CONTENTS contain a pid
-     (content-based on purpose: `test -s` is vacuous on cgroupfs
-     pseudo-files, st_size is 0 regardless of pids); rc 0/1 are both normal
-     (0 = orphans found, listed in `$out`; 1 = none), rc ≥ 2 = genuine
-     traversal/read error. Additionally `pgrep -fa 'nous-hermes-acp-canary'`
-     (the concrete quoted compose project marker used at canary creation)
-     must be empty.
+     traversal and content inspection are SEPARATED so no exit status is
+     ever ambiguous (find rc is checked alone, without -exec and without
+     stderr suppression; each file is then read individually):
+     `if [ ! -d "$SCOPE" ]; then
+       echo "SCOPE-ABSENT (vacuous pass — recorded)"
+     else
+       files=$(find "$SCOPE" -name cgroup.procs) || { echo "TRAVERSAL ERROR (FAIL)"; exit 1; }
+       [ -n "$files" ] || { echo "NO cgroup.procs FOUND (FAIL — unexpected)"; exit 1; }
+       orphans=""
+       while IFS= read -r f; do
+         if content=$(cat -- "$f" 2>/dev/null); then
+           [ -n "$content" ] && orphans="$orphans $f(pids:$content)"
+         else
+           echo "READ ERROR: $f (FAIL)"; exit 1
+         fi
+       done <<< "$files"
+       if [ -n "$orphans" ]; then echo "ORPHANS:$orphans (FAIL)"; exit 1; fi
+       echo "SCOPE-PRESENT, ALL $(printf '%s\n' "$files" | wc -l) cgroup.procs EMPTY (PASS)"
+     fi`
+     — five distinct outcomes: SCOPE-ABSENT (recorded vacuous pass),
+     traversal error (find's own rc, FAIL), zero cgroup.procs found
+     (unexpected for a live-or-just-stopped scope → FAIL, not silent
+     silence), per-file read error (FAIL), nonempty CONTENTS (ORPHANS with
+     the pids listed, FAIL). Content-based by design: `test -s` is vacuous
+     on cgroupfs pseudo-files (st_size is 0 regardless of pids).
+     Additionally `pgrep -fa 'nous-hermes-acp-canary'` (the concrete quoted
+     compose project marker used at canary creation) must be empty.
 7. Teardown canary: `docker compose -p nous-hermes-acp-canary down` + delete
    the copy dirs. No production artifact touched at any step.
 
