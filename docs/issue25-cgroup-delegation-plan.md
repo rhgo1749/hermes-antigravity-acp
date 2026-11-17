@@ -236,11 +236,17 @@ tree + rw delegate subtree + env var), removed entirely afterwards.
      growth over the same window (children's usage lands in the scope
      aggregate because stats recurse).
    - **Stop semantics:** `docker stop hermes-acp-canary` completes within
-     `stop_grace_period` (no SIGKILL fallback needed), then on the host:
-     `find "/sys/fs/cgroup/system.slice/docker-<canary-id>.scope" -name cgroup.procs -exec sh -c 'test -s "$1" && echo "ORPHAN: $1"' _ {} \;`
-     prints NOTHING (every cgroup in the canary's scope, delegate children
-     included, is empty — no orphans), and `pgrep -fa <canary compose
-     project marker>` is empty.
+     `stop_grace_period` (no SIGKILL fallback needed). Then on the host,
+     with `SCOPE=/sys/fs/cgroup/system.slice/docker-<canary-id>.scope`:
+     if `$SCOPE` still exists, `find "$SCOPE" -name cgroup.procs -exec
+     grep -l . {} +` must print NOTHING — any `cgroup.procs` whose CONTENTS
+     contain a pid is listed by grep -l, is an orphan, and FAILS. This is content-based on purpose: `test -s` is
+     vacuous on cgroupfs pseudo-files (st_size reports 0 regardless of
+     pids). A nonzero `find` exit is a FAIL, not a silent pass; if docker
+     already REMOVED `$SCOPE`, the orphan check passes vacuously-by-absence
+     — record which of the two cases occurred rather than conflating them.
+     Additionally `pgrep -fa 'nous-hermes-acp-canary'` (the concrete quoted
+     compose project marker used at canary creation) must be empty.
 7. Teardown canary: `docker compose -p nous-hermes-acp-canary down` + delete
    the copy dirs. No production artifact touched at any step.
 
