@@ -7,7 +7,8 @@ a vendor descendant leaves the mux's PGID/SID via `setsid()`/`setpgid()`?
 **Verdict: INCONCLUSIVE — F4 Gate B ACK recommendation: NO-GO.**
 The gap is real and pinned deterministically; the current vendor happens to
 keep everything in-group at audit time, but nothing in any contract requires
-it, and the vendor binary ships the machinery to leave.
+it, and `setsid`/`setpgid`-related strings/symbols are present in the
+shipped vendor binaries (reachability and runtime use unproven — §4).
 
 ## 1. Ownership boundary (source-confirmed, main `37828b1` + PR #50 head `ac781de`)
 
@@ -16,9 +17,13 @@ plugin (client.py)
   └─ Popen(mux, start_new_session=True)          # mux = session+group leader
        └─ mux (scripts/acp_mux.py)
             └─ Popen(agy_acp_server.par, pass_fds=(lease,))   # plain Popen:
-                 │    # inherits mux PGID/SID; lease fd covers THIS child only
+                 │    # inherits mux PGID/SID; the repo guarantees lease-fd
+                 │    # inheritance through the DIRECT official child only
                  └─ vendor-spawned descendants (localharness_external, …)
-                      # inherited group only; close_fds → no lease fd;
+                      # group membership comes from fork inheritance alone;
+                      # whether the vendor closes or retains inherited fds in
+                      # further descendants is neither guaranteed by any
+                      # contract nor verified by this slice;
                       # no code/contract prevents setsid()/setpgid()
 teardown (process_teardown.py): killpg(leader PGID) — reachable set is
 exactly "processes still in that group". Detached ⇒ unreachable by design.
@@ -48,7 +53,10 @@ teardown's reachability boundary, nothing about vendor intent.
 
 ## 3. Live read-only vendor evidence (no signals, no restarts)
 
-Snapshot 2026-11-17 (KST), `/proc` reads only:
+Snapshot 2026-11-17 21:21:27 KST, `/proc` reads only (raw dump:
+`/opt/data/cache/scratch/g25-detached-live.txt`, sha256 prefix
+`183612ddcde35f49`; fleet is dynamic — a later reviewer snapshot of
+7 trees / 16 descendants / 0 detached is consistent, not contradictory):
 
 - 8 mux trees (`antigravity-acp-mux.py`), 19 descendants total
   (`agy_acp_server.par` + `localharness_external`): **0 detached** — every
@@ -75,10 +83,12 @@ while detached". Observed-same-group ≠ contract-guaranteed.
   termination on parent exit, or requires native-store fd closure.  Do not
   read "ACP standard contract = containment" anywhere in this document.
 - **Vendor 1.4.4 binaries** (static `strings`, read-only):
-  `localharness_external` contains Go `Setsid`/`Setpgid`/`SetSID` symbols
-  (`syscall.SysProcAttr` machinery); `agy_acp_server.par` contains `setsid`
-  references. Symbol presence proves the *capability path exists in the
-  shipped binaries*, not that the runtime detaches today.
+  `localharness_external` contains `setsid`/`setpgid`-related
+  strings/symbol names (`Setsid`, `Setpgid`, `SetSID` — matching Go
+  `syscall.SysProcAttr` field names); `agy_acp_server.par` contains
+  `setsid`-related strings.  Static string/symbol-name presence does
+  **not** prove these are reachable from a relevant descendant-spawn path
+  or used at runtime — reachability and runtime use are **unproven**.
 - **Google vendor docs**: none published in-repo or referenced by our docs
   that promise in-group descendants or store-fd release on child exit.
 - Our own repo docs promise the *plugin* never daemonizes; they make no
@@ -109,7 +119,9 @@ vendor-specific contract (or ACP RFD), not enforcement of an existing one.
 
 1. setsid-escaping descendant holding native-store state through every
    permitted teardown (pinned in §2.1).
-2. Vendor binary ships detach machinery with no contract against it (§4).
+2. `setsid`/`setpgid`-related strings/symbols present in the vendor
+   binaries, with no contract against detaching; reachability and runtime
+   use unproven (§4).
 3. Detached survivor reparents and becomes unattributable to its lane
    (§2.3) — no plugin-side handle survives.
 4. `terminate_process_tree` returning `True` is silent about out-of-group
