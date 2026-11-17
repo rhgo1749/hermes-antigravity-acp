@@ -42,6 +42,7 @@ CANONICAL_PROVIDER_FILES = {
     "__init__.py",
     "client.py",
     "bridge.py",
+    "cgroup_containment.py",
     "conversation_state.py",
     "native_limit_state.py",
     "process_teardown.py",
@@ -104,7 +105,7 @@ def _deploy():
 def test_canonical_fileset_witness_matches_deployer_contract() -> None:
     deploy = _deploy()
     assert set(deploy.REQUIRED) == CANONICAL_PROVIDER_FILES
-    assert len(deploy.REQUIRED) == 10
+    assert len(deploy.REQUIRED) == 11
 
 
 _PROVIDER_PREFIX = "hermes-plugin/antigravity-acp/"

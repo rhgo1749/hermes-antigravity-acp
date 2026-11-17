@@ -313,6 +313,105 @@ def terminate_process_tree(
     return _sweep_group(pgid, proc, grace=sweep_grace, timeout=sweep_timeout)
 
 
+_CONTAINMENT_EMPTY_TIMEOUT_SECONDS = 5.0
+
+
+def terminate_contained_tree(
+    proc: subprocess.Popen,
+    containment,
+    *,
+    graceful_stdin: bool = False,
+    graceful_timeout: float = _GRACEFUL_TIMEOUT_SECONDS,
+    kill_timeout: float = _KILL_TIMEOUT_SECONDS,
+    empty_timeout: float = _CONTAINMENT_EMPTY_TIMEOUT_SECONDS,
+) -> bool | None:
+    """Teardown ladder for a containment-CONFIRMED mux tree (issue #25).
+
+    ``containment`` is the spawn-time ``cgroup_containment.Containment``
+    handle (duck-typed on purpose: this module stays stdlib-only).  The
+    cgroup sweep reaches EVERY member regardless of ``setsid``/``setpgid``
+    escapes — the guarantee the group ladder can never make — so this ladder
+    is preferred whenever a containment was confirmed at spawn.
+
+    Ladder: (optional) cooperative stdin EOF -> ``cgroup.kill`` on OUR OWN
+    cgroup -> reap the direct child -> authoritative empty proof
+    (``cgroup.events`` populated=0 AND ``cgroup.procs`` empty) -> rmdir our
+    own dir.
+
+    Ownership guards: the cgroup dir is touched only while its (st_dev,
+    st_ino) still matches the creation-time record (path-reuse guard), and
+    only the dir this handle created is ever removed.  Any failed step
+    escalates to the legacy group ladder, reports the containment guarantee
+    as UNVERIFIED (``None``), and logs residue loudly — never hidden, never
+    promoted.
+
+    Returns ``True`` ONLY for a completed cgroup-verified teardown (empty
+    proof observed AND own dir removed).  ``False`` means the tree was
+    emptied but our own dir removal failed (logged residue).  ``None`` means
+    the containment verification was lost — callers must not treat it as
+    contained-verified.
+    """
+    if containment.cleaned_up:
+        # This exact ladder already completed and verified for this handle.
+        return True
+    if not containment.ownership_intact():
+        logger.warning(
+            "ACP contained teardown for pid %d: cgroup dir %s no longer "
+            "names the object we created (path reuse?); refusing to touch a "
+            "foreign object — escalating to the group ladder, containment "
+            "UNVERIFIED",
+            proc.pid,
+            containment.directory.name,
+        )
+        terminate_process_tree(proc, graceful_stdin=graceful_stdin)
+        return None
+    if graceful_stdin and proc.stdin is not None and not proc.stdin.closed:
+        with contextlib.suppress(OSError, ValueError):
+            proc.stdin.close()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=graceful_timeout)
+    if not containment.sweep_own_cgroup():
+        logger.warning(
+            "ACP contained teardown for pid %d: cgroup.kill write failed; "
+            "escalating to the group ladder, containment UNVERIFIED",
+            proc.pid,
+        )
+        terminate_process_tree(proc, graceful_stdin=False)
+        return None
+    # cgroup.kill SIGKILLs every member, the direct leader included.
+    try:
+        proc.wait(timeout=kill_timeout)
+    except subprocess.TimeoutExpired:
+        logger.warning(
+            "ACP contained teardown for pid %d: direct child alive after "
+            "cgroup.kill; group-ladder escalation, containment UNVERIFIED",
+            proc.pid,
+        )
+        with contextlib.suppress(OSError):
+            proc.kill()
+        with contextlib.suppress(Exception):
+            proc.wait(timeout=kill_timeout)
+        terminate_process_tree(proc, graceful_stdin=False)
+        return None
+    if not containment.wait_empty(timeout=empty_timeout):
+        logger.error(
+            "ACP contained teardown for pid %d: RESIDUE — cgroup %s still "
+            "populated=%s procs=%s after cgroup.kill; NOT claiming a "
+            "contained teardown; group-ladder escalation follows",
+            proc.pid,
+            containment.directory.name,
+            containment.parse_populated(),
+            containment.procs(),
+        )
+        terminate_process_tree(proc, graceful_stdin=False)
+        return None
+    if not containment.remove_own_dir():
+        # remove_own_dir already logged the exact residue.
+        return False
+    containment.finish()
+    return True
+
+
 def _terminate_windows(
     proc: subprocess.Popen,
     *,

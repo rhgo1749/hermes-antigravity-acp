@@ -62,6 +62,7 @@ PUBLIC_PROVIDER_FILES = frozenset(
         "__init__.py",
         "client.py",
         "bridge.py",
+        "cgroup_containment.py",
         "conversation_state.py",
         "native_limit_state.py",
         "process_teardown.py",

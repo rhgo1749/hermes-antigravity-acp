@@ -59,9 +59,11 @@ from .hermes_compat import (
     windows_hide_flags,
 )
 from .native_limit_state import native_limit_registry
+from . import cgroup_containment
 from .process_teardown import (
     proc_dead_unreaped,
     proc_exit_status_unreaped,
+    terminate_contained_tree,
     terminate_process_tree,
 )
 from .request_trace import get_tracer, silence_seconds
@@ -3843,11 +3845,27 @@ _warm_pool: dict[tuple[str, tuple[str, ...], str, str], list[dict[str, Any]]] = 
 _warm_pool_atexit_armed = False
 
 
+def _terminate_acp_tree(proc: subprocess.Popen[str], *, graceful_stdin: bool = False) -> None:
+    """Single teardown dispatch for every plugin-managed ACP child.
+
+    A spawn whose cgroup containment was CONFIRMED at spawn time (issue #25)
+    takes the cgroup ladder — the only ladder that reaches ``setsid``-escaped
+    descendants; every other process keeps the legacy group/taskkill ladder
+    unchanged.  A containment whose ownership proof is lost mid-teardown
+    degrades to UNVERIFIED inside the ladder; it is never promoted.
+    """
+    containment = cgroup_containment.of(proc)
+    if containment is not None:
+        terminate_contained_tree(proc, containment, graceful_stdin=graceful_stdin)
+    else:
+        terminate_process_tree(proc, graceful_stdin=graceful_stdin)
+
+
 def _terminate_parked(proc: subprocess.Popen[str]) -> None:
     # A parked process has no active writer, so the cooperative stdin-EOF
     # shutdown is safe here; the tree escalation guarantees a parked mux never
     # leaves its bound official-server child behind (issue #23 P1 review).
-    terminate_process_tree(proc, graceful_stdin=True)
+    _terminate_acp_tree(proc, graceful_stdin=True)
 
 
 def _shutdown_warm_pool() -> None:
@@ -4087,7 +4105,7 @@ class AntigravityACPClient:
         # taskkill /T /F on Windows): a mux force-killed here can never leave
         # its official-server child running (issue #23 P1 review).  Closing
         # stdin first is only safe for the thread that owns the request pipe.
-        terminate_process_tree(proc, graceful_stdin=graceful_stdin)
+        _terminate_acp_tree(proc, graceful_stdin=graceful_stdin)
 
     def _release_process(self, proc: subprocess.Popen[str]) -> None:
         with self._active_process_lock:
@@ -4850,31 +4868,72 @@ class AntigravityACPClient:
         par_pin = _read_par_pin()
         if par_pin is not None:
             child_env["ACP_MUX_PAR"] = par_pin
+        # Issue #25 containment seam: when (and ONLY when) the delegated,
+        # migration-contained cgroup gate passes, the mux is exec'd by a
+        # trampoline that joined our own nonce cgroup and VERIFIED it before
+        # exec — no mux/vendor descendant can be born outside it, and the
+        # Popen stays the single assignment point.  Gate unavailable or
+        # handshake failure => plain spawn, behavior identical to before
+        # (containment=UNKNOWN; never promoted later).
+        mux_argv = [self._acp_command] + self._acp_args
+        popen_kwargs: dict[str, Any] = {
+            "stdin": subprocess.PIPE,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
+            "bufsize": 1,
+            "cwd": self._acp_cwd,
+            "env": child_env,
+            "creationflags": _windows_hide_flags(),
+            # Own process group so teardown can signal the whole tree
+            # (mux + official-server child) — see process_teardown.
+            "start_new_session": os.name != "nt",
+        }
+        containment = cgroup_containment.Containment.begin()
+        argv = mux_argv
+        if containment is not None:
+            argv = containment.wrap_argv(mux_argv)
+            popen_kwargs["pass_fds"] = containment.pass_fds()
         try:
-            proc = subprocess.Popen(
-                [self._acp_command] + self._acp_args,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                bufsize=1,
-                cwd=self._acp_cwd,
-                env=child_env,
-                creationflags=_windows_hide_flags(),
-                # Own process group so teardown can signal the whole tree
-                # (mux + official-server child) — see process_teardown.
-                start_new_session=(os.name != "nt"),
-            )
+            proc = subprocess.Popen(argv, **popen_kwargs)
         except FileNotFoundError as exc:
+            if containment is not None:
+                containment.abort()
             raise RuntimeError(
                 f"Could not start Antigravity ACP command '{self._acp_command}'. "
                 "Install the official ACP wrapper or configure the provider command."
             ) from exc
+        except BaseException:
+            if containment is not None:
+                containment.abort()
+            raise
+        if containment is not None and not containment.confirm():
+            # Trampoline failed (never exec'd the mux) or the handshake
+            # timed out: reap it, remove our own cgroup, respawn WITHOUT
+            # containment — the legacy spawn path, unchanged semantics.
+            containment.abort()
+            with contextlib.suppress(OSError):
+                proc.kill()
+            with contextlib.suppress(Exception):
+                proc.wait(timeout=5.0)
+            containment = None
+            popen_kwargs.pop("pass_fds", None)
+            try:
+                proc = subprocess.Popen(mux_argv, **popen_kwargs)
+            except FileNotFoundError as exc:
+                raise RuntimeError(
+                    f"Could not start Antigravity ACP command '{self._acp_command}'. "
+                    "Install the official ACP wrapper or configure the provider command."
+                ) from exc
         if proc.stdin is None or proc.stdout is None:
             proc.kill()
+            if containment is not None:
+                containment.abort()
             raise RuntimeError("Antigravity ACP process did not expose stdin/stdout pipes.")
+        if containment is not None:
+            cgroup_containment.attach(proc, containment)
         with self._active_process_lock:
             self._active_processes.add(proc)
             self.is_closed = False
