@@ -128,10 +128,13 @@ nsenter -t "$PID" -m -- sh -eu -c '
     mount --bind /sys/fs/cgroup/acp-delegate /sys/fs/cgroup/acp-delegate
   mount -o remount,bind,rw /sys/fs/cgroup/acp-delegate'
 # Post-attestation (fail closed): delegate rw inside the ns, parent ro again
-# (it never stopped being ro), and exactly one mount on the delegate path.
+# (it never stopped being ro), and EXACTLY ONE mount attached to the delegate
+# path.  findmnt -T is useless here (it selects the single covering mount, so
+# stacked binds would still print one line); enumerate exact-target entries in
+# mountinfo instead — more than one line means stacked layers -> fail.
 nsenter -t "$PID" -m -- findmnt -T /sys/fs/cgroup/acp-delegate -o OPTIONS | grep -qw rw
 nsenter -t "$PID" -m -- findmnt /sys/fs/cgroup -o OPTIONS | grep -qw ro
-test "$(nsenter -t "$PID" -m -- findmnt -T /sys/fs/cgroup/acp-delegate -o SOURCE | wc -l)" -eq 2
+test "$(nsenter -t "$PID" -m -- awk '$5=="/sys/fs/cgroup/acp-delegate"' /proc/self/mountinfo | wc -l)" -eq 1
 ```
 
 If any step fails, the unit exits non-zero and the seam stays UNKNOWN —
@@ -188,18 +191,18 @@ tree + rw delegate subtree + env var), removed entirely afterwards.
 
 1. Start canary with entrypoint override (root stage, disposable). The
    sequence reaches P1's EXACT mount end-state (parent = original ro,
-   delegate = rw self-bind; no stacked mounts, no shared-superblock flips):
-   `mount --bind /sys/fs/cgroup /sys/fs/cgroup && mount -o remount,bind,rw /sys/fs/cgroup && mkdir -p /sys/fs/cgroup/acp-delegate && chown 1000:1000 /sys/fs/cgroup/acp-delegate && echo 1 > /sys/fs/cgroup/acp-delegate/cgroup.procs && umount /sys/fs/cgroup && mount --bind /sys/fs/cgroup/acp-delegate /sys/fs/cgroup/acp-delegate && mount -o remount,bind,rw /sys/fs/cgroup/acp-delegate && exec /init gateway run`
+   delegate = rw self-bind; no stacked mounts, no shared-superblock flips).
    Ordering is load-bearing: the temporary parent self-bind exists ONLY for
    the `mkdir` (the one operation that DOES need a rw parent); it is unmounted
    BEFORE the delegate bind is created, so no child is ever stacked under it
    and the original ro parent mount reappears intact. PID 1 relocates into
    the delegate before `/init` execs, so every container process — gateway,
-   mux, vendor children — is BORN inside it (§3 condition 2).
+   mux, vendor children — is BORN inside it (§3 condition 2). The findmnt
+   pre-flight is INSIDE the executable chain before `exec` — a literal
+   copy/paste cannot bypass it:
+   `mount --bind /sys/fs/cgroup /sys/fs/cgroup && mount -o remount,bind,rw /sys/fs/cgroup && mkdir -p /sys/fs/cgroup/acp-delegate && chown 1000:1000 /sys/fs/cgroup/acp-delegate && echo 1 > /sys/fs/cgroup/acp-delegate/cgroup.procs && umount /sys/fs/cgroup && mount --bind /sys/fs/cgroup/acp-delegate /sys/fs/cgroup/acp-delegate && mount -o remount,bind,rw /sys/fs/cgroup/acp-delegate && findmnt /sys/fs/cgroup -o OPTIONS | grep -qw ro && findmnt -T /sys/fs/cgroup/acp-delegate -o OPTIONS | grep -qw rw && test "$(awk '$5=="/sys/fs/cgroup/acp-delegate"' /proc/self/mountinfo | wc -l)" -eq 1 && exec /init gateway run`
    With `HERMES_ANTIGRAVITY_ACP_CGROUP_ROOT=/sys/fs/cgroup/acp-delegate`.
-   Pre-flight inside the entrypoint after setup: `findmnt /sys/fs/cgroup -o
-   OPTIONS | grep -qw ro && findmnt -T /sys/fs/cgroup/acp-delegate -o OPTIONS
-   | grep -qw rw` — else abort.
+   Any `&&` link failing aborts the entrypoint before `/init` ever starts.
 2. Gate attestation (inside canary, as hermes uid 1000):
    `python -c "from cgroup_containment import delegated_root; print(delegated_root())"`
    must print the root — else STOP (fail-closed, §6).
@@ -223,11 +226,21 @@ tree + rw delegate subtree + env var), removed entirely afterwards.
    and holds the relocated container processes; sibling cgroups (other
    containers, host services) untouched.
 6. **Lifecycle-parity verification** (turns §4's systemd/Docker assumptions
-   into evidence): `docker stats --no-stream hermes-acp-canary` reports
-   non-zero CPU/mem (recursive aggregation across the relocated tree), then
-   `docker stop hermes-acp-canary` completes within `stop_grace_period` with
-   the ENTIRE subtree (delegate children included) gone afterwards — no
-   orphaned processes under the canary's scope path on the host.
+   into evidence, with measurable criteria — `docker stats` nonzero alone
+   proves nothing since it could reflect the gateway alone):
+   - **Aggregation:** take `docker stats --no-stream` CPU for the canary
+     while idle, then again DURING a busy ACP request (mux + vendor children
+     active). Criterion: the busy reading materially exceeds the idle one
+     AND, on the host, `cat <canary-scope>/cpu.stat` and
+     `<canary-scope>/acp-delegate/cpu.stat` both show nonzero `usage_usec`
+     growth over the same window (children's usage lands in the scope
+     aggregate because stats recurse).
+   - **Stop semantics:** `docker stop hermes-acp-canary` completes within
+     `stop_grace_period` (no SIGKILL fallback needed), then on the host:
+     `find "/sys/fs/cgroup/system.slice/docker-<canary-id>.scope" -name cgroup.procs -exec sh -c 'test -s "$1" && echo "ORPHAN: $1"' _ {} \;`
+     prints NOTHING (every cgroup in the canary's scope, delegate children
+     included, is empty — no orphans), and `pgrep -fa <canary compose
+     project marker>` is empty.
 7. Teardown canary: `docker compose -p nous-hermes-acp-canary down` + delete
    the copy dirs. No production artifact touched at any step.
 
