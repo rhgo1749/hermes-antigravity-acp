@@ -37,6 +37,7 @@ def lanes(tmp_path, monkeypatch):
     # path is reachable; the fence itself is covered in
     # tests/test_issue24_f3_process_lease.py (test_b2_*).
     monkeypatch.setenv("ACP_MUX_F3_CUTOVER_ACK", "1")
+    monkeypatch.setenv("ACP_MUX_F4_PROCESS_TREE_ACK", "1")
     monkeypatch.setenv("ACP_MUX_DEFAULT_HOME", str(tmp_path / "default-home"))
     monkeypatch.setattr(mux, "DEFAULT_HOME", str(tmp_path / "default-home"))
     monkeypatch.setattr(mux, "STATE_PATH", str(tmp_path / "state.json"))

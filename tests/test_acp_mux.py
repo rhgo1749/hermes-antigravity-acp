@@ -736,6 +736,7 @@ def test_official_mux_prunes_expired_sessions_and_keeps_resumable_ones(tmp_path)
         "HERMES_HOME": str(hermes_home),
         "ACP_MUX_SESSION_GC": "1",
         "ACP_MUX_F3_CUTOVER_ACK": "1",
+        "ACP_MUX_F4_PROCESS_TREE_ACK": "1",
     })
     request = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize"}) + "\n"
     completed = subprocess.run(

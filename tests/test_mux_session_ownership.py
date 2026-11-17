@@ -25,6 +25,7 @@ def lanes(tmp_path, monkeypatch):
     # Post-cutover behavior for the GC-lock test below (see test_b2_* in
     # tests/test_issue24_f3_process_lease.py for the fence itself).
     monkeypatch.setenv("ACP_MUX_F3_CUTOVER_ACK", "1")
+    monkeypatch.setenv("ACP_MUX_F4_PROCESS_TREE_ACK", "1")
     monkeypatch.setattr(mux, "STATE_PATH", str(tmp_path / "state.json"))
     monkeypatch.setattr(mux, "REGISTRY_PATH", str(tmp_path / "accounts.json"))
     monkeypatch.setattr(mux, "LOG_PATH", str(tmp_path / "mux.log"))
@@ -225,7 +226,7 @@ def test_gc_reads_checkpoint_after_acquiring_gc_lock(lanes, monkeypatch):
     def active(*, now=None, env=None):
         snapshot_called.set()
         return {SID}
-    def prune(home, active_ids, *, now):
+    def prune(home, active_ids, *, now, **_f4_policy):
         observed.append(set(active_ids))
         return {"expired": 0, "capacity": 0, "bytes": 0, "failed": 0}
     monkeypatch.setattr(mux, "_active_hermes_session_ids", active)

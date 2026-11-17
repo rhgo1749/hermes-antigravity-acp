@@ -266,15 +266,62 @@ deletes nothing.
   `lanes_lease_protected` total; a protected lane reports zero
   candidates so the dry-run prediction cannot drift from GC behavior.
   `deletions_performed` remains a constant 0.
-- Residual race, stated honestly and **not** claimed closed: a bind
-  racing a GC pass — the GC probes the lane lease, releases the probe,
-  and only then walks the store; a new mux can acquire the lease inside
-  that window.  Nothing here makes that safe on its own.  Before any
-  real deletion is enabled, F4 must close **both** (a) this window, with
-  a lease recheck/hold held through deletion plus bounded scope, and
-  (b) the descendant boundary above, via issue #25 process-tree
-  evidence.  Until then `GC=1` stays NO-GO and C1 is only *mitigated*
-  (normal-path exposure), not globally closed.
+- Residual race, stated honestly: a bind racing a GC pass — the GC probes
+  the lane lease, releases the probe, and only then walks the store; a new
+  mux can acquire the lease inside that window.  Nothing in F3 makes that
+  safe on its own.  F4 (below) closes **both** (a) this window, with an
+  exclusive lease hold plus bounded scope, and (b) the descendant boundary
+  above, via the issue #25 process-tree evidence gate.  Until both gates
+  are actually acknowledged in production, `GC=1` stays NO-GO and C1 is
+  only *mitigated* (normal-path exposure), not globally closed.
+
+### Bounded deletion and deletion authority (issue #24 Phase 4 / F4)
+
+F4 turns the F3 lease from a *probe* into a *hold* and puts every real
+deletion behind two independent operator gates.  The design goal is a
+bounded blast radius with a verifiable postcondition — deleted files are
+gone; nothing here pretends to roll them back.
+
+- **Gate A — check-to-delete TOCTOU closed by an exclusive hold.**  A real
+  deletion pass takes each registered lane's lease `LOCK_EX` and keeps it
+  for the whole per-home pass, re-reading the heartbeat *under* the lock
+  (never a reused probe).  A bind racing the pass cannot take its shared
+  lease, so it never spawns against a store being deleted (its own bounded
+  retries fail it closed first).  Contended, absent, grace, or unreadable
+  lanes are skipped fail-closed; the hold is released even if the pass
+  raises.
+- **Gate B — process-tree evidence fence.**  A stale lease never proves
+  vendor-spawned descendants (issue #25 server → local-harness; observed
+  live with up to two harnesses under one server) are gone, and POSIX
+  gives no primitive to bind a lifetime the mux never created.  Real
+  deletion therefore requires `ACP_MUX_F4_PROCESS_TREE_ACK=1`, an
+  operator attestation of first-hand process-tree evidence.  Without it
+  the GC runs **audit-only**: identical selection, revalidation, and
+  budget accounting, logged as `session-gc-audit`, zero unlinks.  Audit
+  output is a plan, never a deletion result.
+- **Bounded per-pass budgets** (`ACP_MUX_GC_MAX_DELETIONS` default 8,
+  `ACP_MUX_GC_MAX_BYTES` default 64 MiB, `ACP_MUX_GC_PASS_DEADLINE_SECONDS`
+  default 10, shared across lanes in deterministic order): a pass that
+  would exceed any budget stops early (`budget-stopped`) and leaves the
+  rest to a later pass.  A bundle whose footprint cannot be measured is
+  never admitted through a byte budget it cannot be checked against.
+- **Fresh per-bundle revalidation:** immediately before each deletion
+  slot the bundle's activity is re-statted, the checkpoint inventory is
+  re-read, and the budgets are re-checked.  A bundle revived,
+  checkpoint-referenced, or unreadable since planning is skipped; an
+  unreadable checkpoint inventory aborts the remainder of the pass.
+  Path-swap and symlink counterexamples were already refused by the
+  delete-time `lstat` checks and stay refused.
+- **Partial failure semantics:** each bundle's deletion is independent;
+  a failure marks that record unsafe and continues within budget.  There
+  is no rollback and none is claimed — the safety property is the bound
+  itself plus per-bundle postconditions, not recovery.
+- The inventory reports the budgets and both acks under `policy`
+  (`gc_max_deletions`, `gc_max_bytes`, `gc_pass_deadline_seconds`,
+  `process_tree_ack`); `deletions_performed` remains a constant 0.
+- Production status: both acks are unset, `ACP_MUX_SESSION_GC` stays off.
+  F4 code existing is not deletion authority; the gates being *closed
+  with evidence* is.
 
 ## 4. Telemetry
 

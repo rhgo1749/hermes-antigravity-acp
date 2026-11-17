@@ -51,9 +51,11 @@ def _fleet_cutover_ack(monkeypatch):
 
     The fleet cutover fence itself (issue #24 review B2) is covered by the
     dedicated test_b2_* cases; everything else acknowledges the drain so it
-    can reach the GC at all.
+    can reach the GC at all.  The F4 process-tree evidence ack is likewise
+    acknowledged here; its own fence has dedicated tests in the F4 suite.
     """
     monkeypatch.setenv("ACP_MUX_F3_CUTOVER_ACK", "1")
+    monkeypatch.setenv("ACP_MUX_F4_PROCESS_TREE_ACK", "1")
 
 
 @pytest.fixture
