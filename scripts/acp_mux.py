@@ -81,9 +81,11 @@ Environment:
   ACP_MUX_SESSION_LIFECYCLE  optional per-connection declaration of whether
                           the creator intends future reuse (issue #24 F2);
                           strict enum ephemeral|durable, anything else
-                          records unknown.  A declaration is classification
-                          metadata only: it never licenses deletion by
-                          itself (F3/F4 are separate phases).  Neither
+                          records unknown.  A declaration never licenses
+                          deletion by itself; since issue #24 F4 (review
+                          R2) an ``ephemeral`` declaration on a registered
+                          lane is a necessary — never sufficient — part of
+                          the deletion-authority evidence.  Neither
                           variable is passed to the official subprocess.
   ACP_MUX_AUTH_COOLDOWN   auth failure cooldown seconds (default 300)
   ACP_MUX_QUOTA_COOLDOWN  quota/rate-limit cooldown seconds (default 900)
@@ -1691,13 +1693,18 @@ def _capacity_gc_candidates(
     active_session_ids: set[str],
     *,
     cap: int,
+    limit: int | None = None,
 ) -> list[str]:
     """Session IDs above the per-store cap the native GC evicts, oldest first.
 
     Shared by ``_prune_session_store`` (deletes) and ``session_inventory``
     (reports only); unsafe and checkpoint-active records are never evictable.
+    ``limit`` widens the returned eviction order beyond the immediate excess
+    so callers can simulate owner-gated replacement (a guarded oldest bundle
+    is skipped and the next-oldest evictable takes its slot).
     """
     excess = max(0, len(remaining) - cap)
+    want = excess if limit is None else min(limit, len(remaining))
     evictable = sorted(
         (
             (session_id, record)
@@ -1706,11 +1713,29 @@ def _capacity_gc_candidates(
         ),
         key=lambda item: activities[item[0]],
     )
-    return [session_id for session_id, _ in evictable[:excess]]
+    return [session_id for session_id, _ in evictable[:want]]
+
+
+def _owner_gate_lane_digests(home: str) -> set[str] | None:
+    """Owner-lane digests that prove a bundle belongs to this store's home.
+
+    Derived from the validated registry (``_ownership_accounts``); ``None``
+    means the registry itself is unreadable and no deletion authority can be
+    established for any lane of this home.
+    """
+    lanes = _ownership_accounts()
+    if lanes is None:
+        return None
+    normalized = os.path.abspath(os.path.expanduser(str(home)))
+    return {
+        _owner_hash(key)
+        for lane_home, _label, key in lanes
+        if os.path.abspath(os.path.expanduser(lane_home)) == normalized
+    }
 
 
 class _RevalidationAborted(Exception):
-    """Fresh checkpoint inventory became unreadable mid-pass (fail closed)."""
+    """Fresh evidence became unreadable mid-pass (fail closed)."""
 
 
 def _prune_session_store(
@@ -1724,21 +1749,32 @@ def _prune_session_store(
 ) -> dict[str, int]:
     """Delete (or, in audit mode, plan) this store's GC candidates.
 
-    Issue #24 F4: every candidate is revalidated immediately before its own
-    deletion slot — a fresh checkpoint-inventory read, a fresh activity
-    re-stat, and the budget/deadline checks — so a plan computed at pass
-    start is never trusted for a later bundle.  A bundle that was revived,
-    became checkpoint-active, or went unreadable since planning is skipped.
-    Budget exhaustion stops the pass early (``budget["stopped"]``); the
-    remaining candidates simply survive to a later pass.  In audit mode
-    nothing is unlinked: the same selection, revalidation, and budget logic
-    runs and the totals describe what a real pass *would* delete.
+    Issue #24 F4 (review R1-R4): every deletion slot re-validates from
+    fresh first-hand evidence immediately before its own destructive
+    mutation — a fresh checkpoint-inventory read, a fresh activity re-stat,
+    a fresh owner-ledger read, and the budget checks.  The delete-authority
+    predicate per slot is: TTL-expired (expired path) or still excess and
+    evictable under freshly recomputed activities (capacity path), not
+    checkpoint-active, and positive owner evidence (owner record exists,
+    its lane belongs to this store's registered lanes, and its declared
+    lifecycle is exactly ``ephemeral``).  Unknown, durable, missing,
+    lane-mismatched, or unreadable evidence never deletes.  Budget cost is
+    reserved before the first destructive mutation and never refunded, and
+    the first deletion failure stops the rest of the pass.  Budget
+    exhaustion stops the pass early (``budget["stopped"]``); remaining
+    candidates survive to a later pass.  In audit mode nothing is unlinked:
+    the same selection, revalidation, and budget accounting runs and the
+    totals describe what a real pass *would* delete.
     """
     result = {"expired": 0, "capacity": 0, "bytes": 0, "failed": 0}
     if budget is None:
         # Direct callers get the same budgets; they simply cannot observe
         # the stop flag afterwards.
         budget = {"deletions": 0, "bytes": 0, "stopped": 0}
+    lane_digests = _owner_gate_lane_digests(home)
+    if lane_digests is None:
+        _log("session-gc revalidation-aborted: owner lane registry unreadable")
+        return result
     store = _session_store_root(home)
     if store is None:
         return result
@@ -1749,13 +1785,16 @@ def _prune_session_store(
 
     activities = _session_gc_activities(records, now=now)
 
-    def _budget_verdict(record: dict) -> str:
-        """``ok`` / ``skip`` / ``stop`` for this bundle under the budgets."""
+    def _budget_estimate(record: dict) -> int | None:
+        """Byte footprint estimate, or None when unmeasurable."""
+        return _lane_bundle_bytes(store, {record["session_id"]: record})
+
+    def _budget_verdict(estimate: int | None) -> str:
+        """``ok`` / ``skip`` / ``stop`` for a bundle under the budgets."""
         if deadline is not None and time.monotonic() >= deadline:
             return "stop"
         if budget["deletions"] >= GC_MAX_DELETIONS:
             return "stop"
-        estimate = _lane_bundle_bytes(store, {record["session_id"]: record})
         if estimate is None:
             # Unmeasurable footprint: never let it through an exact byte
             # budget it cannot be checked against (fail closed per bundle).
@@ -1764,88 +1803,125 @@ def _prune_session_store(
             return "stop"
         return "ok"
 
-    def _revalidate(record: dict, *, expired_required: bool) -> bool:
-        """Fresh first-hand check that this exact bundle may still go."""
-        if record["unsafe"]:
-            return False
-        fresh_activity = _session_record_mtime(record)
-        if fresh_activity is None:
-            return False
-        if expired_required and (
-            fresh_activity >= time.time() - AFFINITY_TTL_SECONDS
-        ):
-            return False
-        fresh_active = _active_hermes_session_ids(now=time.time())
-        if fresh_active is None:
-            # Fail closed: without a current checkpoint view this bundle and
-            # every later one in this pass stay untouched.
+    def _fresh_active() -> set[str]:
+        fresh = _active_hermes_session_ids(now=time.time())
+        if fresh is None:
             raise _RevalidationAborted
-        return record["session_id"] not in fresh_active
+        return fresh
 
-    def _plan_or_delete(session_id: str, kind: str) -> bool:
-        """True when the bundle was deleted (or planned, in audit mode)."""
+    def _owner_evidence_allows(session_id: str) -> bool:
+        """Fresh positive owner/lifecycle evidence for this exact bundle."""
+        owners = _read_session_owners()
+        if owners is None:
+            raise _RevalidationAborted
+        entry = owners.get(_owner_hash(session_id))
+        if entry is None or entry["lane"] not in lane_digests:
+            return False
+        return entry.get("lifecycle") == "ephemeral"
+
+    def _reserve_and_delete(session_id: str, kind: str, estimate: int) -> str:
+        """Returns ``ok`` or ``stop``.  Reserved cost is never refunded."""
         record = records[session_id]
+        budget["deletions"] += 1
+        budget["bytes"] += estimate
         if audit:
-            planned = _lane_bundle_bytes(store, {session_id: record})
-            if planned is None:
-                return False
             result[kind] += 1
-            result["bytes"] += planned
-            budget["deletions"] += 1
-            budget["bytes"] += planned
-            return True
+            result["bytes"] += estimate
+            return "ok"
         deleted, freed = _delete_session_bundle(store, record)
         if deleted:
             result[kind] += 1
             result["bytes"] += freed
-            budget["deletions"] += 1
-            budget["bytes"] += freed
-            return True
+            return "ok"
         record["unsafe"] = True
         result["failed"] += 1
-        return False
+        # A failure here may already have destroyed part of the bundle
+        # (brain tree before DB files).  Nothing is refunded, rolled back,
+        # or pretended otherwise: the pass stops immediately fail-closed.
+        return "stop"
 
     removed: set[str] = set()
-    for session_id in _expired_gc_candidates(
-        records, activities, active_session_ids, now=now
-    ):
-        verdict = _budget_verdict(records[session_id])
-        if verdict == "stop":
-            budget["stopped"] = 1
-            break
-        if verdict == "skip":
-            continue
-        try:
-            if not _revalidate(records[session_id], expired_required=True):
+    try:
+        for session_id in _expired_gc_candidates(
+            records, activities, active_session_ids, now=now
+        ):
+            if not _owner_evidence_allows(session_id):
                 continue
-        except _RevalidationAborted:
-            _log("session-gc revalidation-aborted: checkpoint inventory unavailable")
-            return result
-        if _plan_or_delete(session_id, "expired"):
+            # R5: the footprint is measured exactly once per slot; the
+            # same value drives the budget verdict and the reservation,
+            # and an unmeasurable footprint is never coerced to 0.
+            estimate = _budget_estimate(records[session_id])
+            verdict = _budget_verdict(estimate)
+            if verdict == "stop":
+                budget["stopped"] = 1
+                break
+            if verdict == "skip" or estimate is None:
+                continue
+            fresh_active = _fresh_active()
+            fresh_activity = _session_record_mtime(records[session_id])
+            if (
+                fresh_activity is None
+                or fresh_activity >= time.time() - AFFINITY_TTL_SECONDS
+                or session_id in fresh_active
+            ):
+                continue
+            if _reserve_and_delete(session_id, "expired", estimate) == "stop":
+                budget["stopped"] = 1
+                break
             removed.add(session_id)
 
-    remaining = [
-        (session_id, record)
-        for session_id, record in records.items()
-        if session_id not in removed
-    ]
-    for session_id in _capacity_gc_candidates(
-        remaining, activities, active_session_ids, cap=AFFINITY_MAX_ENTRIES
-    ):
-        verdict = _budget_verdict(records[session_id])
-        if verdict == "stop":
-            budget["stopped"] = 1
-            break
-        if verdict == "skip":
-            continue
-        try:
-            if not _revalidate(records[session_id], expired_required=False):
+        excluded: set[str] = set()
+        while not budget["stopped"]:
+            remaining = [
+                (session_id, record)
+                for session_id, record in records.items()
+                if session_id not in removed
+            ]
+            if max(0, len(remaining) - AFFINITY_MAX_ENTRIES) <= 0:
+                break
+            fresh_active = _fresh_active()
+            fresh_activities = dict(activities)
+            for session_id, record in remaining:
+                fresh_activity = _session_record_mtime(record)
+                if fresh_activity is None:
+                    record["unsafe"] = True
+                    fresh_activity = now + AFFINITY_TTL_SECONDS
+                fresh_activities[session_id] = fresh_activity
+            # R4: eligibility and oldest-first ranking are recomputed from
+            # freshly re-statted activity at every slot; the plan from the
+            # previous iteration is never executed.
+            candidates = [
+                session_id
+                for session_id in _capacity_gc_candidates(
+                    remaining, fresh_activities, fresh_active,
+                    cap=AFFINITY_MAX_ENTRIES, limit=len(remaining),
+                )
+                if session_id not in excluded
+            ]
+            if not candidates:
+                break
+            session_id = candidates[0]
+            if not _owner_evidence_allows(session_id):
+                # Guarded oldest bundle: the next-oldest evictable takes
+                # its slot (never the guarded one).
+                excluded.add(session_id)
                 continue
-        except _RevalidationAborted:
-            _log("session-gc revalidation-aborted: checkpoint inventory unavailable")
-            return result
-        if _plan_or_delete(session_id, "capacity"):
+            # R5: one fresh measurement per slot, shared by verdict and
+            # reservation; None is never converted to 0.
+            estimate = _budget_estimate(records[session_id])
+            verdict = _budget_verdict(estimate)
+            if verdict == "stop":
+                budget["stopped"] = 1
+                break
+            if verdict == "skip" or estimate is None:
+                excluded.add(session_id)
+                continue
+            if _reserve_and_delete(session_id, "capacity", estimate) == "stop":
+                budget["stopped"] = 1
+                break
             removed.add(session_id)
+    except _RevalidationAborted:
+        _log("session-gc revalidation-aborted: fresh evidence unreadable")
     return result
 
 
@@ -2104,7 +2180,7 @@ def _lane_bundle_bytes(store: Path, records: dict[str, dict]) -> int | None:
 
 def _lane_inventory(
     lane: int, home: str, active: set[str], owners: dict[str, dict], *,
-    now: float, lease_state: str,
+    now: float, lease_state: str, lane_digests: set[str],
 ) -> dict:
     """Read-only per-lane bundle census; deletes nothing; reports no identifiers."""
     out: dict[str, Any] = {
@@ -2125,9 +2201,11 @@ def _lane_inventory(
         # cannot drift from what prune_session_stores would actually touch.
         "lease": lease_state,
         # Issue #24 F2: declared session classes of owner-linked bundles.
-        # Classification evidence only — a bucket is never a reclamation
-        # verdict (F3 leases and F4 budgets are separate phases).  Bundles
-        # without an owner record carry no declaration and never appear here.
+        # A bucket is never a reclamation verdict on its own — but since
+        # review R2 the declaration is a *necessary* part of deletion
+        # authority: only ``ephemeral`` owner evidence on a registered
+        # lane makes a bundle a candidate at all.  Bundles without an
+        # owner record carry no declaration and never appear here.
         "origin_lifecycle": {
             origin: {lifecycle: 0 for lifecycle in _SESSION_CLASS_MATRIX[1]}
             for origin in _SESSION_CLASS_MATRIX[0]
@@ -2154,16 +2232,40 @@ def _lane_inventory(
         return out
 
     activities = _session_gc_activities(records, now=now)
-    expired = _expired_gc_candidates(records, activities, active, now=now)
+
+    def _deletable(session_id: str) -> bool:
+        # F4 review R2 parity: the GC's delete-authority predicate requires
+        # positive owner evidence (existing record, lane belongs to this
+        # home, lifecycle exactly ephemeral).  The prediction must not
+        # drift from it.
+        entry = owners.get(_owner_hash(session_id))
+        if entry is None or entry["lane"] not in lane_digests:
+            return False
+        return entry.get("lifecycle") == "ephemeral"
+
+    expired = [
+        session_id
+        for session_id in _expired_gc_candidates(records, activities, active, now=now)
+        if _deletable(session_id)
+    ]
     expired_set = set(expired)
     remaining = [
         (session_id, record)
         for session_id, record in records.items()
         if session_id not in expired_set
     ]
-    capacity = _capacity_gc_candidates(
-        remaining, activities, active, cap=AFFINITY_MAX_ENTRIES
+    # R4 parity: the GC recomputes eligibility per slot and a guarded
+    # (non-deletable) oldest evictable bundle is replaced by the
+    # next-oldest deletable one, so the prediction scans the full
+    # eviction order and keeps only the first `excess` deletable bundles.
+    excess = max(0, len(remaining) - AFFINITY_MAX_ENTRIES)
+    eviction_order = _capacity_gc_candidates(
+        remaining, activities, active, cap=AFFINITY_MAX_ENTRIES,
+        limit=len(remaining),
     )
+    capacity = [
+        session_id for session_id in eviction_order if _deletable(session_id)
+    ][:excess]
     capacity_set = set(capacity)
 
     out["bundles"] = len(records)
@@ -2212,9 +2314,17 @@ def session_inventory(
     applies the same decision helpers as ``prune_session_stores`` and only
     reports what the opt-in native GC *would* select under current policy.
     A candidate is NOT a reclamation verdict: lane process leases (F3) are
-    consulted and lease-protected lanes report zero candidates, but no
-    bounded-deletion checks exist yet and lifecycle declarations are still
-    never consulted (issue #24 C1/C4; F4 is a separate phase).
+    consulted and lease-protected lanes report zero candidates, candidates
+    additionally reflect the F4 owner-evidence gate (a readable ledger, an
+    owner record on a registered lane of this home, lifecycle declared
+    exactly ``ephemeral``; unknown, durable, missing, or lane-mismatched
+    evidence is never a candidate), and the per-pass exclusive lease hold,
+    budget reservations, and destructive postconditions run only in the
+    GC path, never here.  The budget figures appear under ``policy`` for
+    context; the candidate census is a policy prediction, not the result
+    of one budget-limited pass.  Production deletion authority stays
+    NO-GO until the issue #25 process-tree evidence ack is set
+    (issue #24 C1/C4).
 
     Privacy: raw session ids, account labels, homes, and paths never
     appear; lanes are positional indexes and every value is a count, a
@@ -2264,10 +2374,12 @@ def session_inventory(
             "the mux and its direct official child only, vendor-descendant "
             "liveness is unproven (issue #25 process-tree evidence gates "
             "F4 deletion authority), the pre-F3 fleet cutover fence is an "
-            "operator ack, and while the F4 check-to-delete exclusive lease "
-            "hold, per-bundle revalidation, and bounded-deletion budgets "
-            "exist in code they are unexercised in production "
-            "(issue #24 C1-C4; lifecycle declarations are never consulted)"
+            "operator ack, and candidates additionally require positive "
+            "owner evidence (owner record on a registered lane of this "
+            "home with lifecycle declared ephemeral); unknown, durable, "
+            "missing, or lane-mismatched evidence is never a candidate "
+            "(issue #24 C1-C4; F4 hold/budgets exist in code but are "
+            "unexercised in production)"
         ),
         "lanes": [],
         "totals": {},
@@ -2296,6 +2408,17 @@ def session_inventory(
         owners = _read_session_owners()
         if owners is None:
             return _incomplete("ownership-ledger-unavailable")
+        # F4 review R2 parity: candidate predictions apply the GC's owner
+        # gate, which is anchored to the validated registry's lane set.
+        owner_lanes = _ownership_accounts()
+        if owner_lanes is None:
+            return _incomplete("owner-lanes-unavailable")
+        lane_digests_by_home: dict[str, set[str]] = {}
+        for lane_home, _label, key in owner_lanes:
+            normalized = os.path.abspath(os.path.expanduser(lane_home))
+            lane_digests_by_home.setdefault(normalized, set()).add(
+                _owner_hash(key)
+            )
         totals: dict[str, Any] = {
             "bundles": 0,
             "bytes": 0,
@@ -2319,7 +2442,8 @@ def session_inventory(
             ])
             lease_protected_lanes += int(_lane_lease_protected(lease_state))
             lane_report = _lane_inventory(
-                lane, home, active, owners, now=now, lease_state=lease_state
+                lane, home, active, owners, now=now, lease_state=lease_state,
+                lane_digests=lane_digests_by_home.get(home, set()),
             )
             report["lanes"].append(lane_report)
             if lane_report["status"] != "ok":

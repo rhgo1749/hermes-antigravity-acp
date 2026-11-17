@@ -91,7 +91,15 @@ def _bundle(home: Path, session_id: str, *, mtime: float) -> Path:
 
 
 def _seed_expired(home: Path, session_id: str, now: float) -> Path:
-    return _bundle(home, session_id, mtime=now - 40 * DAY)
+    db = _bundle(home, session_id, mtime=now - 40 * DAY)
+    # F4 review R2: deletion authority requires positive owner evidence;
+    # F3 lease tests are about leases, so every seeded bundle carries a
+    # valid ephemeral owner record for its lane.
+    label = "lane-beta" if "beta" in str(home) else "lane-alpha"
+    assert mux._record_session_owner(
+        session_id, str(home), label, origin="agent", lifecycle="ephemeral"
+    )
+    return db
 
 
 def _write_lease(home: Path, label: str, *, at: float) -> Path:

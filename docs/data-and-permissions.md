@@ -147,10 +147,14 @@ operations on different stores, and neither one authorizes the other:
   yields `status: "incomplete"` and no candidate claims.
 - Candidate counts are a policy prediction, **not** a reclamation
   verdict: the GC consults per-lane process leases (issue #24 F3) and a
-  fleet cutover fence, but still consults no session-class declaration
-  and has no bounded-deletion check, so reclamation remains gated on F4
-  (issue #24 counterexample C4; C1's live/parked-child exposure is
-  mitigated — not globally closed — by F3 leases).
+  fleet cutover fence, and since F4 (review R2) candidates additionally
+  require positive owner evidence (registered lane, lifecycle declared
+  `ephemeral`); unknown, durable, missing, or lane-mismatched evidence is
+  never a candidate.  The inventory itself performs no deletion and no
+  per-pass destructive hold, and production reclamation stays NO-GO until
+  the issue #25 process-tree evidence ack (issue #24 counterexample C4;
+  C1's live/parked-child exposure is mitigated — not globally closed — by
+  F3 leases).
   Enabling the GC is a separately reviewed decision with its own bounds
   and rollback evidence (issue #24 Phases 2-3).
 
@@ -301,21 +305,40 @@ gone; nothing here pretends to roll them back.
   output is a plan, never a deletion result.
 - **Bounded per-pass budgets** (`ACP_MUX_GC_MAX_DELETIONS` default 8,
   `ACP_MUX_GC_MAX_BYTES` default 64 MiB, `ACP_MUX_GC_PASS_DEADLINE_SECONDS`
-  default 10, shared across lanes in deterministic order): a pass that
+  default 10, shared across lanes in deterministic *lane* order — bundle
+  iteration inside a store is not an ordering contract): a pass that
   would exceed any budget stops early (`budget-stopped`) and leaves the
-  rest to a later pass.  A bundle whose footprint cannot be measured is
-  never admitted through a byte budget it cannot be checked against.
-- **Fresh per-bundle revalidation:** immediately before each deletion
-  slot the bundle's activity is re-statted, the checkpoint inventory is
-  re-read, and the budgets are re-checked.  A bundle revived,
-  checkpoint-referenced, or unreadable since planning is skipped; an
-  unreadable checkpoint inventory aborts the remainder of the pass.
-  Path-swap and symlink counterexamples were already refused by the
+  rest to a later pass.  A bundle's footprint is measured exactly once
+  per slot (review R5 — no re-read between verdict and reservation), and
+  a bundle whose footprint cannot be measured is never admitted through
+  a byte budget it cannot be checked against, let alone reserved as 0.
+- **Fresh per-slot revalidation (review R1/R4):** immediately before each
+  deletion slot the checkpoint inventory is re-read (a fresh view, never a
+  pass-start snapshot), the bundle's activity is re-statted, and the
+  budgets are re-checked.  Capacity eviction is not a stored plan: at every
+  eviction slot the excess/evictable eligibility and the oldest-first
+  ranking are *recomputed* from freshly re-statted activity, so a bundle
+  revived after planning survives and only what is currently evictable is
+  deleted.  An unreadable fresh checkpoint view aborts the remainder of the
+  pass.  Path-swap and symlink counterexamples were already refused by the
   delete-time `lstat` checks and stay refused.
-- **Partial failure semantics:** each bundle's deletion is independent;
-  a failure marks that record unsafe and continues within budget.  There
-  is no rollback and none is claimed — the safety property is the bound
-  itself plus per-bundle postconditions, not recovery.
+- **Owner/lifecycle positive evidence (review R2):** a bundle is deleted
+  only with a fresh, positive proof read immediately before its own slot —
+  the owner ledger is readable, an owner record exists for the session,
+  its lane belongs to this store's registered lanes, and its declared
+  lifecycle is exactly `ephemeral`.  Unknown, missing, durable, invalid,
+  lane-mismatched, or unreadable evidence never deletes; `origin=backend`
+  alone never licenses a deletion.  The evidence is re-read per slot (no
+  lock-scoped snapshot is reused), and the inventory's candidate
+  prediction applies the same gate so the two never drift.
+- **Partial failure semantics (review R3):** each bundle's full budget
+  cost (count + measured byte estimate) is *reserved* before its first
+  destructive mutation and is never refunded — a bundle whose brain tree
+  was removed but whose DB unlink failed still consumes the reservation.
+  The first deletion failure or uncertain postcondition stops the rest of
+  the pass immediately (fail-closed); later candidates stay untouched.
+  There is no rollback and none is claimed — the safety property is the
+  bound itself plus per-bundle postconditions, not recovery.
 - The inventory reports the budgets and both acks under `policy`
   (`gc_max_deletions`, `gc_max_bytes`, `gc_pass_deadline_seconds`,
   `process_tree_ack`); `deletions_performed` remains a constant 0.

@@ -81,8 +81,15 @@ def _bundle(home: Path, session_id: str, *, mtime: float) -> Path:
     return db
 
 
-def _seed_expired(home: Path, session_id: str, now: float) -> Path:
-    return _bundle(home, session_id, mtime=now - 40 * DAY)
+def _seed_expired(home: Path, session_id: str, now: float, *,
+                  label: str = "lane-alpha", owner: bool = True,
+                  lifecycle: str = "ephemeral", origin: str = "agent") -> Path:
+    db = _bundle(home, session_id, mtime=now - 40 * DAY)
+    # Deletion authority requires positive owner evidence (review R2); most
+    # tests seed a valid ephemeral owner for the lane that owns the store.
+    if owner:
+        _seed_owner(home, label, session_id, lifecycle=lifecycle, origin=origin)
+    return db
 
 
 def _clear_lease(home: Path, label: str, *, at: float | None = None) -> Path:
@@ -93,6 +100,13 @@ def _clear_lease(home: Path, label: str, *, at: float | None = None) -> Path:
          "mux_pid": os.getpid()}
     ))
     return path
+
+
+def _seed_owner(home: Path, label: str, session_id: str, *,
+                lifecycle: str = "ephemeral", origin: str = "agent") -> None:
+    assert mux._record_session_owner(
+        session_id, str(home), label, origin=origin, lifecycle=lifecycle
+    )
 
 
 def _log_text() -> str:
@@ -229,7 +243,7 @@ def test_budget_is_shared_across_lanes(lanes, monkeypatch):
     for sid in (SID_1, SID_2, SID_3):
         _seed_expired(a, sid, now)
     for sid in (SID_4, SID_5, SID_6):
-        _seed_expired(b, sid, now)
+        _seed_expired(b, sid, now, label="lane-beta")
     _clear_lease(a, "lane-alpha")
     _clear_lease(Path(b), "lane-beta")
     result = mux.prune_session_stores(now=now)
@@ -269,27 +283,46 @@ def test_deadline_stops_the_pass(lanes, monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_bundle_revived_after_planning_is_skipped(lanes, monkeypatch):
-    """A bundle touched between planning and its deletion slot survives."""
+    """A bundle touched between planning and its deletion slot survives.
+
+    Store iteration order is not a fixed contract, so the revived target is
+    "whichever expired bundle is still pending at the first delete slot",
+    never a hard-coded session id.  The invariant under test is exactly:
+    a bundle revived after planning survives its later fresh revalidation.
+    """
     a, _b, _state = lanes
     now = time.time()
-    db1 = _seed_expired(a, SID_1, now)
-    db2 = _seed_expired(a, SID_2, now)
+    dbs = {SID_1: _seed_expired(a, SID_1, now), SID_2: _seed_expired(a, SID_2, now)}
     _clear_lease(a, "lane-alpha")
     _clear_lease(Path(_b), "lane-beta")
     real_delete = mux._delete_session_bundle
+    seen: list[str] = []
+    revived: set[str] = set()
 
     def spy_delete(store, record):
-        if record["session_id"] == SID_1:
-            # Revive the second bundle right before the second deletion.
-            fresh = time.time()
-            os.utime(db2, (fresh, fresh))
+        sid = record["session_id"]
+        if not seen:
+            # Revive the other still-pending bundle right before the
+            # second deletion slot revalidates it.
+            for other_sid, other_db in dbs.items():
+                if other_sid != sid:
+                    fresh = time.time()
+                    os.utime(other_db, (fresh, fresh))
+                    revived.add(other_sid)
+                    break
+        seen.append(sid)
         return real_delete(store, record)
 
     monkeypatch.setattr(mux, "_delete_session_bundle", spy_delete)
     result = mux.prune_session_stores(now=now)
-    assert result is not None
-    assert not db1.exists()
-    assert db2.exists(), "stale snapshot reused: revalidation must skip revived bundles"
+    assert result is not None and result["expired"] == 1
+    assert len(revived) == 1
+    survivor = dbs[next(iter(revived))]
+    gone = dbs[next(sid for sid in dbs if sid not in revived)]
+    assert not gone.exists()
+    assert survivor.exists(), (
+        "stale snapshot reused: revalidation must skip revived bundles"
+    )
 
 
 def test_path_swap_to_symlink_is_refused(lanes, monkeypatch):
@@ -428,3 +461,235 @@ def test_bind_time_gc_requires_both_acks(lanes, tmp_path, monkeypatch):
     assert db.exists(), "bind-time GC deleted without the process-tree ack"
     log = Path(mux.LOG_PATH).read_text()
     assert "session-gc-audit" in log
+
+
+# ---------------------------------------------------------------------------
+# Review R2 — owner/lifecycle positive evidence is part of the deletion
+# predicate: readable ledger, existing owner digest, lane match, ephemeral.
+# ---------------------------------------------------------------------------
+
+def test_r2_bundle_without_owner_record_is_never_deleted(lanes):
+    a, _b, _state = lanes
+    now = time.time()
+    db = _seed_expired(a, SID_1, now, owner=False)
+    _clear_lease(a, "lane-alpha")
+    _clear_lease(Path(_b), "lane-beta")
+    result = mux.prune_session_stores(now=now)
+    assert result is not None and result["expired"] == 0
+    assert db.exists()
+
+
+def test_r2_unknown_lifecycle_is_never_deleted(lanes):
+    a, _b, _state = lanes
+    now = time.time()
+    db = _seed_expired(a, SID_1, now, lifecycle="")  # records as unknown
+    _clear_lease(a, "lane-alpha")
+    _clear_lease(Path(_b), "lane-beta")
+    result = mux.prune_session_stores(now=now)
+    assert result is not None and result["expired"] == 0
+    assert db.exists()
+
+
+def test_r2_durable_lifecycle_is_never_deleted(lanes):
+    a, _b, _state = lanes
+    now = time.time()
+    db = _seed_expired(a, SID_1, now, lifecycle="durable")
+    _clear_lease(a, "lane-alpha")
+    _clear_lease(Path(_b), "lane-beta")
+    result = mux.prune_session_stores(now=now)
+    assert result is not None and result["expired"] == 0
+    assert db.exists()
+
+
+def test_r2_lane_mismatch_is_never_deleted(lanes):
+    a, b, _state = lanes
+    now = time.time()
+    db = _seed_expired(a, SID_1, now, owner=False)
+    # Owner evidence exists but names a different lane/home than the store
+    # being deleted: not positive evidence for this store.
+    _seed_owner(b, "lane-beta", SID_1)
+    _clear_lease(a, "lane-alpha")
+    _clear_lease(Path(b), "lane-beta")
+    result = mux.prune_session_stores(now=now)
+    assert result is not None and result["expired"] == 0
+    assert db.exists()
+
+
+def test_r2_backend_origin_alone_never_licenses(lanes):
+    a, _b, _state = lanes
+    now = time.time()
+    guarded = _seed_expired(a, SID_1, now, origin="backend", lifecycle="")
+    allowed = _seed_expired(a, SID_2, now, origin="backend", lifecycle="ephemeral")
+    _clear_lease(a, "lane-alpha")
+    _clear_lease(Path(_b), "lane-beta")
+    result = mux.prune_session_stores(now=now)
+    assert result is not None and result["expired"] == 1
+    assert guarded.exists(), "origin=backend with unknown lifecycle was deleted"
+    assert not allowed.exists()
+
+
+def test_r2_unreadable_owner_ledger_aborts_pass(lanes):
+    a, _b, _state = lanes
+    now = time.time()
+    db = _seed_expired(a, SID_1, now)
+    _clear_lease(a, "lane-alpha")
+    _clear_lease(Path(_b), "lane-beta")
+    Path(mux.STATE_PATH + ".owners.json").write_text("{corrupt", encoding="utf-8")
+    result = mux.prune_session_stores(now=now)
+    assert result is not None and result["expired"] == 0
+    assert db.exists()
+    assert "revalidation-aborted" in _log_text()
+
+
+# ---------------------------------------------------------------------------
+# Review R3 — a partial destructive failure consumes the reserved budget
+# and stops the pass immediately; nothing is refunded or rolled back.
+# ---------------------------------------------------------------------------
+
+def test_r3_partial_failure_stops_pass_and_consumes_budget(lanes, monkeypatch):
+    a, _b, _state = lanes
+    now = time.time()
+    monkeypatch.setattr(mux, "GC_MAX_DELETIONS", 2)
+    dbs = [_seed_expired(a, sid, now) for sid in (SID_1, SID_2)]
+    _clear_lease(a, "lane-alpha")
+    _clear_lease(Path(_b), "lane-beta")
+    real_unlink = os.unlink
+
+    def failing_unlink(path, *args, **kwargs):
+        if str(path).endswith(".db"):
+            raise OSError("synthetic mid-delete failure")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "unlink", failing_unlink)
+    result = mux.prune_session_stores(now=now)
+    assert result is not None
+    assert result["failed"] == 1 and result["expired"] == 0
+    # Exactly one bundle was partially destroyed (brain gone, .db intact);
+    # the other was never touched.  No rollback is attempted or claimed.
+    states = []
+    for db in dbs:
+        brain = a / ".gemini" / "antigravity-acp" / "brain" / db.stem
+        states.append((db.exists(), brain.exists()))
+    assert sorted(states) == [(True, False), (True, True)], (
+        "partial failure must stop the pass with the remaining candidate "
+        "untouched and the partial destruction left as-is"
+    )
+    assert "budget-stopped" in _log_text()
+
+
+# ---------------------------------------------------------------------------
+# Review R4 — capacity eligibility is recomputed fresh at each deletion
+# slot; a stale oldest-first ranking is never executed.
+# ---------------------------------------------------------------------------
+
+def test_r4_capacity_ranking_is_recomputed_before_eviction(lanes, monkeypatch):
+    a, _b, _state = lanes
+    now = time.time()
+    monkeypatch.setattr(mux, "AFFINITY_MAX_ENTRIES", 1)
+    ttl = mux.AFFINITY_TTL_SECONDS
+    expired = _seed_expired(a, SID_1, now)
+    old_live = _bundle(a, SID_2, mtime=now - ttl / 2)
+    new_live = _bundle(a, SID_3, mtime=now - 60)
+    for sid in (SID_2, SID_3):
+        _seed_owner(a, "lane-alpha", sid)
+    _clear_lease(a, "lane-alpha")
+    _clear_lease(Path(_b), "lane-beta")
+    real_delete = mux._delete_session_bundle
+
+    def spy_delete(store, record):
+        if record["session_id"] == SID_1:
+            # Revive the planned-oldest live bundle mid-pass: by the time
+            # the capacity slot runs it is the NEWEST bundle, so evicting
+            # it would be executing a stale ranking.
+            fresh = time.time()
+            os.utime(old_live, (fresh, fresh))
+        return real_delete(store, record)
+
+    monkeypatch.setattr(mux, "_delete_session_bundle", spy_delete)
+    result = mux.prune_session_stores(now=now)
+    assert result is not None
+    assert result["expired"] == 1 and result["capacity"] == 1
+    assert not expired.exists()
+    assert old_live.exists(), "stale capacity ranking evicted a revived bundle"
+    assert not new_live.exists(), "the currently-oldest evictable bundle survived"
+
+
+# ---------------------------------------------------------------------------
+# Review R5 — the footprint is measured exactly once per slot; an
+# unmeasurable estimate is never coerced to 0 bytes before a mutation.
+# ---------------------------------------------------------------------------
+
+def test_r5_unmeasurable_footprint_never_deletes(lanes, monkeypatch):
+    a, _b, _state = lanes
+    now = time.time()
+    db = _seed_expired(a, SID_1, now)
+    _clear_lease(a, "lane-alpha")
+    _clear_lease(Path(_b), "lane-beta")
+    monkeypatch.setattr(
+        mux, "_lane_bundle_bytes", lambda *_args, **_kwargs: None
+    )
+    delete_calls = {"n": 0}
+    real_delete = mux._delete_session_bundle
+
+    def spy_delete(store, record):
+        delete_calls["n"] += 1
+        return real_delete(store, record)
+
+    monkeypatch.setattr(mux, "_delete_session_bundle", spy_delete)
+    result = mux.prune_session_stores(now=now)
+    assert result is not None
+    assert result["expired"] == 0 and result["failed"] == 0
+    assert delete_calls["n"] == 0, (
+        "an unmeasurable footprint must never reach a destructive mutation"
+    )
+    assert db.exists()
+
+
+def test_r5_footprint_is_measured_once_per_slot(lanes, monkeypatch):
+    a, _b, _state = lanes
+    now = time.time()
+    _seed_expired(a, SID_1, now)
+    _clear_lease(a, "lane-alpha")
+    _clear_lease(Path(_b), "lane-beta")
+    real_bytes = mux._lane_bundle_bytes
+    reads = {"n": 0}
+
+    def counting_bytes(*args, **kwargs):
+        reads["n"] += 1
+        return real_bytes(*args, **kwargs)
+
+    monkeypatch.setattr(mux, "_lane_bundle_bytes", counting_bytes)
+    result = mux.prune_session_stores(now=now)
+    assert result is not None and result["expired"] == 1
+    # One candidate slot means one measurement: the budget verdict and the
+    # reservation must never re-read (a re-read is a budget TOCTOU, R5).
+    assert reads["n"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Review R1 — a fresh checkpoint view that turns unreadable mid-pass aborts
+# the remaining deletions (fail closed), never proceeds blind.
+# ---------------------------------------------------------------------------
+
+def test_r1_unreadable_fresh_checkpoint_view_aborts_remaining(lanes, monkeypatch):
+    a, _b, _state = lanes
+    now = time.time()
+    dbs = [_seed_expired(a, sid, now) for sid in (SID_1, SID_2)]
+    _clear_lease(a, "lane-alpha")
+    _clear_lease(Path(_b), "lane-beta")
+    real_active = mux._active_hermes_session_ids
+    calls = {"n": 0}
+
+    def spy_active(*, now=None, env=None):
+        calls["n"] += 1
+        if calls["n"] <= 2:  # pass-start read + first slot succeed
+            return real_active(now=now, env=env)
+        return None  # every later fresh read fails
+
+    monkeypatch.setattr(mux, "_active_hermes_session_ids", spy_active)
+    result = mux.prune_session_stores(now=now)
+    assert result is not None and result["expired"] == 1
+    # Store iteration order is not fixed; the invariant is that exactly the
+    # first slot deleted and the abort left every later bundle untouched.
+    assert sum(0 if db.exists() else 1 for db in dbs) == 1
+    assert "revalidation-aborted" in _log_text()

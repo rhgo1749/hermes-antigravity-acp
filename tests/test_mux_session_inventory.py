@@ -74,6 +74,14 @@ def _checkpoints(state_file: Path, session_ids, *, now: float) -> None:
     }}))
 
 
+def _seed_owner(home: Path, label: str, session_id: str) -> None:
+    # F4 review R2: candidate predictions (and the GC) require positive
+    # owner evidence — a record on this lane declared ephemeral.
+    assert mux._record_session_owner(
+        session_id, str(home), label, origin="agent", lifecycle="ephemeral"
+    )
+
+
 def _inventory(state_file: Path, *, now: float) -> dict:
     return mux.session_inventory(now=now, env={
         "HERMES_ANTIGRAVITY_ACP_STATE_FILE": str(state_file)
@@ -99,8 +107,12 @@ def test_inventory_counts_protection_linkage_and_candidates(lanes):
     _bundle(a, SID_OLD, mtime=now - 72 * 3600)
     _bundle(a, SID_FRESH, mtime=now - 60)
     _bundle(a, SID_PROTECTED, mtime=now - 72 * 3600)
+    # An unowned, unprotected, expired bundle: counted in the linkage
+    # matrix but never a candidate (no positive owner evidence, R2).
+    _bundle(a, SID_EXTRA, mtime=now - 72 * 3600)
     _checkpoints(state_file, [SID_PROTECTED], now=now)
     assert mux._record_session_owner(SID_FRESH, str(a), "lane-alpha")
+    _seed_owner(a, "lane-alpha", SID_OLD)
 
     report = _inventory(state_file, now=now)
     assert report["status"] == "ok", report["reasons"]
@@ -108,13 +120,13 @@ def test_inventory_counts_protection_linkage_and_candidates(lanes):
     assert report["schema"] == "acp-mux-session-inventory-v1"
     assert "process lease" in report["reclaim_certainty"]
 
-    lane_a = next(row for row in report["lanes"] if row["bundles"] == 3)
+    lane_a = next(row for row in report["lanes"] if row["bundles"] == 4)
     assert lane_a["checkpoint_protected"] == 1
-    assert lane_a["owner_linked"] == 1
-    assert lane_a["unowned_unprotected"] == 1  # SID_OLD only
+    assert lane_a["owner_linked"] == 2
+    assert lane_a["unowned_unprotected"] == 1  # SID_EXTRA (protected is excluded)
     assert lane_a["gc_candidate_expired"] == 1  # SID_OLD; protected stays safe
     assert lane_a["gc_candidate_capacity"] == 0
-    assert lane_a["age_buckets"]["3_7d"] == 2
+    assert lane_a["age_buckets"]["3_7d"] == 3
     assert lane_a["age_buckets"]["lt_1h"] == 1
     assert lane_a["bytes"] > 0
     assert lane_a["gc_candidate_bytes"] > 0
@@ -122,7 +134,7 @@ def test_inventory_counts_protection_linkage_and_candidates(lanes):
 
     lane_b = next(row for row in report["lanes"] if row["lane"] != lane_a["lane"])
     assert lane_b["status"] == "ok" and lane_b["bundles"] == 0
-    assert report["totals"]["bundles"] == 3
+    assert report["totals"]["bundles"] == 4
     assert report["totals"]["gc_candidate_expired"] == 1
 
 
@@ -132,6 +144,7 @@ def test_inventory_never_calls_the_deleter(lanes, monkeypatch):
     _clear_lease(a, "lane-alpha")
     stale = _bundle(a, SID_OLD, mtime=now - 72 * 3600)
     fresh = _bundle(a, SID_FRESH, mtime=now - 60)
+    _seed_owner(a, "lane-alpha", SID_OLD)
 
     def _forbidden(*_args, **_kwargs):
         raise AssertionError("the read-only inventory must never delete")
@@ -149,6 +162,7 @@ def test_inventory_candidates_match_the_gc_outcome(lanes, monkeypatch):
     _clear_lease(a, "lane-alpha")
     old = _bundle(a, SID_OLD, mtime=now - 72 * 3600)
     _bundle(a, SID_FRESH, mtime=now - 60)
+    _seed_owner(a, "lane-alpha", SID_OLD)
     _checkpoints(state_file, [], now=now)
 
     report = _inventory(state_file, now=now)
@@ -168,6 +182,7 @@ def test_capacity_candidates_are_predicted_without_deletion(lanes, monkeypatch):
     _clear_lease(a, "lane-alpha")
     older = _bundle(a, SID_OLD, mtime=now - 3 * 3600)
     newer = _bundle(a, SID_FRESH, mtime=now - 2 * 3600)
+    _seed_owner(a, "lane-alpha", SID_OLD)
     _checkpoints(state_file, [], now=now)
     monkeypatch.setattr(mux, "AFFINITY_MAX_ENTRIES", 1)
 
@@ -249,6 +264,7 @@ def test_cli_inventory_prints_json_and_exits_zero(lanes, monkeypatch):
     now = time.time()
     _clear_lease(a, "lane-alpha")
     stale = _bundle(a, SID_OLD, mtime=now - 72 * 3600)
+    _seed_owner(a, "lane-alpha", SID_OLD)
     _checkpoints(state_file, [], now=now)
 
     env = os.environ.copy()
@@ -443,11 +459,12 @@ def test_inventory_lock_appeared_mid_scan_is_incomplete(lanes, monkeypatch):
     real = mux._lane_inventory
     fired = {"done": False}
 
-    def spy(lane, home, active, owners, *, now, lease_state):
+    def spy(lane, home, active, owners, *, now, lease_state, **kwargs):
         if not fired["done"]:
             fired["done"] = True
             lock_path.write_text("")  # simulate a GC pass starting mid-scan
-        return real(lane, home, active, owners, now=now, lease_state=lease_state)
+        return real(lane, home, active, owners, now=now, lease_state=lease_state,
+                    **kwargs)
 
     monkeypatch.setattr(mux, "_lane_inventory", spy)
 

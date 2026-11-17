@@ -272,6 +272,21 @@ def test_local_session_gc_applies_ttl_and_cap_but_preserves_checkpoint_ids(
     expired_id = "22222222-2222-4222-8222-222222222222"
     older_live_id = "33333333-3333-4333-8333-333333333333"
     newest_id = "44444444-4444-4444-8444-444444444444"
+    # F4 review R2: deletion authority requires positive owner evidence on
+    # a registered lane of this home, declared ephemeral.
+    _registry(env, [{"home": str(home), "label": "gc-lane"}])
+    for session_id in (expired_id, older_live_id, newest_id):
+        assert acp_mux._record_session_owner(
+            session_id, str(home), "gc-lane",
+            origin="agent", lifecycle="ephemeral",
+        )
+    # F4 review R1: the per-slot fresh checkpoint view is seeded (valid
+    # fresh view protects the active session), not assumed.
+    checkpoint_file = env / "acp-sessions.json"
+    monkeypatch.setenv("HERMES_ANTIGRAVITY_ACP_STATE_FILE", str(checkpoint_file))
+    checkpoint_file.write_text(json.dumps({"version": 1, "states": {
+        "active": {"session_id": active_id, "updated_at": time.time()}
+    }}), encoding="utf-8")
     bundles = {
         active_id: _write_session_bundle(home, active_id, now - 500),
         expired_id: _write_session_bundle(home, expired_id, now - 500),
@@ -681,7 +696,9 @@ def test_protocol_relay_with_fake_official_acp(tmp_path):
     assert "selected fake" in log.read_text()
 
 
-def test_official_mux_prunes_expired_sessions_and_keeps_resumable_ones(tmp_path):
+def test_official_mux_prunes_expired_sessions_and_keeps_resumable_ones(
+    tmp_path, monkeypatch
+):
     fake = tmp_path / "fake_acp.py"
     fake.write_text(
         "#!/usr/bin/env python3\n"
@@ -715,6 +732,13 @@ def test_official_mux_prunes_expired_sessions_and_keeps_resumable_ones(tmp_path)
     registry = tmp_path / "accounts.json"
     registry.write_text(json.dumps({"accounts": [{"home": str(home), "label": "test", "priority": 0}]}))
     mux_state = tmp_path / "mux-state.json"
+    # F4 review R2: the stale bundle needs positive owner evidence
+    # (registered lane, ephemeral) for the subprocess GC to delete it.
+    monkeypatch.setattr(acp_mux, "STATE_PATH", str(mux_state))
+    monkeypatch.setattr(acp_mux, "REGISTRY_PATH", str(registry))
+    assert acp_mux._record_session_owner(
+        stale_id, str(home), "test", origin="agent", lifecycle="ephemeral"
+    )
     # F3: the GC only walks lanes with positively-cleared (stale) leases.
     # Path is built against the subprocess ACP_MUX_STATE, not this process's
     # module-level STATE_PATH default.

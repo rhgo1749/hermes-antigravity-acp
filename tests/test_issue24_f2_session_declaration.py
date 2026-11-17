@@ -440,10 +440,16 @@ def test_inventory_and_dry_run_perform_zero_deletions(lanes, tmp_path):
     assert mux._record_session_owner(
         SID_BACKEND, str(a), "lane-alpha", origin="backend", lifecycle="ephemeral"
     )
+    # F4 review R2: candidate predictions require positive owner evidence;
+    # SID_UNOWNED stays evidence-free and is therefore no longer predicted.
+    for sid in (SID_AGENT, SID_UNDECLARED):
+        assert mux._record_session_owner(
+            sid, str(a), "lane-alpha", origin="agent", lifecycle="ephemeral"
+        )
     owners_before = Path(mux.STATE_PATH + ".owners.json").read_bytes()
     report = _inventory(state_file, now=now)
     assert report["deletions_performed"] == 0
-    assert report["totals"]["gc_candidate_expired"] == 4  # prediction only
+    assert report["totals"]["gc_candidate_expired"] == 3  # prediction only
     assert all(db.exists() for db in bundles)
     assert Path(mux.STATE_PATH + ".owners.json").read_bytes() == owners_before, (
         "inventory must not rewrite (or backfill) owner metadata"

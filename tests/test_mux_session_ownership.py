@@ -29,6 +29,11 @@ def lanes(tmp_path, monkeypatch):
     monkeypatch.setattr(mux, "STATE_PATH", str(tmp_path / "state.json"))
     monkeypatch.setattr(mux, "REGISTRY_PATH", str(tmp_path / "accounts.json"))
     monkeypatch.setattr(mux, "LOG_PATH", str(tmp_path / "mux.log"))
+    # Keep the per-slot fresh checkpoint reads inside the fixture: an empty
+    # (valid) state view, never the real host's session state.
+    state_file = tmp_path / "acp-sessions.json"
+    monkeypatch.setenv("HERMES_ANTIGRAVITY_ACP_STATE_FILE", str(state_file))
+    state_file.write_text(json.dumps({"version": 1, "states": {}}))
     a, b = tmp_path / "a", tmp_path / "b"
     for home in (a, b):
         (home / ".gemini" / "antigravity-acp" / "conversations").mkdir(parents=True)
@@ -246,7 +251,12 @@ def test_gc_does_not_identify_an_active_uncheckpointed_session(lanes, monkeypatc
     conversations = a / ".gemini" / "antigravity-acp" / "conversations"
     old = conversations / f"{SID}.db"
     old.write_text("fixture")
-    assert mux._record_session_owner(SID, str(a), "a")
+    # F4 review R2: deletion requires positive owner evidence; the point of
+    # this test is that the owner mapping alone buys no process-lease
+    # protection, so the record is a fully valid ephemeral one.
+    assert mux._record_session_owner(
+        SID, str(a), "a", origin="agent", lifecycle="ephemeral"
+    )
     other = conversations / "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb.db"
     other.write_text("fixture")
     os.utime(old, (100, 100))
