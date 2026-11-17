@@ -54,8 +54,16 @@ No sudo/root used; no chmod; no pre-existing cgroup touched; the single
   cleanup sweep order.
 - Ownership: cgroup names carry a nonce; the work dir comes from
   `tempfile.mkdtemp`; `dir_created`/`work_created` flip only after the
-  creation call succeeded; cleanup never deletes or removes anything it
-  did not create.
+  creation call succeeded and `killfile_ready` only after positive
+  validation of the created child's writable `cgroup.kill` + `domain`
+  type — cleanup may write `cgroup.kill` only when ready, so a
+  child-without-`cgroup.kill` environment reaches the BLOCKED skip with
+  zero residue (constructor-level regression test); cleanup never
+  deletes or removes anything it did not create.
+- Process-model parity: the fake outer leader is spawned with
+  `start_new_session=True` (same as the real plugin→mux spawn); the
+  spike asserts leader PGID==SID==leader pid, same-group child sharing
+  both, and the escaped child owning its own PGID/SID.
 - Protocol: fake leader is spawned then joined via `cgroup.procs`;
   it refuses to fork descendants until its own `/proc/self/cgroup`
   confirms membership (kills the pre-join fork race that would leak

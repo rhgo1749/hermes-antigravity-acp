@@ -207,6 +207,7 @@ class _Spike:
         self.pids: dict | None = None
         self.procs: Path | None = None
         self.killfile: Path | None = None
+        self.killfile_ready = False
         self.cleanup_errors: list[str] = []
 
     def _chain_cleanup_errors(self, exc: BaseException) -> None:
@@ -224,8 +225,10 @@ class _Spike:
         self.dir = delegated / f"acp25-{role}-{uuid.uuid4().hex[:10]}"
         self.dir.mkdir()  # EEXIST propagates; dir_created stays False
         self.dir_created = True
-        self.killfile = self.dir / "cgroup.kill"
-        if not self.killfile.is_file() or not os.access(self.killfile, os.W_OK):
+        # Positive validation BEFORE claiming containment capability:
+        # cleanup may only write cgroup.kill when killfile_ready is set.
+        killfile = self.dir / "cgroup.kill"
+        if not killfile.is_file() or not os.access(killfile, os.W_OK):
             raise _BlockedEnv(
                 f"{self.dir.name}: child cgroup lacks a writable cgroup.kill"
             )
@@ -237,6 +240,8 @@ class _Spike:
             raise _BlockedEnv(
                 f"{self.dir.name}: child cgroup.type={ctype!r}, not domain"
             )
+        self.killfile = killfile
+        self.killfile_ready = True
         self.procs = self.dir / "cgroup.procs"
         # mkdtemp creates a fresh unique dir; a pre-existing path is
         # never adopted or deleted.
@@ -247,6 +252,10 @@ class _Spike:
         self.proc = subprocess.Popen(
             [sys.executable, str(self.work / "leader.py"),
              str(self.work), self.dir.name],
+            # Parity with the real plugin->mux spawn (client.py uses
+            # start_new_session=True): the fake leader owns its own
+            # PGID/SID so group-escape semantics are faithful.
+            start_new_session=True,
         )
         # The documented join path for a delegatee moving its own child.
         self.procs.write_text(f"{self.proc.pid}\n")
@@ -287,7 +296,7 @@ class _Spike:
         6. Own work rmtree (only if we created it).
         """
         errors: list[str] = []
-        if self.dir_created and self.killfile is not None:
+        if self.dir_created and self.killfile_ready and self.killfile is not None:
             try:
                 self.killfile.write_text("1")
             except OSError as exc:
@@ -343,10 +352,26 @@ def test_membership_survives_setsid_escape_and_cgroup_kill_sweeps():
         assert target.pids and target.dir and target.proc and target.killfile
         assert sibling.pids and sibling.proc
 
-        # Layout: escaped descendant left the PGID/SID but NOT the cgroup.
-        assert os.getpgid(target.pids["det"]) != target.proc.pid, (
-            "setsid escape model failed"
+        # Layout preconditions (faithful process-model): the leader owns
+        # its own group/session (start_new_session parity with the real
+        # plugin->mux spawn); the same-group child shares them; the
+        # escaped child left BOTH group and session.
+        assert os.getpgid(target.proc.pid) == target.proc.pid, (
+            "leader must own its PGID (start_new_session parity)"
         )
+        assert os.getsid(target.proc.pid) == target.proc.pid, (
+            "leader must own its session"
+        )
+        assert os.getpgid(target.pids["same"]) == target.proc.pid, (
+            "same-group child must share the leader PGID"
+        )
+        assert os.getsid(target.pids["same"]) == target.proc.pid, (
+            "same-group child must share the leader session"
+        )
+        assert (
+            os.getpgid(target.pids["det"]) == target.pids["det"]
+            and os.getsid(target.pids["det"]) == target.pids["det"]
+        ), "detached child must own its own PGID/SID"
         assert target.cgroup_of(target.pids["det"]).endswith(
             target.dir.name
         ), "cgroup membership must survive setsid escape"
@@ -420,8 +445,13 @@ def test_cgroup_name_collision_leaves_existing_dir_untouched(tmp_path, monkeypat
 
 def test_existing_work_path_is_never_deleted(tmp_path, monkeypatch):
     _fake_delegated(tmp_path, monkeypatch)
-    legacy = Path(tempfile.gettempdir()) / f"acp25-target-work-{os.getuid()}"
-    legacy.mkdir(exist_ok=True)
+    # Fully isolate mkdtemp's location under tmp_path — the test never
+    # creates, writes, or removes anything in the real /tmp.
+    tmploc = tmp_path / "tmploc"
+    tmploc.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(tmploc))
+    legacy = tmploc / f"acp25-target-work-{os.getuid()}"
+    legacy.mkdir()
     sentinel = legacy / "sentinel"
     sentinel.write_text("pre-existing")
     spike = _Spike.__new__(_Spike)
@@ -430,8 +460,22 @@ def test_existing_work_path_is_never_deleted(tmp_path, monkeypatch):
         spike._build("target")  # fake child fails the cgroup.kill gate
     spike.cleanup(strict=False)
     assert spike.work_created is False and spike.work is None
-    assert sentinel.exists(), "work-dir logic deleted a pre-existing path"
-    shutil.rmtree(legacy, ignore_errors=True)
+    assert sentinel.exists(), "work-dir logic touched a pre-existing path"
+    assert spike.cleanup_errors == []
+
+
+def test_missing_child_cgroup_kill_skips_with_zero_residue(tmp_path, monkeypatch):
+    """Constructor-level: child created but no cgroup.kill => BLOCKED skip.
+
+    cleanup must NOT attempt a cgroup.kill write (killfile_ready False);
+    only the owned empty child dir is removed.
+    """
+    root = _fake_delegated(tmp_path, monkeypatch)
+    with pytest.raises(pytest.skip.Exception):
+        _Spike("target")
+    assert {p.name for p in root.iterdir()} == {"cgroup.procs", "cgroup.kill"}, (
+        "residue left under the fake delegated root"
+    )
 
 
 def test_partial_pid_publication_never_read_as_truth(tmp_path):
@@ -466,6 +510,7 @@ def test_cleanup_sweeps_unknown_members_via_own_cgroup_kill_only(tmp_path):
     killfile = owned / "cgroup.kill"
     procs = owned / "cgroup.procs"
     spike.killfile = killfile
+    spike.killfile_ready = True
     killfile.touch()
     spike.procs = procs
     procs.write_text("")  # already empty (fake)
