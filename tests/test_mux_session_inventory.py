@@ -33,6 +33,10 @@ SID_EXTRA = "44444444-4444-4444-8444-444444444444"
 
 @pytest.fixture
 def lanes(tmp_path, monkeypatch):
+    # Post-cutover behavior: the F3 fleet fence is acknowledged so the GC
+    # path is reachable; the fence itself is covered in
+    # tests/test_issue24_f3_process_lease.py (test_b2_*).
+    monkeypatch.setenv("ACP_MUX_F3_CUTOVER_ACK", "1")
     monkeypatch.setenv("ACP_MUX_DEFAULT_HOME", str(tmp_path / "default-home"))
     monkeypatch.setattr(mux, "DEFAULT_HOME", str(tmp_path / "default-home"))
     monkeypatch.setattr(mux, "STATE_PATH", str(tmp_path / "state.json"))

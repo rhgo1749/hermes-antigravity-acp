@@ -295,6 +295,11 @@ LEASE_GRACE_SECONDS = _configured_positive_int(
     OWNER_GRACE_SECONDS,
 )
 
+# Hard bound on how long a bind may wait for lease contention (review B4):
+# acquisition is non-blocking with retries, and a bind that cannot take the
+# lease within this window fails closed instead of spawning unleased.
+_LEASE_ACQUIRE_TIMEOUT_SECONDS = 5.0
+
 # Issue #24 F2: the only values an origin/lifecycle declaration may hold.
 # Anything else (including absence) is "unknown", which is deliberately not
 # part of the declaration enum: it is the reader's default, never stamped.
@@ -886,9 +891,13 @@ def _lane_lease_states_aggregate(states: list[str]) -> str:
 class _LaneLease:
     """Hold a shared lane lease for the lifetime of one official ACP child.
 
-    The lock is released by ``close()`` on orderly teardown and by the kernel
-    on process death; both leave the recorded heartbeat behind so consumers
-    can apply the grace window.
+    The lock is released by ``close()`` on orderly teardown and by the
+    kernel when **every** holder of the open file description has exited.
+    The lease fd is passed to the official child at spawn, so a vendor
+    process that outlives a killed mux keeps the lane protected: kernel
+    release of the *mux* fd alone never means vendor death.  Both release
+    paths leave the recorded heartbeat behind so consumers can apply the
+    grace window.
     """
 
     def __init__(self, home: str, label: str) -> None:
@@ -905,30 +914,82 @@ class _LaneLease:
             )
             os.fchmod(self._fd, 0o600)
             # A shared lock only contends with the brief exclusive probes
-            # the GC and the inventory take; retry briefly instead of
-            # refusing a bind because a census happened to be passing.
-            deadline = time.monotonic() + 5.0
+            # the GC and the inventory take.  Acquisition must stay
+            # bounded: retry non-blocking shares until the deadline and
+            # fail the bind (never spawn) if contention outlasts it.
+            deadline = time.monotonic() + _LEASE_ACQUIRE_TIMEOUT_SECONDS
             while True:
                 try:
-                    fcntl.flock(self._fd, fcntl.LOCK_SH)
+                    fcntl.flock(self._fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
                     break
                 except OSError:
                     if time.monotonic() >= deadline:
                         raise
-                    time.sleep(0.1)
+                    time.sleep(0.05)
             self.touch()
         except OSError:
             self.close()
             raise
 
+    @property
+    def fd(self) -> int:
+        """The held lease fd, for inheritance by the official child."""
+        return self._fd
+
     def touch(self) -> None:
-        """Record the latest first-hand activity for the post-death grace."""
-        if self._fd < 0:
+        """Record the latest first-hand activity for the post-death grace.
+
+        Multiple shared holders may heartbeat concurrently, so writes are
+        serialized on a sidecar lock (never on the lifetime lock itself)
+        and the recorded ``at`` is monotone: a writer that computed an
+        earlier timestamp can never shorten another holder's grace.
+        """
+        if self._fd < 0 or fcntl is None:
             return
-        payload = json.dumps({"at": time.time(), "mux_pid": os.getpid()}).encode()
-        os.ftruncate(self._fd, 0)
-        os.lseek(self._fd, 0, os.SEEK_SET)
-        os.write(self._fd, payload)
+        try:
+            wfd = os.open(
+                self._path + ".w", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW,
+                0o600,
+            )
+        except OSError:
+            return  # heartbeat is best-effort; the lifetime lease is intact
+        try:
+            deadline = time.monotonic() + 2.0
+            while True:
+                try:
+                    fcntl.flock(wfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        return
+                    time.sleep(0.01)
+            current = 0.0
+            try:
+                os.lseek(self._fd, 0, os.SEEK_SET)
+                raw = b""
+                while len(raw) < 4096:
+                    chunk = os.read(self._fd, 4096 - len(raw))
+                    if not chunk:
+                        break
+                    raw += chunk
+                current = float(json.loads(raw.decode())["at"])
+            except (OSError, ValueError, KeyError):
+                current = 0.0
+            payload = json.dumps({
+                "at": max(current, time.time()),
+                "mux_pid": os.getpid(),
+                "f3": 1,
+            }).encode()
+            os.ftruncate(self._fd, 0)
+            os.lseek(self._fd, 0, os.SEEK_SET)
+            os.write(self._fd, payload)
+        except OSError:
+            pass
+        finally:
+            try:
+                os.close(wfd)
+            except OSError:
+                pass
 
     def close(self) -> None:
         if self._fd >= 0:
@@ -1682,6 +1743,17 @@ def prune_session_stores(*, now: float | None = None) -> dict[str, int] | None:
     readable. It touches only ``.gemini/antigravity-acp`` conversation stores.
     """
     now = time.time() if now is None else now
+    # Issue #24 F3 (review B2): fleet cutover fence.  A stale lease proves
+    # only that F3-aware holders are gone; a pre-F3 mux (no lease code at
+    # all) can still be alive on the same lane during a rolling upgrade.
+    # The GC therefore refuses to run until the operator acknowledges that
+    # no pre-F3 mux process remains (ps evidence), fail-closed by default.
+    if os.environ.get("ACP_MUX_F3_CUTOVER_ACK", "").strip() != "1":
+        _log(
+            "session-gc skipped: pre-F3 mux fleet drain unacknowledged "
+            "(ACP_MUX_F3_CUTOVER_ACK=1 required after verified legacy drain)"
+        )
+        return None
     entries, meta, _problem = _load_registry_data()
     default_home, _explicit = _effective_default_home(meta)
     lane_labels = _registry_lane_labels(default_home, entries)
@@ -1903,13 +1975,17 @@ def session_inventory(
             "cap_per_lane": AFFINITY_MAX_ENTRIES,
             "owner_grace_seconds": OWNER_GRACE_SECONDS,
             "lease_grace_seconds": LEASE_GRACE_SECONDS,
+            "fleet_cutover_ack": (
+                os.environ.get("ACP_MUX_F3_CUTOVER_ACK", "").strip() == "1"
+            ),
         },
         "deletions_performed": 0,
         "reclaim_certainty": (
             "gc_candidate_prediction_only; lane process leases (F3) are "
-            "consulted, but no bounded-deletion checks exist yet and "
-            "lifecycle declarations are never consulted (issue #24 C1-C4; "
-            "F4 pending)"
+            "consulted, but the pre-F3 fleet cutover fence, the check-to-"
+            "delete revalidation hold, and bounded-deletion checks do not "
+            "exist yet and lifecycle declarations are never consulted "
+            "(issue #24 C1-C4; F4 pending)"
         ),
         "lanes": [],
         "totals": {},
@@ -2681,15 +2757,21 @@ def main() -> int:
                 _log(f"lease-unavailable {label}: {exc}; refusing bind")
                 return False
         try:
-            upstream = subprocess.Popen(
-                [PAR, "--uid="],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=env,
-                text=True,
-                bufsize=1,
-            )
+            popen_kwargs: dict = {
+                "stdin": subprocess.PIPE,
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.PIPE,
+                "env": env,
+                "text": True,
+                "bufsize": 1,
+            }
+            if new_lease is not None:
+                # Issue #24 F3 (review B1): the official child inherits the
+                # lease fd, so the shared lock covers the vendor lineage too
+                # — a child that outlives a killed mux keeps the lane
+                # protected until it itself exits.
+                popen_kwargs["pass_fds"] = (new_lease.fd,)
+            upstream = subprocess.Popen([PAR, "--uid="], **popen_kwargs)
         except OSError as exc:
             _log(f"spawn-failed {label}: {exc}")
             if new_lease is not None:

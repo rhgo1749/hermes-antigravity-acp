@@ -146,10 +146,11 @@ operations on different stores, and neither one authorizes the other:
   during it.  A lock file that appears mid-walk, or a contended lock,
   yields `status: "incomplete"` and no candidate claims.
 - Candidate counts are a policy prediction, **not** a reclamation
-  verdict: the GC consults per-lane process leases (issue #24 F3) but
-  still consults no session-class declaration and has no bounded-
-  deletion check, so reclamation remains gated on F4 (issue #24
-  counterexample C4; C1's live/parked-child exposure is what F3 closes).
+  verdict: the GC consults per-lane process leases (issue #24 F3) and a
+  fleet cutover fence, but still consults no session-class declaration
+  and has no bounded-deletion check, so reclamation remains gated on F4
+  (issue #24 counterexample C4; C1's live/parked-child exposure is
+  mitigated — not globally closed — by F3 leases).
   Enabling the GC is a separately reviewed decision with its own bounds
   and rollback evidence (issue #24 Phases 2-3).
 
@@ -205,9 +206,19 @@ deletes nothing.
 - When the MUX binds a lane it takes a **shared `flock` lease** on
   `<state>.leases/<lane-fingerprint>.lease` (mode 0600, `O_NOFOLLOW`)
   *before* spawning the official ACP child, and holds it for the child's
-  lifetime.  Every completed JSON-RPC request refreshes the lease
+  lifetime.  The lease fd is **inherited by the official child**
+  (`pass_fds`), so the lock covers the whole lane lineage: a vendor
+  process that outlives a SIGKILLed mux keeps the lane protected until it
+  itself exits.  Kernel release of the *mux* fd alone is never treated as
+  vendor death.  Every completed JSON-RPC request refreshes the lease
   heartbeat; orderly teardown records a final heartbeat and releases the
-  lock.  A child process never runs without lease evidence.
+  lock.  A child process never runs without lease evidence, and lease
+  acquisition is non-blocking with a hard 5-second deadline — contention
+  that outlasts it fails the bind instead of spawning unleased.
+- Heartbeat writes from multiple shared holders are serialized on a
+  sidecar write lock (never on the lifetime lock) and the recorded `at`
+  is monotone: a concurrent writer can neither tear the file nor shorten
+  another holder's grace window.
 - The native GC and the read-only inventory probe with a non-blocking
   **exclusive** lock.  States: `live` (a holder is proven alive by lock
   contention), `grace` (no holder, heartbeat within
@@ -218,9 +229,20 @@ deletes nothing.
   lease: fail closed).  Absence of a lease file is never evidence of an
   idle lane.
 - Crash, kill, restart, and PID reuse need no heuristics: the kernel
-  releases the flock when the holder dies, and the lock lives on the
-  file descriptor, not the pid.  Late completion after cancellation
-  stays inside the grace window.
+  releases the flock when **every** holder of the open file description
+  (mux and inherited child lineage) has exited, and the lock lives on the
+  file descriptor, not the pid.  Late completion after cancellation stays
+  inside the grace window.
+- **Fleet cutover fence (mixed-version rollout).**  A stale lease proves
+  only that F3-aware holders are gone; a pre-F3 mux — which never writes
+  a lease at all — can still be alive on the same lane during a rolling
+  upgrade.  The native GC therefore refuses to run until the operator
+  sets `ACP_MUX_F3_CUTOVER_ACK=1` in the environment of the mux that
+  would run it, and only after taking process evidence (`ps`) that no
+  pre-F3 mux remains.  Default (unset) is fail-closed: no deletion pass,
+  logged reason.  The read-only inventory reports the fence state as
+  `policy.fleet_cutover_ack` but still predicts lease-cleared candidates,
+  which remain conditional on the fence.
 - Protection is **lane-level**: while a lane is protected, no bundle in
   that lane's store is a candidate.  Which bundles a live child actually
   holds open is vendor-internal knowledge and is never inferred.
@@ -231,11 +253,13 @@ deletes nothing.
   `lanes_lease_protected` total; a protected lane reports zero
   candidates so the dry-run prediction cannot drift from GC behavior.
   `deletions_performed` remains a constant 0.
-- Residual race, stated honestly: a bind racing a GC pass is bounded —
-  the lease is acquired before the spawn, the GC checks the lease
-  immediately before touching a store, and a freshly spawned vendor
-  child needs seconds before its first bundle write.  F4's revalidation
-  pass closes the remainder before any real deletion is enabled.
+- Residual race, stated honestly and **not** claimed closed: a bind
+  racing a GC pass — the GC probes the lane lease, releases the probe,
+  and only then walks the store; a new mux can acquire the lease inside
+  that window.  Nothing here makes that safe on its own.  F4 must close
+  it with a lease recheck/hold held through deletion plus bounded scope
+  before any real deletion is enabled, and until then `GC=1` stays NO-GO
+  and C1 is only *mitigated* (normal-path exposure), not globally closed.
 
 ## 4. Telemetry
 

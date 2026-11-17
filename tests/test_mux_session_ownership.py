@@ -22,6 +22,9 @@ SID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 
 @pytest.fixture
 def lanes(tmp_path, monkeypatch):
+    # Post-cutover behavior for the GC-lock test below (see test_b2_* in
+    # tests/test_issue24_f3_process_lease.py for the fence itself).
+    monkeypatch.setenv("ACP_MUX_F3_CUTOVER_ACK", "1")
     monkeypatch.setattr(mux, "STATE_PATH", str(tmp_path / "state.json"))
     monkeypatch.setattr(mux, "REGISTRY_PATH", str(tmp_path / "accounts.json"))
     monkeypatch.setattr(mux, "LOG_PATH", str(tmp_path / "mux.log"))

@@ -25,6 +25,7 @@ import fcntl
 import importlib.util
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -42,6 +43,17 @@ DAY = 86400
 SID_LEASED = "f1f1f1f1-f1f1-4f1f-8f1f-f1f1f1f1f1f1"
 SID_OTHER = "f2f2f2f2-f2f2-4f2f-8f2f-f2f2f2f2f2f2"
 SID_B = "f3f3f3f3-f3f3-4f3f-8f3f-f3f3f3f3f3f3"
+
+
+@pytest.fixture(autouse=True)
+def _fleet_cutover_ack(monkeypatch):
+    """Most F3 tests exercise post-cutover behavior.
+
+    The fleet cutover fence itself (issue #24 review B2) is covered by the
+    dedicated test_b2_* cases; everything else acknowledges the drain so it
+    can reach the GC at all.
+    """
+    monkeypatch.setenv("ACP_MUX_F3_CUTOVER_ACK", "1")
 
 
 @pytest.fixture
@@ -420,7 +432,16 @@ def test_mux_bind_takes_lease_and_sigkill_lands_in_grace(lanes, tmp_path):
         proc.kill()
         proc.wait(timeout=10)
         # Late-completion window: the mux died but its heartbeat is fresh.
-        assert mux._lane_lease_state(str(a), "lane-alpha", now=time.time()) == "grace"
+        # The fake vendor exits on stdin EOF; poll until the whole lineage
+        # (mux + inherited child fd) has released the lock.
+        deadline = time.time() + 10
+        state = "live"
+        while time.time() < deadline:
+            state = mux._lane_lease_state(str(a), "lane-alpha", now=time.time())
+            if state != "live":
+                break
+            time.sleep(0.05)
+        assert state == "grace"
     finally:
         if proc.poll() is None:
             proc.kill()
@@ -473,3 +494,243 @@ def test_mux_graceful_exit_releases_lease_into_grace(lanes, tmp_path):
     proc.stdin.close()  # EOF: graceful teardown path
     proc.wait(timeout=15)
     assert mux._lane_lease_state(str(a), "lane-alpha", now=time.time()) == "grace"
+
+
+# ---------------------------------------------------------------------------
+# 6. Independent-review counterexamples B1-B4 (issue #24 rework).
+# ---------------------------------------------------------------------------
+
+def _longlived_fake_vendor(tmp_path: Path, lease_path: str) -> Path:
+    """ACP fake that reports lease-fd inheritance and survives stdin EOF.
+
+    A busy or EOF-ignoring official child outlives a SIGKILLed mux; this
+    fake reproduces that without any vendor binary or credentials.
+    """
+    fake = tmp_path / "longlived_vendor.py"
+    fake.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json,os,sys,time\n"
+        f"LEASE={lease_path!r}\n"
+        "def inherited():\n"
+        " try: expected=os.stat(LEASE).st_ino\n"
+        " except OSError: return False\n"
+        " for name in os.listdir('/proc/self/fd'):\n"
+        "  try: target=os.readlink('/proc/self/fd/'+name)\n"
+        "  except OSError: continue\n"
+        "  if target==LEASE:\n"
+        "   try:\n"
+        "    if os.fstat(int(name)).st_ino==expected: return True\n"
+        "   except OSError: pass\n"
+        " return False\n"
+        "for line in sys.stdin:\n"
+        " r=json.loads(line)\n"
+        " result={'home':os.environ['HOME'],'leaseInherited':inherited()}\n"
+        " if r.get('method')=='session/new':\n"
+        "  result['sessionId']='b1b1b1b1-b1b1-4b1b-8b1b-b1b1b1b1b1b1'\n"
+        " print(json.dumps({'jsonrpc':'2.0','id':r.get('id'),\n"
+        "                   'result':result}),flush=True)\n"
+        "time.sleep(300)\n"
+    )
+    fake.chmod(0o755)
+    return fake
+
+
+def _age_lease_heartbeat(home: Path, label: str, *, at: float) -> None:
+    fd = os.open(mux._lane_lease_path(str(home), label),
+                 os.O_RDWR | os.O_NOFOLLOW)
+    try:
+        os.ftruncate(fd, 0)
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.write(fd, json.dumps({"at": at, "mux_pid": 1}).encode())
+    finally:
+        os.close(fd)
+
+
+def _vendor_pids(marker: str) -> list[int]:
+    out = subprocess.run(["pgrep", "-f", marker],
+                         capture_output=True, text=True)
+    return [int(x) for x in out.stdout.split()]
+
+
+def test_b1_surviving_vendor_child_keeps_lease_live_after_mux_sigkill(
+    lanes, tmp_path
+):
+    """B1: kernel release of the *mux* fd must not mean vendor death.
+
+    The lease fd is inherited by the official child, so the shared lock
+    stays held while any process in the lane lineage is alive.  An aged
+    heartbeat may only produce `stale` once the whole lineage is gone.
+    """
+    a, _b, _state = lanes
+    lease_path = mux._lane_lease_path(str(a), "lane-alpha")
+    env = _mux_env(tmp_path, lanes)
+    fake = _longlived_fake_vendor(tmp_path, lease_path)
+    env["ACP_MUX_PAR"] = str(fake)
+    proc = subprocess.Popen(
+        [sys.executable, str(ROOT / "scripts" / "acp_mux.py")],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+        env=env, bufsize=1,
+    )
+    child_pids: list[int] = []
+    try:
+        proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 1,
+                                     "method": "initialize"}) + "\n")
+        proc.stdin.flush()
+        reply = json.loads(proc.stdout.readline())
+        # The child must have received the lease fd (same open file
+        # description), or the lock cannot cover it after mux death.
+        assert reply["result"]["leaseInherited"] is True
+        assert mux._lane_lease_state(str(a), "lane-alpha",
+                                     now=time.time()) == "live"
+        _age_lease_heartbeat(a, "lane-alpha",
+                             at=time.time() - 10 * mux.LEASE_GRACE_SECONDS)
+        assert mux._lane_lease_state(str(a), "lane-alpha",
+                                     now=time.time()) == "live"
+        child_pids = _vendor_pids(str(fake))
+        assert child_pids, "fake vendor child did not start"
+        proc.kill()
+        proc.wait(timeout=10)
+        # The vendor child is still alive and still holds the inherited fd.
+        assert _vendor_pids(str(fake)), "vendor child died with the mux"
+        assert mux._lane_lease_state(str(a), "lane-alpha",
+                                     now=time.time()) == "live"
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=10)
+        for pid in child_pids + _vendor_pids(str(fake)):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+    # Once the whole lineage is gone, the aged heartbeat makes the lane
+    # reclaimable again: protection must not be permanent.
+    deadline = time.time() + 10
+    state = "live"
+    while time.time() < deadline:
+        state = mux._lane_lease_state(str(a), "lane-alpha", now=time.time())
+        if state != "live":
+            break
+        time.sleep(0.05)
+    assert state == "stale"
+
+
+def test_b2_gc_refused_until_fleet_cutover_acknowledged(lanes, monkeypatch):
+    """B2: a stale new-mux lease does not prove no pre-F3 mux is alive.
+
+    During a rolling upgrade an old mux can hold the same lane without any
+    flock.  Until the operator acknowledges the legacy drain, the GC must
+    refuse to run even behind a positively-cleared (stale) lease.
+    """
+    a, _b, _state = lanes
+    monkeypatch.delenv("ACP_MUX_F3_CUTOVER_ACK", raising=False)
+    now = time.time()
+    db = _seed_expired(a, SID_LEASED, now)
+    _write_lease(a, "lane-alpha", at=now - mux.LEASE_GRACE_SECONDS - 60)
+    _write_lease(Path(_b), "lane-beta", at=now - mux.LEASE_GRACE_SECONDS - 60)
+    assert mux.prune_session_stores(now=now) is None
+    assert db.exists()
+
+
+def test_b2_gc_proceeds_after_cutover_ack(lanes, monkeypatch):
+    a, _b, _state = lanes
+    monkeypatch.setenv("ACP_MUX_F3_CUTOVER_ACK", "1")
+    now = time.time()
+    db = _seed_expired(a, SID_LEASED, now)
+    _write_lease(a, "lane-alpha", at=now - mux.LEASE_GRACE_SECONDS - 60)
+    _write_lease(Path(_b), "lane-beta", at=now - mux.LEASE_GRACE_SECONDS - 60)
+    result = mux.prune_session_stores(now=now)
+    assert result is not None and result["expired"] == 1
+    assert not db.exists()
+
+
+def test_b3_heartbeat_writes_never_regress_timestamp(lanes, monkeypatch):
+    """B3: a legal write interleaving must not shorten the grace window.
+
+    Two shared holders may compute heartbeats in any order; the recorded
+    `at` must never move backwards.
+    """
+    a, _b, _state = lanes
+    clock = {"t": 100.0}
+    monkeypatch.setattr(mux.time, "time", lambda: clock["t"])
+    first = mux._LaneLease(str(a), "lane-alpha")
+    second = mux._LaneLease(str(a), "lane-alpha")
+    clock["t"] = 50.0  # earlier-computed write lands last
+    second.touch()
+    first.close()
+    second.close()
+    assert _lease_at(a, "lane-alpha") >= 100.0
+
+
+def test_b3_parallel_heartbeat_writers_keep_lease_parseable(lanes):
+    """B3: concurrent serialized writers must never tear the JSON file."""
+    import threading
+
+    a, _b, _state = lanes
+    holders = [mux._LaneLease(str(a), "lane-alpha") for _ in range(2)]
+    errors: list[BaseException] = []
+
+    def hammer(lease):
+        try:
+            for _ in range(40):
+                lease.touch()
+        except BaseException as exc:  # pragma: no cover - failure path
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=hammer, args=(holders[i % 2],))
+        for i in range(8)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+    assert not errors
+    for lease in holders:
+        lease.close()
+    payload = json.loads(
+        Path(mux._lane_lease_path(str(a), "lane-alpha")).read_text()
+    )
+    assert isinstance(payload["at"], (int, float))
+
+
+def test_b4_bind_refuses_without_spawning_while_exclusive_lease_held(
+    lanes, tmp_path
+):
+    """B4: the advertised bind deadline must actually fire under contention."""
+    a, _b, _state = lanes
+    lease_path = Path(mux._lane_lease_path(str(a), "lane-alpha"))
+    lease_path.parent.mkdir(parents=True, exist_ok=True)
+    holder_fd = os.open(lease_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW,
+                        0o600)
+    fcntl.flock(holder_fd, fcntl.LOCK_EX)
+    marker = tmp_path / "child_spawned"
+    fake = tmp_path / "spawn_marker.py"
+    fake.write_text(
+        "#!/usr/bin/env python3\n"
+        "import pathlib,sys\n"
+        f"pathlib.Path({str(marker)!r}).write_text('1')\n"
+        "sys.stdin.read()\n"
+    )
+    fake.chmod(0o755)
+    env = _mux_env(tmp_path, lanes)
+    env["ACP_MUX_PAR"] = str(fake)
+    try:
+        try:
+            proc = subprocess.run(
+                [sys.executable, str(ROOT / "scripts" / "acp_mux.py")],
+                input=json.dumps({"jsonrpc": "2.0", "id": 1,
+                                  "method": "initialize"}) + "\n",
+                capture_output=True, text=True, env=env, timeout=25,
+            )
+        except subprocess.TimeoutExpired:
+            pytest.fail(
+                "B4: mux blocked forever on the exclusive lease holder; "
+                "the LOCK_SH acquire must be non-blocking with a real deadline"
+            )
+        assert proc.returncode == 2
+        assert not marker.exists(), "child spawned despite lease contention"
+        assert "lease-unavailable" in Path(mux.LOG_PATH).read_text()
+    finally:
+        fcntl.flock(holder_fd, fcntl.LOCK_UN)
+        os.close(holder_fd)
