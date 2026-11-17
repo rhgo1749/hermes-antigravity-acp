@@ -1,6 +1,6 @@
-"""Issue #25 slice: the reaped-leader boundary at the warm-pool seam.
+"""Issue #25 slice: the reaped-leader boundary at lifecycle seams.
 
-Known bug (evidence slice PR #49, point A): the warm pool decides liveness
+Known bug (evidence slice PR #49, point A): lifecycle code decides liveness
 with ``proc.poll()``, which REAPS a dead child.  Once the group leader is
 reaped, ``terminate_process_tree`` must refuse all group signalling
 (issue #23 PID/PGID-reuse guard), so same-group vendor descendants survive
@@ -8,9 +8,12 @@ every permitted teardown path.
 
 Minimal seam (independent source review): ``terminate_process_tree``
 already captures group ownership BEFORE any reap and fully sweeps a
-dead-but-UNREAPED owned leader.  The only defect is the warm pool's
-pre-emptive reap.  This slice adds a non-reaping liveness primitive
-(``proc_dead_unreaped``) and wires ONLY the warm-pool dead checks to it.
+dead-but-UNREAPED owned leader.  The defect is any pre-teardown
+``proc.poll()`` reap.  This slice adds a non-reaping liveness primitive
+(``proc_dead_unreaped`` plus the non-consuming ``proc_exit_status_unreaped``
+for exit-code diagnostics) and wires all six pre-teardown callsites:
+three warm-pool checks and the three ``_session`` checks (request-wait
+loop, early-exit diagnostic, finally dispose).
 
 Scope locks: no warm-pool global cap, no GC, no mux lease, no deployment
 drift, no vendor cooperation, no detached/setsid-descendant claims (that
