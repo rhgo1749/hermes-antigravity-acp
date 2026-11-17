@@ -237,16 +237,22 @@ tree + rw delegate subtree + env var), removed entirely afterwards.
      aggregate because stats recurse).
    - **Stop semantics:** `docker stop hermes-acp-canary` completes within
      `stop_grace_period` (no SIGKILL fallback needed). Then on the host,
-     with `SCOPE=/sys/fs/cgroup/system.slice/docker-<canary-id>.scope`:
-     if `$SCOPE` still exists, `find "$SCOPE" -name cgroup.procs -exec
-     grep -l . {} +` must print NOTHING — any `cgroup.procs` whose CONTENTS
-     contain a pid is listed by grep -l, is an orphan, and FAILS. This is content-based on purpose: `test -s` is
-     vacuous on cgroupfs pseudo-files (st_size reports 0 regardless of
-     pids). A nonzero `find` exit is a FAIL, not a silent pass; if docker
-     already REMOVED `$SCOPE`, the orphan check passes vacuously-by-absence
-     — record which of the two cases occurred rather than conflating them.
-     Additionally `pgrep -fa 'nous-hermes-acp-canary'` (the concrete quoted
-     compose project marker used at canary creation) must be empty.
+     with `SCOPE=/sys/fs/cgroup/system.slice/docker-<canary-id>.scope`,
+     distinguish the FOUR states explicitly (GNU find's `-exec … +`
+     PROPAGATES grep's exit: 1 on "no file matched" is the DESIRED empty
+     state, so raw nonzero-find-exit must not be the criterion):
+     `if [ ! -d "$SCOPE" ]; then echo "SCOPE-ABSENT (vacuous pass — recorded)";
+     else out=$(find "$SCOPE" -name cgroup.procs -exec grep -l . {} + 2>/dev/null); rc=$?;
+     if [ "$rc" -ge 2 ]; then echo "TRAVERSAL ERROR rc=$rc (FAIL)"; exit 1; fi;
+     if [ -n "$out" ]; then echo "ORPHANS: $out (FAIL)"; exit 1; fi;
+     echo "SCOPE-PRESENT, ALL cgroup.procs EMPTY (PASS)"; fi`
+     — `grep -l .` lists any `cgroup.procs` whose CONTENTS contain a pid
+     (content-based on purpose: `test -s` is vacuous on cgroupfs
+     pseudo-files, st_size is 0 regardless of pids); rc 0/1 are both normal
+     (0 = orphans found, listed in `$out`; 1 = none), rc ≥ 2 = genuine
+     traversal/read error. Additionally `pgrep -fa 'nous-hermes-acp-canary'`
+     (the concrete quoted compose project marker used at canary creation)
+     must be empty.
 7. Teardown canary: `docker compose -p nous-hermes-acp-canary down` + delete
    the copy dirs. No production artifact touched at any step.
 
