@@ -895,9 +895,13 @@ class _LaneLease:
     kernel when **every** holder of the open file description has exited.
     The lease fd is passed to the official child at spawn, so a vendor
     process that outlives a killed mux keeps the lane protected: kernel
-    release of the *mux* fd alone never means vendor death.  Both release
-    paths leave the recorded heartbeat behind so consumers can apply the
-    grace window.
+    release of the *mux* fd alone never means vendor death.  Coverage is
+    the mux plus its **direct** official child only — descendants the
+    vendor itself spawns (default ``close_fds``) hold no lease fd, and
+    whether any such descendant outlives the direct child is unproven
+    (issue #25 process-tree evidence gates F4 deletion authorization).
+    Both release paths leave the recorded heartbeat behind so consumers
+    can apply the grace window.
     """
 
     def __init__(self, home: str, label: str) -> None:
@@ -1748,6 +1752,10 @@ def prune_session_stores(*, now: float | None = None) -> dict[str, int] | None:
     # all) can still be alive on the same lane during a rolling upgrade.
     # The GC therefore refuses to run until the operator acknowledges that
     # no pre-F3 mux process remains (ps evidence), fail-closed by default.
+    # Review B5: a stale lease also never proves vendor-spawned descendants
+    # (issue #25 server -> local-harness) are gone — that process-tree
+    # evidence is a separate hard prerequisite for F4 deletion
+    # authorization, not something this phase may assume.
     if os.environ.get("ACP_MUX_F3_CUTOVER_ACK", "").strip() != "1":
         _log(
             "session-gc skipped: pre-F3 mux fleet drain unacknowledged "
@@ -1981,11 +1989,12 @@ def session_inventory(
         },
         "deletions_performed": 0,
         "reclaim_certainty": (
-            "gc_candidate_prediction_only; lane process leases (F3) are "
-            "consulted, but the pre-F3 fleet cutover fence, the check-to-"
-            "delete revalidation hold, and bounded-deletion checks do not "
-            "exist yet and lifecycle declarations are never consulted "
-            "(issue #24 C1-C4; F4 pending)"
+            "gc_candidate_prediction_only; lane process leases (F3) cover "
+            "the mux and its direct official child only, vendor-descendant "
+            "liveness is unproven (issue #25 gates F4), and the pre-F3 "
+            "fleet cutover fence, the check-to-delete revalidation hold, "
+            "and bounded-deletion checks do not exist yet and lifecycle "
+            "declarations are never consulted (issue #24 C1-C4; F4 pending)"
         ),
         "lanes": [],
         "totals": {},
@@ -2767,9 +2776,11 @@ def main() -> int:
             }
             if new_lease is not None:
                 # Issue #24 F3 (review B1): the official child inherits the
-                # lease fd, so the shared lock covers the vendor lineage too
+                # lease fd, so the shared lock covers the direct child too
                 # — a child that outlives a killed mux keeps the lane
-                # protected until it itself exits.
+                # protected until it itself exits.  Vendor-spawned
+                # descendants are NOT covered (review B5; issue #25 gates
+                # F4).
                 popen_kwargs["pass_fds"] = (new_lease.fd,)
             upstream = subprocess.Popen([PAR, "--uid="], **popen_kwargs)
         except OSError as exc:

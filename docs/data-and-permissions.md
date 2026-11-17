@@ -206,8 +206,8 @@ deletes nothing.
 - When the MUX binds a lane it takes a **shared `flock` lease** on
   `<state>.leases/<lane-fingerprint>.lease` (mode 0600, `O_NOFOLLOW`)
   *before* spawning the official ACP child, and holds it for the child's
-  lifetime.  The lease fd is **inherited by the official child**
-  (`pass_fds`), so the lock covers the whole lane lineage: a vendor
+  lifetime.  The lease fd is **inherited by the direct official child**
+  (`pass_fds`), so the lock covers the mux and that child: a vendor
   process that outlives a SIGKILLed mux keeps the lane protected until it
   itself exits.  Kernel release of the *mux* fd alone is never treated as
   vendor death.  Every completed JSON-RPC request refreshes the lease
@@ -230,9 +230,22 @@ deletes nothing.
   idle lane.
 - Crash, kill, restart, and PID reuse need no heuristics: the kernel
   releases the flock when **every** holder of the open file description
-  (mux and inherited child lineage) has exited, and the lock lives on the
-  file descriptor, not the pid.  Late completion after cancellation stays
-  inside the grace window.
+  (mux and the direct child that inherited the fd) has exited, and the
+  lock lives on the file descriptor, not the pid.  Late completion after
+  cancellation stays inside the grace window.
+- **Descendant boundary (review B5), stated as a limit not a feature.**
+  `pass_fds` propagates to the **direct** child only.  Processes the
+  vendor itself spawns (the issue #25 observation: official server →
+  local-harness, launched with default `close_fds`) hold no lease fd, and
+  we cannot control vendor-internal spawn semantics; reparenting makes
+  descendant liveness unprovable from the outside.  A stale lease
+  therefore never proves vendor descendants are gone.  F3's protection
+  claim is scoped to **mux + direct official child**; whether any vendor
+  descendant outlives the direct child is pinned as a boundary test
+  (`test_b5_grandchild_does_not_inherit_lease_fd`), and **issue #25
+  process-tree evidence is a hard prerequisite for F4 deletion
+  authorization**.  Until that evidence exists, "active/parked process
+  protection" is *not* closed — F3 is a mitigation.
 - **Fleet cutover fence (mixed-version rollout).**  A stale lease proves
   only that F3-aware holders are gone; a pre-F3 mux — which never writes
   a lease at all — can still be alive on the same lane during a rolling
@@ -256,10 +269,12 @@ deletes nothing.
 - Residual race, stated honestly and **not** claimed closed: a bind
   racing a GC pass — the GC probes the lane lease, releases the probe,
   and only then walks the store; a new mux can acquire the lease inside
-  that window.  Nothing here makes that safe on its own.  F4 must close
-  it with a lease recheck/hold held through deletion plus bounded scope
-  before any real deletion is enabled, and until then `GC=1` stays NO-GO
-  and C1 is only *mitigated* (normal-path exposure), not globally closed.
+  that window.  Nothing here makes that safe on its own.  Before any
+  real deletion is enabled, F4 must close **both** (a) this window, with
+  a lease recheck/hold held through deletion plus bounded scope, and
+  (b) the descendant boundary above, via issue #25 process-tree
+  evidence.  Until then `GC=1` stays NO-GO and C1 is only *mitigated*
+  (normal-path exposure), not globally closed.
 
 ## 4. Telemetry
 

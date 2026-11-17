@@ -557,9 +557,10 @@ def test_b1_surviving_vendor_child_keeps_lease_live_after_mux_sigkill(
 ):
     """B1: kernel release of the *mux* fd must not mean vendor death.
 
-    The lease fd is inherited by the official child, so the shared lock
-    stays held while any process in the lane lineage is alive.  An aged
-    heartbeat may only produce `stale` once the whole lineage is gone.
+    The lease fd is inherited by the direct official child, so the shared
+    lock stays held while either the mux or that child is alive.  An aged
+    heartbeat may only produce `stale` once both are gone.  (Vendor
+    descendants beyond the direct child are the B5 boundary.)
     """
     a, _b, _state = lanes
     lease_path = mux._lane_lease_path(str(a), "lane-alpha")
@@ -734,3 +735,104 @@ def test_b4_bind_refuses_without_spawning_while_exclusive_lease_held(
     finally:
         fcntl.flock(holder_fd, fcntl.LOCK_UN)
         os.close(holder_fd)
+
+
+def _wrapper_vendor_with_grandchild(tmp_path: Path, lease_path: str) -> Path:
+    """ACP fake that spawns a grandchild exactly like a vendor wrapper.
+
+    The direct child inherits the lease fd (B1), then launches a grandchild
+    with the default ``close_fds=True`` — the same shape as the official
+    server -> local-harness process tree in issue #25.  The grandchild
+    records whether it can see the lease fd.
+    """
+    grand = tmp_path / "grandchild_reporter.py"
+    grand.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json,os,sys\n"
+        f"LEASE={lease_path!r}\n"
+        "OUT=sys.argv[1]\n"
+        "holds=False\n"
+        "try: expected=os.stat(LEASE).st_ino\n"
+        "except OSError: expected=-1\n"
+        "for name in os.listdir('/proc/self/fd'):\n"
+        " try: target=os.readlink('/proc/self/fd/'+name)\n"
+        " except OSError: continue\n"
+        " if target==LEASE:\n"
+        "  try:\n"
+        "   if os.fstat(int(name)).st_ino==expected: holds=True\n"
+        "  except OSError: pass\n"
+        "open(OUT,'w').write(json.dumps({'holds':holds}))\n"
+        "import time; time.sleep(300)\n"
+    )
+    grand.chmod(0o755)
+    wrapper = tmp_path / "wrapper_vendor.py"
+    wrapper.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json,os,subprocess,sys\n"
+        f"GRAND={str(grand)!r}\n"
+        f"OUT={str(tmp_path / 'grandchild_holds.json')!r}\n"
+        "for line in sys.stdin:\n"
+        " r=json.loads(line)\n"
+        " result={'home':os.environ['HOME']}\n"
+        " if r.get('method')=='initialize':\n"
+        "  subprocess.Popen([sys.executable,GRAND,OUT])\n"
+        " if r.get('method')=='session/new':\n"
+        "  result['sessionId']='b5b5b5b5-b5b5-4b5b-8b5b-b5b5b5b5b5b5'\n"
+        " print(json.dumps({'jsonrpc':'2.0','id':r.get('id'),\n"
+        "                   'result':result}),flush=True)\n"
+    )
+    wrapper.chmod(0o755)
+    return wrapper
+
+
+def test_b5_grandchild_does_not_inherit_lease_fd(lanes, tmp_path):
+    """B5 boundary: `pass_fds` covers the direct child only, not descendants.
+
+    The official server may launch helper processes (issue #25: server ->
+    local-harness) with the default `close_fds=True`, so a grandchild that
+    outlives the direct child holds no lease fd.  This test pins that OS
+    boundary so the F3 claim can never be over-generalized to "the whole
+    vendor lineage": F3 protects the mux + its direct official child, and
+    vendor-descendant liveness is an unproven gate that must be closed by
+    issue #25 process-tree evidence before F4 may authorize deletion.
+    """
+    a, _b, _state = lanes
+    lease_path = mux._lane_lease_path(str(a), "lane-alpha")
+    env = _mux_env(tmp_path, lanes)
+    wrapper = _wrapper_vendor_with_grandchild(tmp_path, lease_path)
+    env["ACP_MUX_PAR"] = str(wrapper)
+    proc = subprocess.Popen(
+        [sys.executable, str(ROOT / "scripts" / "acp_mux.py")],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+        env=env, bufsize=1,
+    )
+    report_path = tmp_path / "grandchild_holds.json"
+    grand_pids: list[int] = []
+    try:
+        proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 1,
+                                     "method": "initialize"}) + "\n")
+        proc.stdin.flush()
+        json.loads(proc.stdout.readline())  # wrapper replies
+        # The grandchild (spawned with close_fds=True) reports whether it
+        # inherited the lease fd.  It must NOT have it.
+        deadline = time.time() + 15
+        while time.time() < deadline and not report_path.exists():
+            time.sleep(0.05)
+        assert report_path.exists(), "grandchild never reported"
+        report = json.loads(report_path.read_text())
+        assert report["holds"] is False, (
+            "grandchild unexpectedly holds the lease fd; the OS boundary "
+            "this test pins has changed — revisit the F3 claim scope"
+        )
+        # The lane is still protected while the mux + direct child live.
+        assert mux._lane_lease_state(str(a), "lane-alpha",
+                                     now=time.time()) == "live"
+        grand_pids = _vendor_pids(str(tmp_path / "grandchild_reporter.py"))
+    finally:
+        proc.kill()
+        proc.wait(timeout=10)
+        for pid in grand_pids:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
