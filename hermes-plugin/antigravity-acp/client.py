@@ -59,7 +59,7 @@ from .hermes_compat import (
     windows_hide_flags,
 )
 from .native_limit_state import native_limit_registry
-from .process_teardown import terminate_process_tree
+from .process_teardown import proc_dead_unreaped, terminate_process_tree
 from .request_trace import get_tracer, silence_seconds
 from .bridge import (
     MalformedToolCallError,
@@ -4114,7 +4114,10 @@ class AntigravityACPClient:
         with _warm_pool_lock:
             kept: list[dict[str, Any]] = []
             for entry in _warm_pool.get(key, []):
-                dead = entry["proc"].poll() is not None
+                # Non-reaping liveness (issue #25): a dead leader must reach
+                # terminate_process_tree UNREAPED so its owned group can
+                # still be captured and swept.
+                dead = proc_dead_unreaped(entry["proc"])
                 expired = now - entry["idle_since"] > _WARM_IDLE_TTL_SECONDS
                 if dead or expired:
                     victims.append(entry)
@@ -4142,9 +4145,10 @@ class AntigravityACPClient:
 
     def _warm_park(self, entry: dict[str, Any]) -> None:
         global _warm_pool_atexit_armed
-        if entry["proc"].poll() is not None:
+        if proc_dead_unreaped(entry["proc"]):
             # The child died between the last request and release; never
-            # park a corpse.
+            # park a corpse.  Handed off UNREAPED (issue #25) so the
+            # teardown can still capture group ownership and sweep.
             self._release_process(entry["proc"])
             return
         entry["idle_since"] = time.monotonic()
@@ -4154,7 +4158,7 @@ class AntigravityACPClient:
         with _warm_pool_lock:
             bucket: list[dict[str, Any]] = []
             for parked in _warm_pool.get(entry["key"], []):
-                if parked["proc"].poll() is None:
+                if not proc_dead_unreaped(parked["proc"]):
                     bucket.append(parked)
                 else:
                     victims.append(parked)

@@ -64,9 +64,53 @@ _SWEEP_GRACE_SECONDS = 2.0
 _SWEEP_TIMEOUT_SECONDS = 5.0
 
 
+_NON_REAPING_SUPPORTED = (
+    os.name != "nt"
+    and hasattr(os, "waitid")
+    and hasattr(os, "WNOWAIT")
+    and hasattr(os, "WEXITED")
+    and hasattr(os, "P_PID")
+)
+
+
+def proc_dead_unreaped(proc: subprocess.Popen) -> bool:
+    """Liveness check that NEVER reaps (issue #25 reaped-leader boundary).
+
+    The warm pool must decide liveness without destroying the ownership
+    evidence a later ``terminate_process_tree`` needs: ``Popen.poll()``
+    reaps, and a reaped group leader makes PID/PGID ownership unverifiable
+    forever (issue #23 guard), which strands same-group descendants.
+
+    POSIX: ``waitid(P_PID, WEXITED | WNOWAIT | WNOHANG)`` reports a
+    dead-but-unreaped child while the zombie leader keeps the group
+    resolvable, so the teardown can still capture ownership and sweep.
+    ``WNOWAIT`` is a ``waitid``-only flag — the legacy ``waitpid`` family
+    rejects it with ``EINVAL`` — hence ``os.waitid``.  Where non-reaping
+    waits are unavailable (Windows, or a POSIX build without these flags)
+    this falls back to ``poll()`` and the caller inherits the legacy
+    reaping semantics, identical to the pre-fix behavior; no Windows
+    behavior changes here.
+
+    This function only ever reports liveness: it must never set
+    ``returncode`` nor consume the child's exit status.
+    """
+    if proc.returncode is not None:
+        return True
+    if not _NON_REAPING_SUPPORTED:
+        return proc.poll() is not None
+    try:
+        result = os.waitid(
+            os.P_PID, proc.pid, os.WEXITED | os.WNOWAIT | os.WNOHANG
+        )
+    except ChildProcessError:
+        # Already reaped elsewhere: dead, and ownership is unverifiable —
+        # the conservative teardown guard applies downstream.
+        return True
+    return result is not None
+
+
 def _group_id_if_resolvable(proc: subprocess.Popen) -> int | None:
     """The process's group id while the kernel can still resolve it.
-
     Valid only when it equals ``proc.pid`` (the child leads the group — the
     contract of ``start_new_session=True``).  After a reap this raises
     ProcessLookupError, which is exactly the point where ownership becomes
