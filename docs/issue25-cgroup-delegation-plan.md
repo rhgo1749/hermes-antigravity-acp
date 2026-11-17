@@ -34,64 +34,110 @@ container's own subtree and mounted read-only, and the gateway has no
 capabilities. The PR #53 gate therefore evaluates `delegated_root() → None`
 and every production spawn is `containment=UNKNOWN` — exactly the fail-closed
 behavior the seam was built with. The 2026-11-17 host spike (docs §8) proved
-the kernel primitive; what is missing is a **writable delegated subtree inside
+the kernel primitive; what is missing is a **usable delegated subtree inside
 the container's own cgroup namespace**.
 
 ## 2. Kernel constraints that shape the design
 
-* cgroup-v2 self-migration (what the trampoline does) requires, for an
-  unprivileged process: write access on the destination `cgroup.procs`, and
-  (kernel ≥ 5.14 `cgroup_procs_write_permission`) destination **and** source
-  inside the caller's cgroup namespace. A delegated directory from OUTSIDE the
-  container's scope is therefore useless even if bind-mounted rw.
-* The destination must be a real descendant of the container's own
-  `docker-<id>.scope`, and the container's mount of it must not be `ro`-blocked.
+* cgroup-v2 unprivileged self-migration (`cgroup_procs_write_permission`,
+  kernel ≥ 5.14) requires ALL of:
+  1. write access on the destination's `cgroup.procs`;
+  2. destination **and** source inside the caller's cgroup namespace;
+  3. **write access to `cgroup.procs` of the destination's ancestor at the
+     source's level** (the "common ancestor" rule).
+* Rule 3 is what the 2026-11-17 bare-`app.slice` EACCES proved in the
+  negative, and why the host spike passed: `systemd-run --user` with
+  `Delegate=yes` chowns the WHOLE delegated scope subtree — scope root
+  `cgroup.procs` included — to the unit owner. Chowning only a leaf dir is
+  NOT delegation: a uid-1000 trampoline whose source sits at the scope root
+  would pass the PR #53 gate and still fail the join with EACCES.
+* Two ways to satisfy rule 3 for this container: (a) chown the scope root's
+  `cgroup.procs` — REJECTED: uid 1000 is uid 1000 in EVERY container here,
+  so a same-uid process in another container could migrate itself INTO this
+  scope (cross-container interference vector); or (b) **relocate the
+  container's own process tree one level down into the delegated subtree** so
+  the ancestor becomes the delegated dir itself (owned by 1000). This plan
+  uses (b): the relocation is performed by root (which bypasses the
+  permission checks) at setup time, and afterwards every unprivileged join
+  the seam performs has source and destination inside the delegated subtree.
 * No controllers are needed: the seam uses only `cgroup.procs`,
   `cgroup.events`, `cgroup.kill` (always present on v2 ≥ 5.14) — no
   `cgroup.subtree_control` mutation anywhere.
+* Mount flag flips on the container's cgroupfs MUST be per-mount
+  (self-bind + `remount,bind,...`). A plain `remount,rw` would flip the
+  SHARED cgroup2 superblock and make the HOST's cgroupfs rw — forbidden.
 * The PR #53 gate additionally requires (by design) the root to sit under
   `/sys/fs/cgroup` within the process's own namespace subtree, be canonical
-  (resolved), pre-existing, and effectively writable.
+  (resolved), pre-existing, and effectively writable. After the §4
+  relocation a container process's own path IS `/acp-delegate`, which the
+  gate accepts (`root == own-subtree base`).
 
-## 3. Minimal runtime delegation conditions (production, ALL four)
+## 3. Minimal runtime delegation conditions (production, ALL five)
 
-1. A directory `acp-delegate` exists as a direct child of the container's own
-   scope cgroup, `chown 1000:1000` (the container's hermes uid), created by a
-   privileged actor — it must survive as long as the container.
-2. That directory is visible **rw** inside the container at a path under
-   `/sys/fs/cgroup` (so the gate's own-subtree check passes and writes are not
-   `EROFS`-blocked).
-3. `HERMES_ANTIGRAVITY_ACP_CGROUP_ROOT=/sys/fs/cgroup/acp-delegate` set in the
-   `hermes-gateway` environment.
-4. Nothing else: no controllers, no `cgroup_parent`, no namespace changes, no
-   capability changes to the gateway process itself.
+1. A directory `acp-delegate` exists as a direct child of the container's
+   own scope cgroup, `chown -R 1000:1000` (the container's hermes uid),
+   created by root — it must survive as long as the container.
+2. **The container's process tree is relocated into `acp-delegate`** (root
+   writes the pids in the scope root's `cgroup.procs` into
+   `acp-delegate/cgroup.procs` once, at setup), so unprivileged
+   self-migration satisfies the common-ancestor rule with the 1000-owned
+   delegate dir (§2 rule 3).
+3. That subtree is visible **rw** inside the container at
+   `/sys/fs/cgroup/acp-delegate` via per-mount flag flips only (self-bind of
+   the ns-visible path; the parent mount keeps its original ro flags; the
+   shared superblock is never touched).
+4. `HERMES_ANTIGRAVITY_ACP_CGROUP_ROOT=/sys/fs/cgroup/acp-delegate` set in
+   the `hermes-gateway` environment.
+5. Nothing else: no controllers, no `cgroup_parent`, no namespace changes,
+   no capability changes to the gateway process itself.
 
 ## 4. Options (proposed diffs — NOT applied)
 
 ### P1 (recommended): host-side delegation helper + env var only — zero container capability change
 
-Host systemd unit (new, e.g. `acp-cgroup-delegate.service` + `.path` or a
-`docker events`-driven oneshot) that, on container (re)start of `hermes`:
+Host systemd unit (new, e.g. `acp-cgroup-delegate.service`, triggered on the
+Docker `start` event for `hermes` / after recreate) running as root:
 
 ```sh
+set -eu
 CID=$(docker inspect -f '{{.Id}}' hermes)
 PID=$(docker inspect -f '{{.State.Pid}}' hermes)
-D="/sys/fs/cgroup/system.slice/docker-${CID}.scope/acp-delegate"
-mkdir -p "$D" && chown 1000:1000 "$D"
-# The container's cgroupfs mount is ro, so the mount POINT cannot exist yet.
-# Flag flips MUST be per-mount (self-bind + remount,bind,...): a plain
-# remount,rw would flip the SHARED cgroup2 superblock and make the HOST's
-# cgroupfs rw too.  The self-bind recipe touches only this mount namespace;
-# the parent is restored to per-mount ro, leaving exactly one rw path: the
-# delegate bind submount.
-nsenter -t "$PID" -m -- sh -c "
-  mount --bind /sys/fs/cgroup /sys/fs/cgroup &&
-  mount -o remount,bind,rw /sys/fs/cgroup &&
-  mkdir -p /sys/fs/cgroup/acp-delegate &&
-  mount --bind '$D' /sys/fs/cgroup/acp-delegate &&
-  mount -o remount,bind,rw /sys/fs/cgroup/acp-delegate &&
-  mount -o remount,bind,ro /sys/fs/cgroup"
+[ "$PID" -gt 0 ] || { echo "container not running"; exit 1; }
+# Verify the scope path actually belongs to THIS container before touching it.
+test "$(cat "/proc/$PID/cgroup")" = "0::/system.slice/docker-${CID}.scope"
+S="/sys/fs/cgroup/system.slice/docker-${CID}.scope"
+D="$S/acp-delegate"
+mkdir -p "$D"
+chown -R 1000:1000 "$D"
+# (2) relocate the container's process tree into the delegate subtree.
+#     Root bypasses migration permission checks; systemd/docker scope stop
+#     still kills the whole subtree (children included) and stats aggregate
+#     recursively, so container lifecycle semantics are unchanged.
+while read -r p; do echo "$p" > "$D/cgroup.procs"; done < "$S/cgroup.procs"
+# (3) make ONLY the delegate subtree rw INSIDE the container's mount ns.
+#     Every path below is namespace-valid: inside the container the scope IS
+#     the cgroupfs root, so the delegate dir is already visible at
+#     /sys/fs/cgroup/acp-delegate — no host path crosses the boundary.
+#     The temporary rw self-bind of the parent exists only to allow the
+#     per-mount flip on the delegate; afterwards the parent's ORIGINAL ro
+#     mount reappears (umount of the self-bind) and only the delegate's own
+#     bind is rw.  The shared superblock is never touched.
+nsenter -t "$PID" -m -- sh -eu -c '
+  mount --bind /sys/fs/cgroup /sys/fs/cgroup
+  mount -o remount,bind,rw /sys/fs/cgroup
+  mount --bind /sys/fs/cgroup/acp-delegate /sys/fs/cgroup/acp-delegate
+  mount -o remount,bind,rw /sys/fs/cgroup/acp-delegate
+  umount /sys/fs/cgroup'
+# Post-attestation (fail closed): delegate rw inside the ns, parent ro again.
+nsenter -t "$PID" -m -- findmnt -T /sys/fs/cgroup/acp-delegate -o OPTIONS | grep -qw rw
+nsenter -t "$PID" -m -- findmnt /sys/fs/cgroup -o OPTIONS | grep -qw ro
 ```
+
+If any step fails, the unit exits non-zero and the seam stays UNKNOWN —
+partial states are visible (`findmnt`, `ls`), never papered over. Re-runs are
+idempotent (`mkdir -p`, `mount --bind` over an existing bind is a no-op
+replace, pid relocation of already-relocated pids is a no-op); on container
+recreation the unit re-runs for the new scope id.
 
 Compose diff (production, the ONLY service change):
 
@@ -101,20 +147,22 @@ Compose diff (production, the ONLY service change):
 +    HERMES_ANTIGRAVITY_ACP_CGROUP_ROOT: "/sys/fs/cgroup/acp-delegate"
 ```
 
-Rationale: the bind submount is created by a privileged host process, so the
-container's `ro` cgroupfs mount does not block it; the destination is inside
-the namespace (kernel check passes); the gateway keeps `CapEff=0`; the seam
-gate passes unchanged. Cost: one small host unit tracking container restarts
-(bind is lost on container recreation — the unit re-runs on the `start`
-docker event). If the unit is ever absent/failing, the gate sees a missing or
-unwritable root → `UNKNOWN` → today's behavior (fail-closed, no promotion).
+Why this is safe: the delegate subtree is the container's OWN territory —
+kernel namespace rules still confine every unprivileged migration inside it
+(any destination outside requires write access to root-owned files elsewhere);
+uid-1000 write power never touches the scope root or any other container's
+cgroups; the gateway keeps `CapEff=0`; if the unit is absent or fails, the
+gate sees a missing or unwritable root → `UNKNOWN` → today's behavior
+(fail-closed, no promotion).
 
-### P2: `cap_add: [SYS_ADMIN]` + root-stage remount inside the container
+### P2: `cap_add: [SYS_ADMIN]` + root-stage setup inside the container
 
-Requires an entrypoint/init override (the official image has **no supported
-root-stage extension point**, and the deployment AGENTS.md says do not set
-`entrypoint:`), and grants a broad capability to the container. Not
-recommended for production; acceptable shape for the disposable canary (§5).
+Same §3 shape executed by the container's own root stage (entrypoint
+override). Requires overriding `entrypoint:` — the official image has **no
+supported root-stage extension point** and the deployment AGENTS.md says do
+not set `entrypoint:` — and grants a broad capability. Not recommended for
+production; used ONLY as the disposable canary shape (§5), where the
+entrypoint override is acceptable precisely because the canary is throwaway.
 
 ### P3: `privileged: true` — REJECTED (security regression for a containment
 nice-to-have; also makes `/sys/fs/cgroup` rw for every process in the
@@ -123,56 +171,64 @@ container).
 ### Explicitly NOT proposed
 
 `cgroup_parent`/`cgroupns: host` changes (break the gate's own-subtree
-invariant or widen host visibility), Podman runtime migration (out of scope),
-any Windows/macOS mechanism (mandate §5).
+invariant or widen host visibility), scope-root `cgroup.procs` chown
+(cross-container same-uid interference vector, §2), Podman runtime migration
+(out of scope), any Windows/macOS mechanism (mandate §5).
 
 ## 5. Disposable canary procedure (production-equivalent, throwaway)
 
 A separate compose project (`nous-hermes-acp-canary`), same image
 `nousresearch/hermes-agent:v0.23.2`, **verified-copy** state dirs (the compose
 header rule: never share a state dir with the live gateway), container name
-`hermes-acp-canary`, `cap_add: [SYS_ADMIN]` (P2 shape — chosen only because a
-canary may override the entrypoint; production will use P1), no host network
-exposure beyond defaults, removed entirely afterwards.
+`hermes-acp-canary`, `cap_add: [SYS_ADMIN]` (P2 shape standing in for the P1
+host helper — the kernel-relevant end state is identical: relocated process
+tree + rw delegate subtree + env var), removed entirely afterwards.
 
 1. Start canary with entrypoint override (root stage, disposable; per-mount
    flag flips only — the shared superblock is never touched):
-   `mount --bind /sys/fs/cgroup /sys/fs/cgroup && mount -o remount,bind,rw /sys/fs/cgroup && mkdir -p /sys/fs/cgroup/acp-delegate && chown 1000:1000 /sys/fs/cgroup/acp-delegate && exec /init gateway run`
-   with `HERMES_ANTIGRAVITY_ACP_CGROUP_ROOT=/sys/fs/cgroup/acp-delegate`.
-   (Here the delegate dir is a real child of the container's namespace root —
-   no bind submount needed; the seam creates its nonce dirs inside it.)
-2. Gate attestation (inside canary, as hermes):
+   `mount --bind /sys/fs/cgroup /sys/fs/cgroup && mount -o remount,bind,rw /sys/fs/cgroup && mkdir -p /sys/fs/cgroup/acp-delegate && chown 1000:1000 /sys/fs/cgroup/acp-delegate && echo 1 > /sys/fs/cgroup/acp-delegate/cgroup.procs && exec /init gateway run`
+   (PID 1 relocates itself into the delegate subtree BEFORE `/init` execs, so
+   every container process — gateway, mux, vendor children — is BORN inside
+   it, which is the §3-condition-2 end state; the parent self-bind stays rw
+   for the canary, which is disposable).
+   With `HERMES_ANTIGRAVITY_ACP_CGROUP_ROOT=/sys/fs/cgroup/acp-delegate`.
+2. Gate attestation (inside canary, as hermes uid 1000):
    `python -c "from cgroup_containment import delegated_root; print(delegated_root())"`
    must print the root — else STOP (fail-closed, §6).
-3. Real seam tests (the two that SKIP everywhere else, PR #53):
+3. **Unprivileged-join gate** — the real seam tests (the two that SKIP
+   everywhere else, PR #53), run as uid 1000:
    `pytest tests/test_issue25_cgroup_containment_seam.py -k real -q`
-   → must be **2 passed, 0 skipped** (membership-before-first-fork; escaped
-   descendant swept by `cgroup.kill`, sibling cgroup untouched, empty proof,
-   own-dir removal).
+   → must be **2 passed, 0 skipped**. These ARE the unprivileged-join proof:
+   the trampoline (uid 1000) self-migrates under the common-ancestor rule;
+   EACCES here would mean §2 rule 3 is unmet. They also pin
+   membership-before-first-fork, escaped-descendant sweep via `cgroup.kill`,
+   sibling cgroup untouched, empty proof, own-dir removal.
 4. Production-equivalent live check: run one real ACP request through the
    canary gateway (mux + vendor children spawn normally). During the request:
    every mux/vendor descendant's `/proc/<pid>/cgroup` ends in
    `/acp-delegate/acpmux-<nonce>` (fork-before-containment race closed);
    a normal request completes with unchanged latency/semantics.
 5. After teardown (session close / idle teardown):
-   `cgroup.events populated 0`, `cgroup.procs` empty, `acpmux-*` dir removed
-   by the ladder, **residue 0** (`ls /sys/fs/cgroup/acp-delegate` empty), and
-   the canary's own scope (`cgroup.procs` of the scope root, minus the
-   delegate subtree) shows no leaked descendants; sibling cgroups (other
+   zero `acpmux-*` nonce dirs remain under `acp-delegate` (**residue 0**;
+   each nonce's `cgroup.events populated 0` + `cgroup.procs` empty precedes
+   its removal by the ladder); `acp-delegate` itself legitimately persists
+   and holds the relocated container processes; sibling cgroups (other
    containers, host services) untouched.
 6. Teardown canary: `docker compose -p nous-hermes-acp-canary down` + delete
    the copy dirs. No production artifact touched at any step.
 
-**Canary success criteria = steps 2–5 all PASS with zero residue. Anything
-else = FAIL/NOT RUN → Gate B stays NO-GO; production untouched.**
+**Canary success criteria = steps 2–5 all PASS with zero nonce residue.
+Anything else = FAIL/NOT RUN → Gate B stays NO-GO; production untouched.**
 
 ## 6. Fail-closed criteria (already enforced by the seam itself)
 
 * Root missing / not canonical / mount-root / not writable / no writable
   `cgroup.kill` / outside own namespace subtree → `delegated_root()=None` →
   `containment=UNKNOWN`, legacy spawn+teardown byte-identical to today.
-* Trampoline join or exec verdict failure → kill+reap, own-cgroup-only abort,
-  respawn with original argv (UNKNOWN), never promoted.
+* Trampoline join EACCES (common-ancestor rule unmet) → exit 87, no exec,
+  kill+reap, own-cgroup-only abort, respawn UNKNOWN — a mis-delegated
+  environment degrades, never half-contains.
+* Trampoline exec verdict failure → same UNKNOWN fallback, never promoted.
 * Teardown ownership/inode/empty-proof failure → `None` (UNVERIFIED) + legacy
   escalation, or `False` (verified-dead + own-dir residue logged) — never a
   silent success; foreign objects never touched.
@@ -180,28 +236,36 @@ else = FAIL/NOT RUN → Gate B stays NO-GO; production untouched.**
 
 ## 7. Rollback (production, post-approval)
 
-1. Remove `HERMES_ANTIGRAVITY_ACP_CGROUP_ROOT` from compose; `docker compose
-   up -d hermes-gateway` (approved recreate window) → gate `None` → UNKNOWN
-   immediately; legacy path is the byte-identical pre-seam behavior.
-2. `systemctl disable --now acp-cgroup-delegate*`; `nsenter -t $PID -m umount
-   /sys/fs/cgroup/acp-delegate`; `rmdir` the host dir when empty (refuses
-   non-empty — residue stays visible, never force-removed).
-3. No state, credential, or workspace data is ever written by the seam;
-   rollback cannot orphan anything the seam created (nonce dirs are removed by
-   teardown or left visible as logged residue).
+```sh
+set -eu
+CID=$(docker inspect -f '{{.Id}}' hermes)
+PID=$(docker inspect -f '{{.State.Pid}}' hermes)
+S="/sys/fs/cgroup/system.slice/docker-${CID}.scope"
+# move the container's processes back to the scope root (root may do this),
+nsenter -t "$PID" -m -- umount /sys/fs/cgroup/acp-delegate || true
+while read -r p; do echo "$p" > "$S/cgroup.procs"; done < "$S/acp-delegate/cgroup.procs"
+rmdir "$S/acp-delegate"   # refuses non-empty; residue stays visible
+systemctl disable --now acp-cgroup-delegate.service
+```
+
+Plus: remove `HERMES_ANTIGRAVITY_ACP_CGROUP_ROOT` from compose at the next
+approved recreate window — but the env var alone is inert immediately once
+the delegate bind is gone (gate → `UNKNOWN`), so **the umount above is the
+effective kill switch and needs NO container restart**. The seam writes no
+state; rollback cannot orphan anything the seam created (nonce dirs are
+removed by teardown or left visible as logged residue).
 
 ## 8. Open decision for the operator (exactly one)
 
 Approve (or reject) running **§5 canary** — a disposable container, zero
 production contact — as the next step. Production mutation (§4 P1) is proposed
 only after canary PASS and requires its own explicit approval; merge of
-#49–#53 remains separately gated.
+#49–#54 remains separately gated.
 
 ## 9. Consistency with prior evidence
 
 * #49/#50/#51/#52/#53 semantics unchanged; this plan mutates nothing.
-* The 2026-11-17 bare-`app.slice` EACCES finding is exactly why §2's namespace
-  rule and the gate's own-subtree check exist.
-* Host spike (docs §8, `fd03122`) proved kernel mechanics under a systemd
-  transient scope; the canary re-proves them in the container shape that
-  production actually runs.
+* The 2026-11-17 bare-`app.slice` EACCES finding is exactly §2's rule-3
+  demonstration; the host spike (`fd03122`, `Delegate=yes` full-scope
+  delegation) is its positive control. The canary re-proves both in the
+  container shape production actually runs.
