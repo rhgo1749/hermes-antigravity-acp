@@ -13,7 +13,9 @@ Contracts pinned here:
    contributes NOTHING to the spawn in those cases.
 2. The trampoline NEVER execs the mux unless it joined the nonce cgroup and
    verified membership via /proc/self/cgroup; a failed join exits 87 with an
-   "F" verdict and the mux command never runs.
+   "F" verdict and the mux command never runs.  Confirmation is TWO-stage:
+   "J" (joined) alone is not enough — the CLOEXEC errpipe must reach EOF
+   (exec succeeded); a failed execvp reports "E" and confirm() refuses.
 3. Handshake failure at spawn degrades to a plain (UNKNOWN) spawn with the
    original argv and removes only the cgroup dir we created.
 4. Teardown refuses a cgroup path whose inode no longer matches the
@@ -45,10 +47,12 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import contextlib
 import subprocess
 import sys
 import time
 import types
+import unittest
 from pathlib import Path
 
 import pytest
@@ -163,25 +167,144 @@ def test_trampoline_aborts_without_exec(tmp_path):
     procs.touch()  # regular file: the pid write "succeeds"...
     touched = tmp_path / "mux-ran"
     read_fd, write_fd = os.pipe()
+    err_read, err_write = os.pipe()
     try:
         completed = subprocess.run(
             [
-                sys.executable, "-c", cgc.TRAMPOLINE_SRC, str(procs), str(write_fd),
+                sys.executable, "-c", cgc.TRAMPOLINE_SRC,
+                str(procs), str(write_fd), str(err_write),
                 sys.executable, "-c", f"import pathlib; pathlib.Path({str(touched)!r}).write_text('x')",
             ],
-            pass_fds=(write_fd,),
+            pass_fds=(write_fd, err_write),
             capture_output=True,
             timeout=30,
         )
-        verdict = os.read(read_fd, 1)
-    finally:
-        os.close(read_fd)
+        # Parent must drop its OWN write ends before reading: the
+        # trampoline's copies are gone with it, and EOF only happens when
+        # NO writer remains.
         os.close(write_fd)
+        os.close(err_write)
+        verdict = os.read(read_fd, 1)
+        err_verdict = os.read(err_read, 1)
+    finally:
+        for fd in (read_fd, write_fd, err_read, err_write):
+            with contextlib.suppress(OSError):
+                os.close(fd)
     # ...but membership is not observable, so the trampoline aborts and the
     # mux command NEVER runs.
     assert completed.returncode == 87, completed.stderr.decode()
     assert verdict == b"F"
+    assert err_verdict == b"", "join-failure path must exit without an exec verdict"
     assert not touched.exists(), "trampoline exec'd the mux without verified join"
+
+
+# The container's own cgroup is the v2 root ("0::/"), so a RELATIVE procs
+# path gives target="" and the membership check passes against our real
+# (unchanged) cgroup — no cgroup mutation, just a regular file in tmp.
+# That lets the EXEC verdict (errpipe) be tested without delegation.
+_ROOT_CGROUP = next(
+    (line[3:].strip() for line in open("/proc/self/cgroup") if line.startswith("0::")), "?"
+) == "/"
+
+
+@unittest.skipUnless(_ROOT_CGROUP, "exec-verdict trick needs cgroup root '/'")
+def test_trampoline_exec_failure_writes_E_and_exits_87(tmp_path):
+    err_read, err_write = os.pipe()
+    read_fd, write_fd = os.pipe()
+    try:
+        completed = subprocess.run(
+            [
+                sys.executable, "-c", cgc.TRAMPOLINE_SRC,
+                "cgroup.procs", str(write_fd), str(err_write),
+                "/nonexistent-acp-mux-binary-xyz",
+            ],
+            cwd=str(tmp_path),
+            pass_fds=(write_fd, err_write),
+            capture_output=True,
+            timeout=30,
+        )
+        # Parent must drop its OWN write ends before reading: the
+        # trampoline's copies are gone with it, and EOF only happens when
+        # NO writer remains.
+        os.close(write_fd)
+        os.close(err_write)
+        verdict = os.read(read_fd, 1)
+        err_verdict = os.read(err_read, 1)
+    finally:
+        for fd in (read_fd, write_fd, err_read, err_write):
+            with contextlib.suppress(OSError):
+                os.close(fd)
+    assert completed.returncode == 87, completed.stderr.decode()
+    assert verdict == b"J", "join was observable; the join verdict is J"
+    assert err_verdict == b"E", "failed execvp must report E, never silence"
+    assert (tmp_path / "cgroup.procs").read_text().strip().isdigit()
+
+
+@unittest.skipUnless(_ROOT_CGROUP, "exec-verdict trick needs cgroup root '/'")
+def test_trampoline_successful_exec_closes_errpipe(tmp_path):
+    err_read, err_write = os.pipe()
+    read_fd, write_fd = os.pipe()
+    try:
+        completed = subprocess.run(
+            [
+                sys.executable, "-c", cgc.TRAMPOLINE_SRC,
+                "cgroup.procs", str(write_fd), str(err_write),
+                sys.executable, "-c", "raise SystemExit(3)",
+            ],
+            cwd=str(tmp_path),
+            pass_fds=(write_fd, err_write),
+            capture_output=True,
+            timeout=30,
+        )
+        # Parent must drop its OWN write ends before reading: the
+        # trampoline's copies are gone with it, and EOF only happens when
+        # NO writer remains.
+        os.close(write_fd)
+        os.close(err_write)
+        verdict = os.read(read_fd, 1)
+        err_verdict = os.read(err_read, 1)
+    finally:
+        for fd in (read_fd, write_fd, err_read, err_write):
+            with contextlib.suppress(OSError):
+                os.close(fd)
+    assert completed.returncode == 3, "exec'd command's exit code must surface"
+    assert verdict == b"J"
+    assert err_verdict == b"", "successful exec closes the CLOEXEC errpipe (EOF)"
+
+
+# -- 2b. parent-side confirm(): J alone is NOT confirmation -------------------
+
+
+def test_confirm_requires_exec_eof(tmp_path):
+    directory, handle = _fake_handle(tmp_path, "acpmux-conf000000000")
+    read_fd, write_fd = os.pipe()
+    err_read, err_write = os.pipe()
+    handle._notify_read, handle._notify_write = read_fd, write_fd
+    handle._err_read, handle._err_write = err_read, err_write
+    # Simulate a trampoline that JOINED (J) but whose execvp then FAILED (E):
+    # the exact defect the two-pipe protocol closes — a never-exec'd mux
+    # must never be marked CONFIRMED.
+    os.write(write_fd, b"J")
+    os.write(err_write, b"E")
+    os.close(write_fd)
+    os.close(err_write)
+    handle._notify_write = handle._err_write = None
+    assert handle.confirm(timeout=5.0) is False
+    assert handle.confirmed is False
+
+
+def test_confirm_true_only_on_join_and_exec_eof(tmp_path):
+    directory, handle = _fake_handle(tmp_path, "acpmux-conf010000000")
+    read_fd, write_fd = os.pipe()
+    err_read, err_write = os.pipe()
+    handle._notify_read, handle._notify_write = read_fd, write_fd
+    handle._err_read, handle._err_write = err_read, err_write
+    os.write(write_fd, b"J")
+    os.close(write_fd)
+    os.close(err_write)  # EOF on errpipe = exec succeeded
+    handle._notify_write = handle._err_write = None
+    assert handle.confirm(timeout=5.0) is True
+    assert handle.confirmed is True
 
 
 # -- 3. spawn-side abort: sweeps own cgroup, touches nothing else ------------
@@ -254,11 +377,33 @@ def test_fake_ladder_cooperative_then_sweep(tmp_path):
     result = teardown.terminate_contained_tree(proc, handle, graceful_stdin=True)
     # Cooperative exit -> own cgroup.kill sweep ran -> fake empty proof.
     # rmdir of the FAKE dir fails (regular files; real cgroup files are
-    # virtual) -> documented artifact -> False with logged residue, never a
-    # silently "successful" cleanup.
+    # virtual) -> documented artifact -> tri-state contract: False = tree
+    # verified dead, own-dir residue logged, NO group escalation after the
+    # empty proof (pgid-reuse hazard, #50).  Never a silent "success".
     assert result is False
     assert (directory / "cgroup.kill").read_text() == "1"
     assert proc.poll() is not None
+    for name in ("cgroup.kill", "cgroup.type", "cgroup.procs", "cgroup.events"):
+        (directory / name).unlink()
+    directory.rmdir()
+
+
+def test_teardown_verified_handle_is_idempotent_noop(tmp_path):
+    # A handle whose ladder already completed and VERIFIED returns True on
+    # re-entry without touching the (here still live) process — and the
+    # flag is teardown_verified, NOT cleaned_up, which finish()/abort()
+    # also set for pipe-closing purposes.
+    directory, handle = _fake_handle(tmp_path, "acpmux-idem00000000000")
+    handle.teardown_verified = True
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(300)"],
+        start_new_session=True,
+    )
+    try:
+        assert teardown.terminate_contained_tree(proc, handle) is True
+        assert proc.poll() is None, "verified handle must be a pure no-op"
+    finally:
+        teardown.terminate_process_tree(proc)
     for name in ("cgroup.kill", "cgroup.type", "cgroup.procs", "cgroup.events"):
         (directory / name).unlink()
     directory.rmdir()
@@ -340,7 +485,9 @@ def test_spawn_handshake_failure_falls_back_to_unknown(tmp_path, monkeypatch):
     handle = pkg_cgc.Containment(directory, os.stat(directory))
     handle.killfile_ready = True
     read_fd, write_fd = os.pipe()  # what begin() would have created
+    err_read, err_write = os.pipe()
     handle._notify_read, handle._notify_write = read_fd, write_fd
+    handle._err_read, handle._err_write = err_read, err_write
     monkeypatch.setattr(
         pkg_cgc.Containment, "begin", classmethod(lambda cls: handle)
     )

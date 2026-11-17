@@ -341,17 +341,20 @@ def terminate_contained_tree(
     Ownership guards: the cgroup dir is touched only while its (st_dev,
     st_ino) still matches the creation-time record (path-reuse guard), and
     only the dir this handle created is ever removed.  Any failed step
-    escalates to the legacy group ladder, reports the containment guarantee
-    as UNVERIFIED (``None``), and logs residue loudly — never hidden, never
-    promoted.
+    BEFORE the empty proof escalates to the legacy group ladder and reports
+    the containment guarantee as UNVERIFIED (``None``) — never hidden,
+    never promoted.  After the empty proof the tree is provably dead, so
+    the group ladder is NOT run there: signalling a pgid whose members are
+    all gone invites pgid-reuse collateral (the #50 invariant).
 
     Returns ``True`` ONLY for a completed cgroup-verified teardown (empty
     proof observed AND own dir removed).  ``False`` means the tree was
-    emptied but our own dir removal failed (logged residue).  ``None`` means
-    the containment verification was lost — callers must not treat it as
-    contained-verified.
+    emptied and verified dead but our own dir removal failed (logged
+    residue — the cgroup dir lingers; nothing else is owed).  ``None``
+    means the containment verification was lost — callers must not treat
+    it as contained-verified.
     """
-    if containment.cleaned_up:
+    if containment.teardown_verified:
         # This exact ladder already completed and verified for this handle.
         return True
     if not containment.ownership_intact():
@@ -406,8 +409,12 @@ def terminate_contained_tree(
         terminate_process_tree(proc, graceful_stdin=False)
         return None
     if not containment.remove_own_dir():
-        # remove_own_dir already logged the exact residue.
+        # remove_own_dir already logged the exact residue.  The tree is
+        # provably dead (empty proof above) — no group-ladder escalation
+        # after that proof (pgid-reuse hazard); the only debt is the
+        # lingering own cgroup dir, reported, never hidden.
         return False
+    containment.teardown_verified = True
     containment.finish()
     return True
 

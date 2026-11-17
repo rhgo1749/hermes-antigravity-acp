@@ -21,13 +21,18 @@ Containment is claimed ONLY when every one of these holds (fail closed):
   inode at the path treats it as a FOREIGN object and refuses to touch it
   (path-reuse guard; the containment claim degrades, it is never transferred).
 * The spawn trampoline joined ITSELF into the nonce cgroup and verified it
-  via ``/proc/self/cgroup`` BEFORE exec'ing the mux, and reported success to
-  the parent over a pipe handshake.  The trampoline forks nothing before the
-  join, so no mux/vendor descendant can ever be born outside the cgroup
-  (pre-join fork race closed at the only place it could occur).  A parent
-  that moves a pid in AFTER ``Popen`` would race the child's first fork —
-  that design is deliberately NOT used, and ``preexec_fn`` is unsafe in this
-  threaded client, so it is not used either.
+  via ``/proc/self/cgroup`` BEFORE exec'ing the mux.  Confirmation is a
+  TWO-PIPE protocol: the notify pipe carries the join verdict ("J"/"F") and
+  a second, CLOEXEC-marked errpipe is the EXEC verdict — a successful exec
+  closes it (parent observes EOF), an ``execvp`` failure writes "E" and
+  exits 87.  A parent that saw "J" but not EOF is NOT confirmed: a trampoline
+  that joined but never exec'd the mux can never be mistaken for a contained
+  mux.  The trampoline forks nothing before the join, so no mux/vendor
+  descendant can ever be born outside the cgroup (pre-join fork race closed
+  at the only place it could occur).  A parent that moves a pid in AFTER
+  ``Popen`` would race the child's first fork — that design is deliberately
+  NOT used, and ``preexec_fn`` is unsafe in this threaded client, so it is
+  not used either.
 
 Anything else — non-Linux, gate failure, mkdir/type/handshake failure,
 timeout — means containment=UNKNOWN: the mux is spawned exactly as before
@@ -118,9 +123,12 @@ def delegated_root() -> Path | None:
         return None
     if not _cgroup2_mounted():
         return None
-    root = Path(raw)
     try:
-        if root.resolve() == Path("/sys/fs/cgroup").resolve():
+        # Canonicalize BEFORE any check: a symlinked root under our own
+        # subtree could otherwise name an object living elsewhere, and the
+        # migration-containment comparison is only meaningful on real paths.
+        root = Path(raw).resolve()
+        if root == Path("/sys/fs/cgroup").resolve():
             return None
         if not (root / "cgroup.procs").is_file():
             return None
@@ -140,36 +148,60 @@ def delegated_root() -> Path | None:
 
 # Runs in the forked child BEFORE the mux exists.  Joins its OWN pid into
 # the nonce cgroup, verifies membership through /proc/self/cgroup, reports
-# over the notify pipe, closes the fd, then execs the real command.  Any
-# failure path exits with _TRAMPOLINE_ABORT_CODE without ever exec'ing the
-# mux, so a failed join can never leak an uncontained mux.
+# the join verdict over the notify pipe, then marks the errpipe CLOEXEC and
+# execs the real command: a SUCCESSFUL exec closes the errpipe (parent sees
+# EOF = exec confirmed); an execvp failure writes "E" and exits 87.  Every
+# failure path exits with _TRAMPOLINE_ABORT_CODE without ever leaving a
+# positive confirmation behind, so a failed join OR a failed exec can never
+# be mistaken for a contained mux.
 TRAMPOLINE_SRC = """
-import os, sys
-procs_path, notify_fd, *cmd = sys.argv[1:]
-notify_fd = int(notify_fd)
-target = os.path.basename(os.path.dirname(procs_path))
+import fcntl, os, sys
+notify_fd = err_fd = exec_err = None
 try:
-    with open(procs_path, "w") as fh:
-        fh.write(str(os.getpid()) + "\\n")
-    joined = False
-    with open("/proc/self/cgroup") as fh:
-        for line in fh:
-            if line.startswith("0::") and line.strip().endswith("/" + target):
-                joined = True
-    if not joined:
-        raise RuntimeError("cgroup join not observable in /proc/self/cgroup")
-except BaseException:
+    procs_path, notify_s, err_s, *cmd = sys.argv[1:]
+    notify_fd, err_fd = int(notify_s), int(err_s)
+    target = os.path.basename(os.path.dirname(procs_path))
     try:
-        os.write(notify_fd, b"F")
+        with open(procs_path, "w") as fh:
+            fh.write(str(os.getpid()) + "\\n")
+        joined = False
+        with open("/proc/self/cgroup") as fh:
+            for line in fh:
+                if line.startswith("0::") and line.strip().endswith("/" + target):
+                    joined = True
+        if not joined:
+            raise RuntimeError("cgroup join not observable in /proc/self/cgroup")
+    except BaseException:
+        try:
+            os.write(notify_fd, b"F")
+        except OSError:
+            pass
+        os._exit(87)
+    try:
+        os.write(notify_fd, b"J")
     except OSError:
         pass
+    os.close(notify_fd)
+    notify_fd = None
+    # From here the errpipe is the ONLY verdict.  pass_fds handed us this fd
+    # WITHOUT CLOEXEC, so dup3 a CLOEXEC twin for the exec: a successful
+    # exec closes the twin (parent reads EOF); a failed exec keeps the
+    # original err_fd open for the handler below to report "E" on.
+    exec_err = os.dup(err_fd)
+    fcntl.fcntl(exec_err, fcntl.F_SETFD, fcntl.FD_CLOEXEC)
+    os.close(err_fd)
+    err_fd = None
+    os.execvp(cmd[0], cmd)
+except BaseException:
+    # E goes to whichever errpipe end is still open: the original err_fd
+    # (failure before dup3) or the CLOEXEC twin (execvp itself failed).
+    verdict_fd = err_fd if err_fd is not None else exec_err
+    if verdict_fd is not None:
+        try:
+            os.write(verdict_fd, b"E")
+        except OSError:
+            pass
     os._exit(87)
-try:
-    os.write(notify_fd, b"J")
-except OSError:
-    pass
-os.close(notify_fd)
-os.execvp(cmd[0], cmd)
 """
 
 
@@ -191,8 +223,14 @@ class Containment:
         self.killfile_ready = False  # flipped only after positive validation
         self.confirmed = False
         self.cleaned_up = False
+        # Set ONLY by a completed cgroup-verified teardown; the early-return
+        # in terminate_contained_tree trusts THIS, never cleaned_up (which
+        # finish()/abort() also set for pipe-closing purposes).
+        self.teardown_verified = False
         self._notify_read: int | None = None
         self._notify_write: int | None = None
+        self._err_read: int | None = None
+        self._err_write: int | None = None
 
     @classmethod
     def begin(cls) -> "Containment | None":
@@ -220,6 +258,7 @@ class Containment:
                 raise RuntimeError("child cgroup lacks a writable cgroup.kill")
             inst.killfile_ready = True
             inst._notify_read, inst._notify_write = os.pipe()
+            inst._err_read, inst._err_write = os.pipe()
         except (OSError, RuntimeError) as exc:
             logger.warning(
                 "mux containment disabled for one spawn: %s: %s; "
@@ -236,53 +275,90 @@ class Containment:
     # -- spawn side ---------------------------------------------------------
 
     def wrap_argv(self, argv: list[str]) -> list[str]:
-        assert self._notify_write is not None
+        assert self._notify_write is not None and self._err_write is not None
         return [
             sys.executable,
             "-c",
             TRAMPOLINE_SRC,
             str(self.directory / "cgroup.procs"),
             str(self._notify_write),
+            str(self._err_write),
             *argv,
         ]
 
     def pass_fds(self) -> tuple[int, ...]:
-        return (self._notify_write,) if self._notify_write is not None else ()
+        fds = tuple(
+            fd for fd in (self._notify_write, self._err_write) if fd is not None
+        )
+        return fds
 
     def confirm(self, timeout: float = _HANDSHAKE_TIMEOUT_SECONDS) -> bool:
-        """Read the trampoline's one-byte verdict; always closes both ends."""
+        """Two-stage verdict: join ("J" on notify) THEN exec (EOF on errpipe).
+
+        ``J`` alone is NOT confirmation: the trampoline writes it before
+        exec'ing, so a failed ``execvp`` (missing/unsound binary) must not
+        leave a positive containment claim.  The errpipe is CLOEXEC-marked
+        in the trampoline, so a SUCCESSFUL exec closes the write end and the
+        parent reads EOF; a failed exec reads "E" first.
+        """
         read_fd = self._notify_read
         if read_fd is None:  # pipes already consumed: verdict is unrecoverable
             self.confirmed = False
             return False
         deadline = time.monotonic() + timeout
-        verdict = b""
-        try:
-            while time.monotonic() < deadline:
-                ready, _, _ = select.select([read_fd], [], [], 0.1)
-                if not ready:
-                    continue
-                chunk = os.read(read_fd, 1)
-                if not chunk:  # EOF without verdict: trampoline died oddly
-                    break
-                verdict = chunk
-                break
-        except OSError:
-            verdict = b""
-        finally:
-            self._close_pipes()
-        self.confirmed = verdict == b"J"
+        verdict = self._read_one(read_fd, deadline)
+        joined = verdict == b"J"
+        execed = False
+        if joined:
+            execed = self._await_exec_eof(self._err_read, deadline)
+        self._close_pipes()
+        self.confirmed = joined and execed
         if not self.confirmed:
             logger.warning(
-                "mux containment handshake failed for %s (verdict=%r); "
-                "this spawn degrades to containment=UNKNOWN",
+                "mux containment handshake failed for %s "
+                "(join=%r exec_eof=%s); this spawn degrades to "
+                "containment=UNKNOWN",
                 self.directory.name,
                 verdict,
+                execed,
             )
         return self.confirmed
 
+    @staticmethod
+    def _read_one(fd: int, deadline: float) -> bytes:
+        try:
+            while time.monotonic() < deadline:
+                ready, _, _ = select.select([fd], [], [], 0.1)
+                if not ready:
+                    continue
+                chunk = os.read(fd, 1)
+                if not chunk:  # EOF without verdict: trampoline died oddly
+                    return b""
+                return chunk
+        except OSError:
+            return b""
+        return b""
+
+    @staticmethod
+    def _await_exec_eof(fd: int | None, deadline: float) -> bool:
+        """True only when the errpipe closed = execvp SUCCEEDED."""
+        if fd is None:
+            return False
+        try:
+            while time.monotonic() < deadline:
+                ready, _, _ = select.select([fd], [], [], 0.1)
+                if not ready:
+                    continue
+                chunk = os.read(fd, 1)
+                if not chunk:
+                    return True  # EOF: exec closed the CLOEXEC write end
+                return False  # "E" (or anything else): exec failed
+        except OSError:
+            return False
+        return False
+
     def _close_pipes(self) -> None:
-        for attr in ("_notify_read", "_notify_write"):
+        for attr in ("_notify_read", "_notify_write", "_err_read", "_err_write"):
             fd = getattr(self, attr)
             if fd is not None:
                 with contextlib.suppress(OSError):
@@ -356,8 +432,10 @@ class Containment:
     def abort(self) -> None:
         """Spawn-side failure path: sweep own cgroup, remove own dir.
 
-        Called when the trampoline never exec'd the mux or the handshake
-        failed; the caller has already killed/reaped the direct child.
+        Called when the trampoline never confirmed (failed join, failed
+        exec, or timeout).  The caller has already killed and reaped the
+        direct child before invoking this; the sweep exists for anything
+        the trampoline may have started inside our own cgroup.
         """
         if self.cleaned_up:
             return

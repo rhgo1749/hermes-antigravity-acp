@@ -4910,14 +4910,15 @@ class AntigravityACPClient:
                 containment.abort()
             raise
         if containment is not None and not containment.confirm():
-            # Trampoline failed (never exec'd the mux) or the handshake
-            # timed out: reap it, remove our own cgroup, respawn WITHOUT
-            # containment — the legacy spawn path, unchanged semantics.
-            containment.abort()
+            # Trampoline failed (failed join, failed exec, or timeout):
+            # kill and REAP the direct child first, then abort (sweep own
+            # cgroup + remove own dir), then respawn WITHOUT containment —
+            # the legacy spawn path, unchanged semantics.
             with contextlib.suppress(OSError):
                 proc.kill()
             with contextlib.suppress(Exception):
                 proc.wait(timeout=5.0)
+            containment.abort()
             containment = None
             popen_kwargs.pop("pass_fds", None)
             try:
