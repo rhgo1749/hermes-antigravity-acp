@@ -59,9 +59,13 @@ and marked as not observed here — never guessed.
   `ACP_MUX_AFFINITY_PIN`, affinity TTL and entry limits, and `ACP_MUX_PAR`
   when pinned. The issue #24 F2 session-class declarations
   `ACP_MUX_SESSION_ORIGIN`/`ACP_MUX_SESSION_LIFECYCLE` are set by the
-  plugin only for the explicit `llm_backend` one-shot policy and are
-  consumed by the mux itself — the mux strips both before spawning the
-  official server. These are Hermes-side continuation bookkeeping values — not
+  plugin only for the explicit `llm_backend` one-shot policy **and only
+  when the configured launch target is named as a mux entry point** per
+  the mux packaging naming contract (`docs/mux-packaging.md`);
+  Single-mode direct official-server children never receive them.  They
+  are consumed by the mux itself — the mux strips both before spawning
+  the official server. These are Hermes-side continuation bookkeeping
+  values — not
   Google credentials — and the child gets no general environment inheritance
   beyond the allowlist.
 - **Installer** writes are limited to: the versioned server under
