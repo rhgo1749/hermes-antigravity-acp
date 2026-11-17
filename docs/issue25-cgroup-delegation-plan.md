@@ -111,33 +111,35 @@ mkdir -p "$D"
 chown -R 1000:1000 "$D"
 # (2) relocate the container's process tree into the delegate subtree.
 #     Root bypasses migration permission checks; systemd/docker scope stop
-#     still kills the whole subtree (children included) and stats aggregate
-#     recursively, so container lifecycle semantics are unchanged.
+#     kills the whole subtree (children included) and stats aggregate
+#     recursively — the canary (§5 step 6) VERIFIES those lifecycle claims
+#     rather than assuming them.
 while read -r p; do echo "$p" > "$D/cgroup.procs"; done < "$S/cgroup.procs"
 # (3) make ONLY the delegate subtree rw INSIDE the container's mount ns.
-#     Every path below is namespace-valid: inside the container the scope IS
-#     the cgroupfs root, so the delegate dir is already visible at
-#     /sys/fs/cgroup/acp-delegate — no host path crosses the boundary.
-#     The temporary rw self-bind of the parent exists only to allow the
-#     per-mount flip on the delegate; afterwards the parent's ORIGINAL ro
-#     mount reappears (umount of the self-bind) and only the delegate's own
-#     bind is rw.  The shared superblock is never touched.
+#     No parent rw is needed or performed: the mount point already exists
+#     (created host-side in step 1) and a bind mount does not require write
+#     access to the underlying mount — only CAP_SYS_ADMIN, which the host
+#     root helper has.  The parent keeps its ORIGINAL ro mount untouched;
+#     exactly one new mount exists, the delegate's own rw self-bind.
+#     mountpoint guard makes re-runs idempotent (bind-over-bind would
+#     otherwise STACK mount layers, not replace).
 nsenter -t "$PID" -m -- sh -eu -c '
-  mount --bind /sys/fs/cgroup /sys/fs/cgroup
-  mount -o remount,bind,rw /sys/fs/cgroup
-  mount --bind /sys/fs/cgroup/acp-delegate /sys/fs/cgroup/acp-delegate
-  mount -o remount,bind,rw /sys/fs/cgroup/acp-delegate
-  umount /sys/fs/cgroup'
-# Post-attestation (fail closed): delegate rw inside the ns, parent ro again.
+  mountpoint -q /sys/fs/cgroup/acp-delegate ||
+    mount --bind /sys/fs/cgroup/acp-delegate /sys/fs/cgroup/acp-delegate
+  mount -o remount,bind,rw /sys/fs/cgroup/acp-delegate'
+# Post-attestation (fail closed): delegate rw inside the ns, parent ro again
+# (it never stopped being ro), and exactly one mount on the delegate path.
 nsenter -t "$PID" -m -- findmnt -T /sys/fs/cgroup/acp-delegate -o OPTIONS | grep -qw rw
 nsenter -t "$PID" -m -- findmnt /sys/fs/cgroup -o OPTIONS | grep -qw ro
+test "$(nsenter -t "$PID" -m -- findmnt -T /sys/fs/cgroup/acp-delegate -o SOURCE | wc -l)" -eq 2
 ```
 
 If any step fails, the unit exits non-zero and the seam stays UNKNOWN —
-partial states are visible (`findmnt`, `ls`), never papered over. Re-runs are
-idempotent (`mkdir -p`, `mount --bind` over an existing bind is a no-op
-replace, pid relocation of already-relocated pids is a no-op); on container
-recreation the unit re-runs for the new scope id.
+partial states are visible (`findmnt`, `mountinfo`), never papered over.
+Re-runs are idempotent (`mkdir -p`; `mountpoint` guard skips an existing
+bind; `remount,bind,rw` on already-rw is a no-op; relocating already-
+relocated pids is a no-op); on container recreation the unit re-runs for the
+new scope id.
 
 Compose diff (production, the ONLY service change):
 
@@ -184,14 +186,20 @@ header rule: never share a state dir with the live gateway), container name
 host helper — the kernel-relevant end state is identical: relocated process
 tree + rw delegate subtree + env var), removed entirely afterwards.
 
-1. Start canary with entrypoint override (root stage, disposable; per-mount
-   flag flips only — the shared superblock is never touched):
-   `mount --bind /sys/fs/cgroup /sys/fs/cgroup && mount -o remount,bind,rw /sys/fs/cgroup && mkdir -p /sys/fs/cgroup/acp-delegate && chown 1000:1000 /sys/fs/cgroup/acp-delegate && echo 1 > /sys/fs/cgroup/acp-delegate/cgroup.procs && exec /init gateway run`
-   (PID 1 relocates itself into the delegate subtree BEFORE `/init` execs, so
-   every container process — gateway, mux, vendor children — is BORN inside
-   it, which is the §3-condition-2 end state; the parent self-bind stays rw
-   for the canary, which is disposable).
+1. Start canary with entrypoint override (root stage, disposable). The
+   sequence reaches P1's EXACT mount end-state (parent = original ro,
+   delegate = rw self-bind; no stacked mounts, no shared-superblock flips):
+   `mount --bind /sys/fs/cgroup /sys/fs/cgroup && mount -o remount,bind,rw /sys/fs/cgroup && mkdir -p /sys/fs/cgroup/acp-delegate && chown 1000:1000 /sys/fs/cgroup/acp-delegate && echo 1 > /sys/fs/cgroup/acp-delegate/cgroup.procs && umount /sys/fs/cgroup && mount --bind /sys/fs/cgroup/acp-delegate /sys/fs/cgroup/acp-delegate && mount -o remount,bind,rw /sys/fs/cgroup/acp-delegate && exec /init gateway run`
+   Ordering is load-bearing: the temporary parent self-bind exists ONLY for
+   the `mkdir` (the one operation that DOES need a rw parent); it is unmounted
+   BEFORE the delegate bind is created, so no child is ever stacked under it
+   and the original ro parent mount reappears intact. PID 1 relocates into
+   the delegate before `/init` execs, so every container process — gateway,
+   mux, vendor children — is BORN inside it (§3 condition 2).
    With `HERMES_ANTIGRAVITY_ACP_CGROUP_ROOT=/sys/fs/cgroup/acp-delegate`.
+   Pre-flight inside the entrypoint after setup: `findmnt /sys/fs/cgroup -o
+   OPTIONS | grep -qw ro && findmnt -T /sys/fs/cgroup/acp-delegate -o OPTIONS
+   | grep -qw rw` — else abort.
 2. Gate attestation (inside canary, as hermes uid 1000):
    `python -c "from cgroup_containment import delegated_root; print(delegated_root())"`
    must print the root — else STOP (fail-closed, §6).
@@ -214,10 +222,16 @@ tree + rw delegate subtree + env var), removed entirely afterwards.
    its removal by the ladder); `acp-delegate` itself legitimately persists
    and holds the relocated container processes; sibling cgroups (other
    containers, host services) untouched.
-6. Teardown canary: `docker compose -p nous-hermes-acp-canary down` + delete
+6. **Lifecycle-parity verification** (turns §4's systemd/Docker assumptions
+   into evidence): `docker stats --no-stream hermes-acp-canary` reports
+   non-zero CPU/mem (recursive aggregation across the relocated tree), then
+   `docker stop hermes-acp-canary` completes within `stop_grace_period` with
+   the ENTIRE subtree (delegate children included) gone afterwards — no
+   orphaned processes under the canary's scope path on the host.
+7. Teardown canary: `docker compose -p nous-hermes-acp-canary down` + delete
    the copy dirs. No production artifact touched at any step.
 
-**Canary success criteria = steps 2–5 all PASS with zero nonce residue.
+**Canary success criteria = steps 2–6 all PASS with zero nonce residue.
 Anything else = FAIL/NOT RUN → Gate B stays NO-GO; production untouched.**
 
 ## 6. Fail-closed criteria (already enforced by the seam itself)
@@ -238,22 +252,35 @@ Anything else = FAIL/NOT RUN → Gate B stays NO-GO; production untouched.**
 
 ```sh
 set -eu
+# (1) STOP THE HELPER FIRST: an event-triggered unit would otherwise re-run
+#     the delegation the moment anything re-triggers its start event.
+systemctl disable --now acp-cgroup-delegate.service
 CID=$(docker inspect -f '{{.Id}}' hermes)
 PID=$(docker inspect -f '{{.State.Pid}}' hermes)
 S="/sys/fs/cgroup/system.slice/docker-${CID}.scope"
-# move the container's processes back to the scope root (root may do this),
-nsenter -t "$PID" -m -- umount /sys/fs/cgroup/acp-delegate || true
+# (2) VERIFIED unmount of the delegate bind — no '|| true': if the kill
+#     switch cannot be pulled, rollback STOPS loudly (fail closed) instead
+#     of leaving an env-configured root writable and claiming success.
+nsenter -t "$PID" -m -- umount /sys/fs/cgroup/acp-delegate
+nsenter -t "$PID" -m -- mountpoint -q /sys/fs/cgroup/acp-delegate \
+  && { echo "ROLLBACK INCOMPLETE: delegate bind still mounted"; exit 1; }
+# (3) move the container's processes back to the scope root (root may do
+#     this), then remove the now-empty delegate dir.
 while read -r p; do echo "$p" > "$S/cgroup.procs"; done < "$S/acp-delegate/cgroup.procs"
 rmdir "$S/acp-delegate"   # refuses non-empty; residue stays visible
-systemctl disable --now acp-cgroup-delegate.service
 ```
 
-Plus: remove `HERMES_ANTIGRAVITY_ACP_CGROUP_ROOT` from compose at the next
-approved recreate window — but the env var alone is inert immediately once
-the delegate bind is gone (gate → `UNKNOWN`), so **the umount above is the
-effective kill switch and needs NO container restart**. The seam writes no
-state; rollback cannot orphan anything the seam created (nonce dirs are
-removed by teardown or left visible as logged residue).
+If step (2) fails, the delegate bind remains and the seam may still see a
+usable root — that is a KNOWN, LOUD rollback-incomplete state: leave the
+env var REMOVED (next recreate → gate `None` → UNKNOWN regardless) and
+investigate the mount state (`findmnt`) before retrying. Removing
+`HERMES_ANTIGRAVITY_ACP_CGROUP_ROOT` from compose at the next approved
+recreate window is the belt-and-braces second switch; when the unmount
+succeeds, the umount alone is the effective kill switch and needs NO
+container restart (the gate sees the root vanish → `UNKNOWN` on the very
+next spawn). The seam writes no state; rollback cannot orphan anything the
+seam created (nonce dirs are removed by teardown or left visible as logged
+residue).
 
 ## 8. Open decision for the operator (exactly one)
 
