@@ -48,6 +48,7 @@ import os
 import signal
 import subprocess
 import time
+from typing import Literal
 
 logger = logging.getLogger(__name__)
 
@@ -70,43 +71,101 @@ _NON_REAPING_SUPPORTED = (
     and hasattr(os, "WNOWAIT")
     and hasattr(os, "WEXITED")
     and hasattr(os, "P_PID")
+    and hasattr(os, "CLD_KILLED")
+    and hasattr(os, "CLD_DUMPED")
 )
 
+# Runtime kill-switch: a platform that EXPOSES the waitid symbols but
+# FAILS the call (EINVAL/ENOSYS at runtime) permanently degrades to the
+# poll() fallback on first failure; see ``_non_reaping_probe``.
+_non_reaping_enabled = True
 
-def proc_dead_unreaped(proc: subprocess.Popen) -> bool:
-    """Liveness check that NEVER reaps (issue #25 reaped-leader boundary).
+_FALLBACK: Literal["fallback"] = "fallback"
+_ALREADY_REAPED: Literal["reaped"] = "reaped"
 
-    The warm pool must decide liveness without destroying the ownership
-    evidence a later ``terminate_process_tree`` needs: ``Popen.poll()``
-    reaps, and a reaped group leader makes PID/PGID ownership unverifiable
-    forever (issue #23 guard), which strands same-group descendants.
 
-    POSIX: ``waitid(P_PID, WEXITED | WNOWAIT | WNOHANG)`` reports a
-    dead-but-unreaped child while the zombie leader keeps the group
-    resolvable, so the teardown can still capture ownership and sweep.
-    ``WNOWAIT`` is a ``waitid``-only flag — the legacy ``waitpid`` family
-    rejects it with ``EINVAL`` — hence ``os.waitid``.  Where non-reaping
-    waits are unavailable (Windows, or a POSIX build without these flags)
-    this falls back to ``poll()`` and the caller inherits the legacy
-    reaping semantics, identical to the pre-fix behavior; no Windows
-    behavior changes here.
+def _non_reaping_probe(proc: subprocess.Popen):
+    """One non-reaping WEXITED probe, or a sentinel telling the caller to
+    use the legacy ``poll()`` semantics / that the child was reaped.
 
-    This function only ever reports liveness: it must never set
-    ``returncode`` nor consume the child's exit status.
+    Never raises.  An unexpected ``OSError`` from a present-but-broken
+    ``waitid`` disables the non-reaping path process-wide (sticky) and
+    logs once, because the caller must then knowingly accept the reaping
+    fallback rather than crash.
     """
-    if proc.returncode is not None:
-        return True
-    if not _NON_REAPING_SUPPORTED:
-        return proc.poll() is not None
+    global _non_reaping_enabled
+    if not (_NON_REAPING_SUPPORTED and _non_reaping_enabled):
+        return _FALLBACK
     try:
-        result = os.waitid(
+        return os.waitid(
             os.P_PID, proc.pid, os.WEXITED | os.WNOWAIT | os.WNOHANG
         )
     except ChildProcessError:
-        # Already reaped elsewhere: dead, and ownership is unverifiable —
-        # the conservative teardown guard applies downstream.
+        return _ALREADY_REAPED
+    except OSError as exc:
+        if _non_reaping_enabled:
+            _non_reaping_enabled = False
+            logger.warning(
+                "ACP non-reaping waitid failed (%s); permanently falling "
+                "back to poll() semantics, which REAP the direct child "
+                "(tree guarantees degrade as documented for the legacy path)",
+                exc,
+            )
+        return _FALLBACK
+
+
+def proc_dead_unreaped(proc: subprocess.Popen) -> bool:
+    """Liveness check for lifecycle seams that hand off to teardown.
+
+    Supported POSIX path: ``waitid(P_PID, WEXITED | WNOWAIT | WNOHANG)``
+    reports a dead-but-unreaped child WITHOUT reaping and WITHOUT setting
+    ``returncode``, so the zombie leader keeps group ownership resolvable
+    and ``terminate_process_tree`` can still capture ownership and sweep.
+    ``WNOWAIT`` is a ``waitid``-only flag — the legacy ``waitpid`` family
+    rejects it with ``EINVAL``.
+
+    Legacy fallback (Windows, POSIX builds missing the flags, or a runtime
+    ``waitid`` failure): delegates to ``poll()``, which REAPS and sets
+    ``returncode`` — the pre-existing semantics, unchanged, with the same
+    pre-existing tree-guarantee degradation (issue #23 guard).  The
+    "never reaps" property holds ONLY on the supported path and callers
+    on the fallback must not assume ownership survives the check.
+    """
+    if proc.returncode is not None:
         return True
-    return result is not None
+    probe = _non_reaping_probe(proc)
+    if probe is _ALREADY_REAPED:
+        # Dead, and ownership is unverifiable — the conservative teardown
+        # guard applies downstream.
+        return True
+    if probe is _FALLBACK:
+        return proc.poll() is not None
+    return probe is not None
+
+
+def proc_exit_status_unreaped(proc: subprocess.Popen) -> int | None:
+    """Exit status of a dead child WITHOUT consuming it (supported path).
+
+    Mirrors ``Popen.returncode`` semantics (``-signal`` for signal death)
+    so early-exit diagnostics keep their exact message and trace shape
+    while leaving the zombie — and therefore group ownership — intact for
+    the teardown that follows.  ``None`` means the status is not (yet)
+    observable without reaping; callers must treat it as unknown, never
+    as zero.  On the legacy fallback this is ``poll()`` — reaping, with
+    the same documented degradation as ``proc_dead_unreaped``.
+    """
+    if proc.returncode is not None:
+        return proc.returncode
+    probe = _non_reaping_probe(proc)
+    if isinstance(probe, str):
+        if probe == _ALREADY_REAPED:
+            return None
+        return proc.poll()
+    if probe is None:
+        return None
+    if probe.si_code in (os.CLD_KILLED, os.CLD_DUMPED):
+        return -probe.si_status
+    return probe.si_status
 
 
 def _group_id_if_resolvable(proc: subprocess.Popen) -> int | None:

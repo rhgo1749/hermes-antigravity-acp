@@ -230,6 +230,157 @@ def test_warm_park_corpse_handoff_sweeps_descendants(monkeypatch, tmp_path):
         tree.cleanup()
 
 
+# ---------------------------------------------------------------------------
+# 4. Reviewer BLOCKER R1: the remaining _session lifecycle seams
+#    (request wait loop, early-exit diagnostics, finally dispose) must
+#    also hand the tree teardown an UNREAPED leader, and the exit-status
+#    diagnostics must obtain codes without consuming them.
+# ---------------------------------------------------------------------------
+
+EXIT_SRC = """
+import sys
+sys.exit(7)
+"""
+
+SLEEP_SRC = """
+import time
+time.sleep(120)
+"""
+
+
+def _spawn(tmp_path, name, src):
+    script = tmp_path / f"{name}.py"
+    script.write_text(src)
+    return subprocess.Popen([sys.executable, str(script)],
+                            start_new_session=True)
+
+
+def test_exit_status_helper_reports_code_without_reaping(tmp_path):
+    proc = _spawn(tmp_path, "exit7", EXIT_SRC)
+    assert _wait(lambda: teardown.proc_dead_unreaped(proc), 10)
+    assert teardown.proc_exit_status_unreaped(proc) == 7
+    assert proc.returncode is None, "exit-status probe must not reap"
+    assert os.getpgid(proc.pid) == proc.pid
+    # Ownership survives the probe: the teardown can still verify+sweep+reap.
+    assert teardown.terminate_process_tree(proc) is True
+    assert proc.returncode == 7
+
+
+def test_exit_status_helper_matches_popen_signal_semantics(tmp_path):
+    proc = _spawn(tmp_path, "sleepy", SLEEP_SRC)
+    time.sleep(0.3)
+    proc.kill()
+    assert _wait(lambda: teardown.proc_dead_unreaped(proc), 10)
+    assert teardown.proc_exit_status_unreaped(proc) == -9, (
+        "signal death must mirror Popen.returncode semantics (-signal)"
+    )
+    teardown.terminate_process_tree(proc)
+
+
+def test_exit_status_probe_feeds_tree_sweep_with_descendants(tmp_path):
+    # The early-exit diagnostic position: probe the code, keep ownership,
+    # then the same-group descendant must still be swept by the teardown.
+    tree = _Tree(tmp_path, "diag-sweep")
+    try:
+        victim = tree.desc_pid
+        tree.kill_leader()
+        assert _wait(lambda: teardown.proc_dead_unreaped(tree.proc), 10)
+        code = teardown.proc_exit_status_unreaped(tree.proc)
+        assert code == -9
+        assert teardown.terminate_process_tree(tree.proc) is True
+        assert _wait(lambda: not _alive(victim), 15)
+    finally:
+        tree.cleanup()
+
+
+def test_runtime_waitid_failure_falls_back_and_is_sticky(tmp_path, monkeypatch):
+    monkeypatch.setattr(teardown, "_non_reaping_enabled", True)
+    real_waitid = os.waitid
+
+    def broken_waitid(*args, **kwargs):
+        raise OSError(22, "EINVAL")
+
+    proc = _spawn(tmp_path, "rtfail", SLEEP_SRC)
+    try:
+        monkeypatch.setattr(os, "waitid", broken_waitid)
+        assert teardown.proc_dead_unreaped(proc) is False  # via poll fallback
+        assert teardown._non_reaping_enabled is False, (
+            "an OSError from a present waitid symbol must permanently "
+            "degrade to the documented poll() semantics, not crash"
+        )
+        proc.kill()
+        assert _wait(lambda: teardown.proc_dead_unreaped(proc), 10)
+        assert proc.returncode is not None, (
+            "the fallback reaps — the contract must state this, not hide it"
+        )
+    finally:
+        monkeypatch.setattr(os, "waitid", real_waitid)
+        monkeypatch.setattr(teardown, "_non_reaping_enabled", True)
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=5)
+
+
+def test_fallback_path_reaps_by_contract(tmp_path, monkeypatch):
+    # Requirement: the legacy fallback's reaping must be explicit, not
+    # papered over by the "never reaps" wording of the supported path.
+    monkeypatch.setattr(teardown, "_NON_REAPING_SUPPORTED", False)
+    proc = _spawn(tmp_path, "fb", SLEEP_SRC)
+    proc.kill()
+    assert _wait(lambda: teardown.proc_dead_unreaped(proc), 10)
+    assert proc.returncode is not None, (
+        "fallback = poll() = reaping; documented degradation"
+    )
+
+
+def test_release_process_after_non_reaping_detection_sweeps_descendants(
+    monkeypatch, tmp_path
+):
+    # The _session finally dispose position, driven through the REAL
+    # _release_process -> terminate_process_tree path.
+    _facade, client, _module = _load(monkeypatch)
+    tree = _Tree(tmp_path, "finally-close")
+    try:
+        victim = tree.desc_pid
+        tree.kill_leader()
+        assert _wait(lambda: teardown.proc_dead_unreaped(tree.proc), 10)
+        client._release_process(tree.proc)
+        assert _wait(lambda: not _alive(victim), 20), (
+            "non-reaping detection at the finally seam must let the real "
+            "release path sweep the same-group descendant"
+        )
+    finally:
+        tree.cleanup()
+
+
+def test_release_process_after_poll_reap_loses_descendants(
+    monkeypatch, tmp_path
+):
+    # Permanent gap evidence at the finally position on the OLD pattern.
+    _facade, client, _module = _load(monkeypatch)
+    tree = _Tree(tmp_path, "finally-gap")
+    try:
+        victim = tree.desc_pid
+        tree.kill_leader()
+        assert _wait(lambda: tree.proc.poll() is not None, 10)  # the bug
+        client._release_process(tree.proc)
+        time.sleep(0.5)
+        assert _alive(victim), "gap: poll-reaped leader strands the descendant"
+    finally:
+        tree.cleanup()
+
+
+def test_session_lifecycle_seams_use_the_non_reaping_primitive(monkeypatch):
+    _facade, client, _module = _load(monkeypatch)
+    cls = type(client)
+    src = inspect.getsource(cls._session.__wrapped__)
+    assert ".poll()" not in src, "_session still reaps with poll()"
+    assert "proc_dead_unreaped" in src
+    assert "proc_exit_status_unreaped" in src, (
+        "early-exit exit-code diagnostics must not consume the status"
+    )
+
+
 def test_warm_park_sweep_terminates_dead_parked_sibling_untouched(
     monkeypatch, tmp_path
 ):
