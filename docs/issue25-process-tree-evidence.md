@@ -42,7 +42,10 @@ the mux. `terminate_process_tree` (plugin side) does group kill + verified
 sweep, and **refuses all group signalling once the leader was reaped**
 (PID/PGID-reuse guard; issue #23 contract).
 
-Live (read-only, 2026-11-17 20:19 KST, 7 trees): every `agy_acp_server.par`
+Live (read-only, 2026-11-17 20:19 KST, 8 vendor trees — 12053, 82578,
+87446, 95069, 96104, 96482, 101014, 101102; one extra `mux.py`-matching
+shell pipeline entry from the audit itself is excluded as a non-vendor
+transient): every `agy_acp_server.par`
 and every `localharness_external` has `PGID == SID == mux PID` — no setsid
 escape observed in vendor 1.4.4. 4 mux trees are orphaned (`ppid=0`, plugin
 client died; whole tree survives together).
@@ -72,7 +75,7 @@ detach or spontaneous parent exit; not extended here.
   `_terminate_parked` → `terminate_process_tree` then **must refuse** the
   group signal. A hung vendor (or any surviving descendant) then keeps the
   tree alive with no permitted teardown path. Mechanism confirmed in code;
-  no such tree observed alive at audit time (all 7 trees intact or orphaned
+  no such tree observed alive at audit time (all 8 trees intact or orphaned
   whole).
 * Orphaned mux trees (`ppid=0`) show the adjacent already-realized path:
   plugin death leaves full trees running; with the deployed lease-less mux
@@ -89,9 +92,14 @@ ACK requires ALL of:
    descendants are proven by contract + attestation to always die with the
    direct child (no such contract exists).
 3. A teardown path that still reaches descendants after the group leader
-   was reaped (e.g. Linux `pidfd_open`-anchored ownership, which removes the
-   PID/PGID-reuse refusal), or proof that no lifecycle path reaps the leader
-   before sweeping — the warm-pool `poll()` path currently refutes that.
+   was reaped. Closing this needs EITHER a non-reaping liveness path that
+   preserves verifiable ownership/containment before any reap, OR a
+   containment/ownership primitive stronger than process groups (Linux
+   `pidfd` stabilizes task identity but alone grants no descendant
+   containment and does not auto-own/enumerate a surviving group whose
+   leader was already terminated and reaped).  Alternatively, proof that
+   no lifecycle path reaps the leader before sweeping — the warm-pool
+   `poll()` path currently refutes that.
 4. Live attestation loop: after each lane close, zero descendant processes
    with open store fds survive the grace window.
 
@@ -100,9 +108,11 @@ lease alone must never ACK.
 
 ## 6. Next minimal actions (NOT executed in this slice)
 
-1. Candidate boundary closure (separate, minimal, reviewable): anchor
-   teardown ownership with `pidfd` on Linux so the reaped-leader refusal
-   path can still sweep its own tree; do NOT expand into the warm-pool
-   global-cap refactor here.
+1. Boundary closure requirement (NOT an implementation decision, and not
+   implemented in this PR): closing the reaped-leader refusal path needs
+   either a non-reaping liveness path that preserves verifiable
+   ownership/containment before any reap, or a containment/ownership
+   primitive stronger than process groups.  Do NOT expand into the
+   warm-pool global-cap refactor here.
 2. Redeploy the audited mux build (drift closure) — separate approval.
 3. Independent re-review of this evidence via WebGPT task.

@@ -8,11 +8,14 @@ Question this file answers with executable evidence, not estimation:
 
 Fidelity contract: the REAL mux (``scripts/acp_mux.py``) runs against a
 credential-free fake vendor that spawns credential-free fake descendants.
-The vendor descendant spawn mirrors the vendor's observed behavior:
-``subprocess`` default ``close_fds=True`` — descendants hold NO lease fd —
-and (configurably) no descendant teardown on vendor exit.  Live 1.4.4
-observations (issue #25 read-only audit) show descendants staying inside
-the mux's process group/session; the fake trees mirror that.
+The descendant model is an ADMISSIBLE safety counterexample — behavior no
+contract forbids — not a claim about observed vendor 1.4.4 teardown
+behavior: ``subprocess`` default ``close_fds=True`` (descendants hold no
+lease fd) and (configurably) no descendant teardown on vendor exit.  What
+live 1.4.4 observation (issue #25 read-only audit) actually established is
+only that descendants were inside the mux's PGID/SID; there is NO live
+proof that descendants survive the direct child's exit, and none is
+claimed here.
 
 What the tests establish:
 
@@ -400,9 +403,10 @@ def test_plugin_group_teardown_reaches_same_group_descendant(trees):
     verified = teardown.terminate_process_tree(tree.proc, graceful_stdin=True)
     assert verified is True, "tree sweep must be verified, not assumed"
     assert _wait(lambda: all(not _alive(p) for p in harnesses), 15), (
-        "group kill + sweep reaches same-group descendants (live 1.4.4 "
-        "trees keep descendants in the mux group; this control shows the "
-        "protection comes from the plugin's tree teardown, not the lease)"
+        "group kill + sweep reaches same-group descendants (the live 1.4.4 "
+        "audit observed descendants inside the mux group; this control shows "
+        "that where that containment holds, the protection comes from the "
+        "plugin's tree teardown, not the lease)"
     )
     assert tree.lease_state() != "live"
 
