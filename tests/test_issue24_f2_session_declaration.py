@@ -427,6 +427,11 @@ def test_declaration_never_overrides_checkpoint_protection(lanes):
 def test_inventory_and_dry_run_perform_zero_deletions(lanes, tmp_path):
     a, _b, state_file = lanes
     now = time.time()
+    # F3: cleared (stale) lease so this lane's candidates stay visible; the
+    # point of the test is that even visible candidates delete nothing.
+    lease = Path(mux._lane_lease_path(str(a), "lane-alpha"))
+    lease.parent.mkdir(parents=True, exist_ok=True)
+    lease.write_text(json.dumps({"at": 0.0, "mux_pid": 1}))
     _checkpoints(state_file, [], now=now)
     bundles = [
         _bundle(a, sid, mtime=now - 40 * DAY)  # expired under current policy

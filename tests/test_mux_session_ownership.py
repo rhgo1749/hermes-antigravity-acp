@@ -213,6 +213,12 @@ def test_unknown_resume_never_reaches_fake_server(lanes, tmp_path, entrypoint):
 def test_gc_reads_checkpoint_after_acquiring_gc_lock(lanes, monkeypatch):
     observed = []
     snapshot_called = threading.Event()
+    # F3: the GC only walks lanes with positively-cleared (stale) leases.
+    for home in lanes:
+        lease = Path(mux._lane_lease_path(str(home), home.name))
+        lease.parent.mkdir(parents=True, exist_ok=True)
+        lease.write_text(json.dumps({"at": 0.0, "mux_pid": 1}))
+
     def active(*, now=None, env=None):
         snapshot_called.set()
         return {SID}

@@ -75,9 +75,22 @@ def _inventory(state_file: Path, *, now: float) -> dict:
     })
 
 
+def _clear_lease(home: Path, label: str) -> None:
+    """Seed a positively-cleared (stale) lane lease.
+
+    Since issue #24 F3 the GC and the inventory protect any lane whose lease
+    is not stale; these tests exercise candidate computation and GC parity,
+    so their lanes must carry cleared lease evidence.
+    """
+    path = Path(mux._lane_lease_path(str(home), label))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"at": 0.0, "mux_pid": 1}))
+
+
 def test_inventory_counts_protection_linkage_and_candidates(lanes):
     a, _b, state_file = lanes
     now = time.time()
+    _clear_lease(a, "lane-alpha")
     _bundle(a, SID_OLD, mtime=now - 72 * 3600)
     _bundle(a, SID_FRESH, mtime=now - 60)
     _bundle(a, SID_PROTECTED, mtime=now - 72 * 3600)
@@ -111,6 +124,7 @@ def test_inventory_counts_protection_linkage_and_candidates(lanes):
 def test_inventory_never_calls_the_deleter(lanes, monkeypatch):
     a, _b, state_file = lanes
     now = time.time()
+    _clear_lease(a, "lane-alpha")
     stale = _bundle(a, SID_OLD, mtime=now - 72 * 3600)
     fresh = _bundle(a, SID_FRESH, mtime=now - 60)
 
@@ -127,6 +141,7 @@ def test_inventory_never_calls_the_deleter(lanes, monkeypatch):
 def test_inventory_candidates_match_the_gc_outcome(lanes, monkeypatch):
     a, _b, state_file = lanes
     now = time.time()
+    _clear_lease(a, "lane-alpha")
     old = _bundle(a, SID_OLD, mtime=now - 72 * 3600)
     _bundle(a, SID_FRESH, mtime=now - 60)
     _checkpoints(state_file, [], now=now)
@@ -145,6 +160,7 @@ def test_inventory_candidates_match_the_gc_outcome(lanes, monkeypatch):
 def test_capacity_candidates_are_predicted_without_deletion(lanes, monkeypatch):
     a, _b, state_file = lanes
     now = time.time()
+    _clear_lease(a, "lane-alpha")
     older = _bundle(a, SID_OLD, mtime=now - 3 * 3600)
     newer = _bundle(a, SID_FRESH, mtime=now - 2 * 3600)
     _checkpoints(state_file, [], now=now)
@@ -226,6 +242,7 @@ def test_report_never_leaks_identifiers_labels_or_paths(lanes):
 def test_cli_inventory_prints_json_and_exits_zero(lanes, monkeypatch):
     a, _b, state_file = lanes
     now = time.time()
+    _clear_lease(a, "lane-alpha")
     stale = _bundle(a, SID_OLD, mtime=now - 72 * 3600)
     _checkpoints(state_file, [], now=now)
 
@@ -414,17 +431,18 @@ def test_inventory_lock_appeared_mid_scan_is_incomplete(lanes, monkeypatch):
     """P2: absent-bracket proof fails if a GC pass starts during the walk."""
     a, _b, state_file = lanes
     now = time.time()
+    _clear_lease(a, "lane-alpha")
     _bundle(a, SID_OLD, mtime=now - 72 * 3600)
     _checkpoints(state_file, [], now=now)
     lock_path = Path(mux.STATE_PATH + ".session-gc.lock")
     real = mux._lane_inventory
     fired = {"done": False}
 
-    def spy(lane, home, active, owners, *, now):
+    def spy(lane, home, active, owners, *, now, lease_state):
         if not fired["done"]:
             fired["done"] = True
             lock_path.write_text("")  # simulate a GC pass starting mid-scan
-        return real(lane, home, active, owners, now=now)
+        return real(lane, home, active, owners, now=now, lease_state=lease_state)
 
     monkeypatch.setattr(mux, "_lane_inventory", spy)
 

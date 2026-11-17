@@ -52,6 +52,12 @@ Environment:
   ACP_MUX_OWNER_GRACE_SECONDS  minimum age before an ownership record whose
                           native bundle and checkpoint are both gone may be
                           retired; defaults to the affinity retention TTL
+  ACP_MUX_LEASE_GRACE_SECONDS  issue #24 F3: how long a lane stays protected
+                          from the native GC after its last lease holder
+                          died (kernel-released flock) with no newer
+                          heartbeat; defaults to the owner grace.  A lane
+                          lease is taken automatically whenever flock is
+                          available; there is no opt-out, only this window.
   ACP_MUX_SESSION_ORIGIN  optional per-connection session-class declaration
                           stamped into the owner record at session/new
                           (issue #24 F2); strict enum agent|backend, any
@@ -277,6 +283,16 @@ OWNER_GRACE_SECONDS = _configured_positive_int(
     "ACP_MUX_OWNER_GRACE_SECONDS",
     "HERMES_ANTIGRAVITY_ACP_OWNER_GRACE_SECONDS",
     _DEFAULT_AFFINITY_TTL_SECONDS,
+)
+
+# Issue #24 F3: after the last holder of a lane lease dies (the kernel
+# releases its flock automatically), the lane stays protected until its last
+# heartbeat ages past this window: the late-completion / crash-recovery
+# margin.  Deliberately as conservative as the owner grace by default.
+LEASE_GRACE_SECONDS = _configured_positive_int(
+    "ACP_MUX_LEASE_GRACE_SECONDS",
+    "HERMES_ANTIGRAVITY_ACP_LEASE_GRACE_SECONDS",
+    OWNER_GRACE_SECONDS,
 )
 
 # Issue #24 F2: the only values an origin/lifecycle declaration may hold.
@@ -788,6 +804,163 @@ def _session_gc_lock_probe() -> Iterator[str]:
         os.close(fd)
 
 
+# --- Issue #24 F3: per-lane process leases --------------------------------
+# A mux that binds a lane takes a SHARED flock on that lane's lease file and
+# holds it for the lifetime of its official ACP child.  Consumers (the native
+# GC and the read-only inventory) probe with a non-blocking EXCLUSIVE lock:
+# contention proves a live holder, and the kernel releases the lock
+# automatically when a holder dies (crash, kill, or restart), so no pid
+# liveness heuristics or process start-time comparisons are needed.  A lane
+# is reclaimable only from the single "stale" state; every other state —
+# including a missing or unreadable lease file — is protected.  That is
+# deliberate fail-closed behavior: an old mux build that never writes a lease
+# keeps its lane protected rather than exposed.
+
+
+def _lane_lease_path(home: str, label: str) -> str:
+    normalized = os.path.abspath(os.path.expanduser(str(home)))
+    digest = _lane_fingerprint(normalized, str(label))
+    return os.path.join(STATE_PATH + ".leases", digest + ".lease")
+
+
+def _lane_lease_state(home: str, label: str, *, now: float) -> str:
+    """Classify one lane's lease; creates and mutates nothing.
+
+    Returns one of: ``live`` (lock contention proves a holder), ``grace``
+    (no holder, heartbeat within the grace window), ``stale`` (no holder and
+    the heartbeat is older than the grace: the only unprotected state),
+    ``absent`` (no lease file: unknown evidence, protected), ``unsupported``
+    (no flock primitive), or ``unavailable`` (unreadable or corrupt lease:
+    fail closed).
+    """
+    if fcntl is None or not hasattr(os, "O_NOFOLLOW"):
+        return "unsupported"
+    path = _lane_lease_path(home, label)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return "absent"
+    except OSError:
+        return "unavailable"
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return "live"
+        try:
+            # The exclusive probe is held: shared holders cannot be writing,
+            # so a single read is whole-file by construction.
+            data = json.loads(os.read(fd, 65536).decode("utf-8"))
+            at = data.get("at") if isinstance(data, dict) else None
+            if (
+                isinstance(at, bool)
+                or not isinstance(at, (int, float))
+                or not math.isfinite(at)
+            ):
+                return "unavailable"
+        except (OSError, ValueError, TypeError, UnicodeError):
+            return "unavailable"
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+    finally:
+        os.close(fd)
+    return "grace" if at + LEASE_GRACE_SECONDS > now else "stale"
+
+
+def _lane_lease_protected(state: str) -> bool:
+    """True unless the lease is positively cleared (``stale``)."""
+    return state != "stale"
+
+
+def _lane_lease_states_aggregate(states: list[str]) -> str:
+    """Worst (most protected) state across every label registered for a home."""
+    for token in ("live", "grace", "absent", "unsupported", "unavailable"):
+        if token in states:
+            return token
+    return "stale"
+
+
+class _LaneLease:
+    """Hold a shared lane lease for the lifetime of one official ACP child.
+
+    The lock is released by ``close()`` on orderly teardown and by the kernel
+    on process death; both leave the recorded heartbeat behind so consumers
+    can apply the grace window.
+    """
+
+    def __init__(self, home: str, label: str) -> None:
+        if fcntl is None or not hasattr(os, "O_NOFOLLOW"):
+            raise OSError("flock is not supported on this platform")
+        self._path = _lane_lease_path(home, label)
+        self._fd = -1
+        directory = os.path.dirname(self._path)
+        try:
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+            self._fd = os.open(
+                self._path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600
+            )
+            os.fchmod(self._fd, 0o600)
+            # A shared lock only contends with the brief exclusive probes
+            # the GC and the inventory take; retry briefly instead of
+            # refusing a bind because a census happened to be passing.
+            deadline = time.monotonic() + 5.0
+            while True:
+                try:
+                    fcntl.flock(self._fd, fcntl.LOCK_SH)
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.1)
+            self.touch()
+        except OSError:
+            self.close()
+            raise
+
+    def touch(self) -> None:
+        """Record the latest first-hand activity for the post-death grace."""
+        if self._fd < 0:
+            return
+        payload = json.dumps({"at": time.time(), "mux_pid": os.getpid()}).encode()
+        os.ftruncate(self._fd, 0)
+        os.lseek(self._fd, 0, os.SEEK_SET)
+        os.write(self._fd, payload)
+
+    def close(self) -> None:
+        if self._fd >= 0:
+            if fcntl is not None:
+                try:
+                    fcntl.flock(self._fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            try:
+                os.close(self._fd)
+            except OSError:
+                pass
+            self._fd = -1
+
+
+def _registry_lane_labels(
+    default_home: str, entries: list[dict] | None
+) -> dict[str, set[str]]:
+    """Map every candidate store home to the lane labels registered for it."""
+    lane_labels: dict[str, set[str]] = {}
+    lane_labels.setdefault(
+        os.path.abspath(os.path.expanduser(default_home)), set()
+    ).add("default")
+    for entry in entries or []:
+        home, label, _priority, _key = _account(entry, default_home)
+        if home:
+            lane_labels.setdefault(
+                os.path.abspath(os.path.expanduser(home)), set()
+            ).add(label)
+    return lane_labels
+
+
 def _ownership_accounts() -> list[tuple[str, str, str]] | None:
     """Return distinct registered lanes, refusing aliases or invalid registry entries."""
     entries, meta, problem = _load_registry_data()
@@ -1024,6 +1197,22 @@ class _SessionOwnerRelay:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._new_requests: set = set()
+        # Issue #24 F3: the bound lane's lease, attached after bind().  Every
+        # completed request is first-hand lane activity and refreshes the
+        # lease heartbeat that governs the post-death grace window.
+        self._lease: _LaneLease | None = None
+
+    def attach_lease(self, lease: _LaneLease | None) -> None:
+        self._lease = lease
+
+    def _heartbeat(self) -> None:
+        lease = self._lease
+        if lease is None:
+            return
+        try:
+            lease.touch()
+        except OSError:
+            pass  # lease already closed during teardown: nothing to record
 
     @staticmethod
     def _error(request_id: object, message: str) -> str:
@@ -1059,6 +1248,7 @@ class _SessionOwnerRelay:
         request_id = payload.get("id")
         if not isinstance(request_id, (int, str)) or isinstance(request_id, bool):
             return line
+        self._heartbeat()
         with self._lock:
             if request_id not in self._new_requests:
                 return line
@@ -1494,13 +1684,10 @@ def prune_session_stores(*, now: float | None = None) -> dict[str, int] | None:
     now = time.time() if now is None else now
     entries, meta, _problem = _load_registry_data()
     default_home, _explicit = _effective_default_home(meta)
-    homes = {os.path.abspath(os.path.expanduser(default_home))}
-    for entry in entries:
-        home, _label, _priority, _key = _account(entry, default_home)
-        if home:
-            homes.add(os.path.abspath(os.path.expanduser(home)))
+    lane_labels = _registry_lane_labels(default_home, entries)
 
     totals = {"expired": 0, "capacity": 0, "bytes": 0, "failed": 0}
+    lease_protected_lanes = 0
     with _session_gc_lock() as locked:
         if not locked:
             _log("session-gc skipped: cross-process lock unavailable")
@@ -1509,11 +1696,26 @@ def prune_session_stores(*, now: float | None = None) -> dict[str, int] | None:
         if active is None:
             _log("session-gc skipped: continuation checkpoint inventory unavailable")
             return None
-        for home in sorted(homes):
+        for home in sorted(lane_labels):
+            # Issue #24 F3: a store is skipped unless every registered lane
+            # for it is positively cleared (stale lease).  A live holder, a
+            # fresh post-death heartbeat, a missing lease file, or an
+            # unreadable one all keep the whole store untouched: a child
+            # process may hold any bundle in its own store open, and which
+            # ones is vendor-internal knowledge we never infer.
+            states = [
+                _lane_lease_state(home, label, now=now)
+                for label in sorted(lane_labels[home])
+            ]
+            if any(_lane_lease_protected(state) for state in states):
+                lease_protected_lanes += 1
+                continue
             result = _prune_session_store(home, active, now=now)
             for key in totals:
                 totals[key] += result[key]
 
+    if lease_protected_lanes:
+        _log(f"session-gc lease-protected-lanes={lease_protected_lanes}")
     if any(totals.values()):
         _log(
             "session-gc expired={expired} capacity={capacity} failed={failed} bytes={bytes}".format(
@@ -1558,7 +1760,8 @@ def _lane_bundle_bytes(store: Path, records: dict[str, dict]) -> int | None:
 
 
 def _lane_inventory(
-    lane: int, home: str, active: set[str], owners: dict[str, dict], *, now: float
+    lane: int, home: str, active: set[str], owners: dict[str, dict], *,
+    now: float, lease_state: str,
 ) -> dict:
     """Read-only per-lane bundle census; deletes nothing; reports no identifiers."""
     out: dict[str, Any] = {
@@ -1574,6 +1777,10 @@ def _lane_inventory(
         "gc_candidate_capacity": 0,
         "gc_candidate_bytes": 0,
         "unsafe": 0,
+        # Issue #24 F3: the lane's lease evidence token (never identifiers).
+        # A protected lane reports zero candidates so the dry-run prediction
+        # cannot drift from what prune_session_stores would actually touch.
+        "lease": lease_state,
         # Issue #24 F2: declared session classes of owner-linked bundles.
         # Classification evidence only — a bucket is never a reclamation
         # verdict (F3 leases and F4 budgets are separate phases).  Bundles
@@ -1618,11 +1825,16 @@ def _lane_inventory(
 
     out["bundles"] = len(records)
     out["bytes"] = _lane_bundle_bytes(store, records)
-    out["gc_candidate_expired"] = len(expired_set)
-    out["gc_candidate_capacity"] = len(capacity_set)
-    out["gc_candidate_bytes"] = _lane_bundle_bytes(
-        store, {sid: records[sid] for sid in expired_set | capacity_set}
-    )
+    lease_protected = _lane_lease_protected(lease_state)
+    if not lease_protected:
+        # Policy parity with prune_session_stores: a lease-protected store is
+        # skipped wholesale, so it can contribute no candidates at all.  The
+        # census itself (counts, bytes, buckets, linkage) stays reportable.
+        out["gc_candidate_expired"] = len(expired_set)
+        out["gc_candidate_capacity"] = len(capacity_set)
+        out["gc_candidate_bytes"] = _lane_bundle_bytes(
+            store, {sid: records[sid] for sid in expired_set | capacity_set}
+        )
     for session_id, record in records.items():
         if record["unsafe"]:
             out["unsafe"] += 1
@@ -1656,10 +1868,10 @@ def session_inventory(
     Deletes nothing and never will: this walks the same inventories and
     applies the same decision helpers as ``prune_session_stores`` and only
     reports what the opt-in native GC *would* select under current policy.
-    A candidate is NOT a reclamation verdict: the current GC has no process
-    lease and consults no origin/lifecycle declaration, so a candidate may
-    still belong to a live or parked ACP child (issue #24 C1/C4; F3/F4 are
-    separate phases).
+    A candidate is NOT a reclamation verdict: lane process leases (F3) are
+    consulted and lease-protected lanes report zero candidates, but no
+    bounded-deletion checks exist yet and lifecycle declarations are still
+    never consulted (issue #24 C1/C4; F4 is a separate phase).
 
     Privacy: raw session ids, account labels, homes, and paths never
     appear; lanes are positional indexes and every value is a count, a
@@ -1690,12 +1902,14 @@ def session_inventory(
             "ttl_seconds": AFFINITY_TTL_SECONDS,
             "cap_per_lane": AFFINITY_MAX_ENTRIES,
             "owner_grace_seconds": OWNER_GRACE_SECONDS,
+            "lease_grace_seconds": LEASE_GRACE_SECONDS,
         },
         "deletions_performed": 0,
         "reclaim_certainty": (
-            "gc_candidate_prediction_only; no process lease or "
-            "bounded-deletion checks exist yet and origin/lifecycle "
-            "declarations are never consulted (issue #24 C1-C4)"
+            "gc_candidate_prediction_only; lane process leases (F3) are "
+            "consulted, but no bounded-deletion checks exist yet and "
+            "lifecycle declarations are never consulted (issue #24 C1-C4; "
+            "F4 pending)"
         ),
         "lanes": [],
         "totals": {},
@@ -1717,11 +1931,7 @@ def session_inventory(
         if problem not in ("", "missing"):
             return _incomplete(f"registry-{problem}")
         default_home, _explicit = _effective_default_home(meta)
-        homes = {os.path.abspath(os.path.expanduser(default_home))}
-        for entry in entries or []:
-            home, _label, _priority, _key = _account(entry, default_home)
-            if home:
-                homes.add(os.path.abspath(os.path.expanduser(home)))
+        lane_labels = _registry_lane_labels(default_home, entries)
         active = _active_hermes_session_ids(now=now, env=env)
         if active is None:
             return _incomplete("checkpoint-inventory-unavailable")
@@ -1743,8 +1953,16 @@ def session_inventory(
             origin: {lifecycle: 0 for lifecycle in _SESSION_CLASS_MATRIX[1]}
             for origin in _SESSION_CLASS_MATRIX[0]
         }
-        for lane, home in enumerate(sorted(homes)):
-            lane_report = _lane_inventory(lane, home, active, owners, now=now)
+        lease_protected_lanes = 0
+        for lane, home in enumerate(sorted(lane_labels)):
+            lease_state = _lane_lease_states_aggregate([
+                _lane_lease_state(home, label, now=now)
+                for label in sorted(lane_labels[home])
+            ])
+            lease_protected_lanes += int(_lane_lease_protected(lease_state))
+            lane_report = _lane_inventory(
+                lane, home, active, owners, now=now, lease_state=lease_state
+            )
             report["lanes"].append(lane_report)
             if lane_report["status"] != "ok":
                 reasons.append(f"lane-{lane}-{lane_report['status']}")
@@ -1759,6 +1977,7 @@ def session_inventory(
                 for lifecycle, count in buckets.items():
                     totals_matrix[origin][lifecycle] += count
         totals["origin_lifecycle"] = totals_matrix
+        totals["lanes_lease_protected"] = lease_protected_lanes
         report["totals"] = totals
         if lock_state == "absent" and os.path.exists(_gc_lock_path()):
             # A GC or owner-prune pass started mid-walk (every pass creates
@@ -2404,6 +2623,7 @@ def main() -> int:
     upstream: subprocess.Popen[str] | None = None
     bound_home = ""
     bound_label = ""
+    lease: _LaneLease | None = None
     session_gc_run = False
     owner_prune_run = False
     pump_threads: list[threading.Thread] = []
@@ -2429,7 +2649,7 @@ def main() -> int:
             sys.stderr.flush()
 
     def bind(home: str, label: str, reason: str) -> bool:
-        nonlocal upstream, bound_home, bound_label
+        nonlocal upstream, bound_home, bound_label, lease
         env = dict(os.environ)
         env.pop("ACP_MUX_AFFINITY", None)
         env.pop("ACP_MUX_AFFINITY_PIN", None)
@@ -2448,6 +2668,18 @@ def main() -> int:
             _log(f"mcp-config-guard {label}: {violation}")
             _mark_failure(home, label, "mcp-config", violation)
             return False
+        # Issue #24 F3: take the lane lease before the child exists, so no
+        # official ACP process ever runs without lease evidence.  Where
+        # flock is unavailable (Windows) the native GC cannot run either
+        # (its lock is the same primitive), so there is nothing to protect
+        # against and no lease is possible; skip symmetrically.
+        new_lease: _LaneLease | None = None
+        if fcntl is not None:
+            try:
+                new_lease = _LaneLease(home, label)
+            except OSError as exc:
+                _log(f"lease-unavailable {label}: {exc}; refusing bind")
+                return False
         try:
             upstream = subprocess.Popen(
                 [PAR, "--uid="],
@@ -2460,7 +2692,11 @@ def main() -> int:
             )
         except OSError as exc:
             _log(f"spawn-failed {label}: {exc}")
+            if new_lease is not None:
+                new_lease.close()
             return False
+        lease = new_lease
+        owner_relay.attach_lease(new_lease)
         bound_home = home
         bound_label = label
         _log(f"bound account {label} ({reason}) pid={upstream.pid}")
@@ -2535,6 +2771,7 @@ def main() -> int:
                             "protected={checkpoint_protected} "
                             "owner-linked={owner_linked} "
                             "unowned={unowned_unprotected} "
+                            "lease-protected={lanes_lease_protected} "
                             "candidates-expired={gc_candidate_expired} "
                             "candidates-capacity={gc_candidate_capacity} "
                             "unsafe={unsafe} deletions=0".format(
@@ -2547,6 +2784,7 @@ def main() -> int:
                                         "checkpoint_protected",
                                         "owner_linked",
                                         "unowned_unprotected",
+                                        "lanes_lease_protected",
                                         "gc_candidate_expired",
                                         "gc_candidate_capacity",
                                         "unsafe",
@@ -2641,6 +2879,15 @@ def main() -> int:
                     "exit_code": upstream.returncode,
                 },
             )
+        if lease is not None:
+            # Orderly exit records a final heartbeat, then releases the
+            # lease: the lane stays protected through the same grace window
+            # a crash would leave, because the evidence is identical.
+            try:
+                lease.touch()
+            except OSError:
+                pass
+            lease.close()
     return 0
 
 

@@ -715,6 +715,15 @@ def test_official_mux_prunes_expired_sessions_and_keeps_resumable_ones(tmp_path)
     registry = tmp_path / "accounts.json"
     registry.write_text(json.dumps({"accounts": [{"home": str(home), "label": "test", "priority": 0}]}))
     mux_state = tmp_path / "mux-state.json"
+    # F3: the GC only walks lanes with positively-cleared (stale) leases.
+    # Path is built against the subprocess ACP_MUX_STATE, not this process's
+    # module-level STATE_PATH default.
+    lease = (
+        Path(str(mux_state) + ".leases")
+        / f"{acp_mux._lane_fingerprint(str(home), 'test')}.lease"
+    )
+    lease.parent.mkdir(parents=True, exist_ok=True)
+    lease.write_text(json.dumps({"at": 0.0, "mux_pid": 1}))
     log = tmp_path / "mux.log"
     proc_env = os.environ.copy()
     proc_env.update({
