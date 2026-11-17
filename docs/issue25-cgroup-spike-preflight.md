@@ -8,7 +8,10 @@ no sudo/chmod/mount/pre-existing-cgroup mutation otherwise.
 **Verdict: BLOCKED — spike NOT RUN on the deployment environment.
 F4 Gate B recommendation remains NO-GO.**
 
-## 1. Preflight evidence (READ-ONLY probes, 2026-11-17 KST, container `hermes`)
+## 1. Preflight evidence (2026-11-17 KST, container `hermes`; all probes
+read-only except one explicitly non-destructive failed-create probe —
+`mkdir` under `/sys/fs/cgroup`, which returned EACCES and created
+nothing)
 
 | probe | observed |
 |---|---|
@@ -17,9 +20,9 @@ F4 Gate B recommendation remains NO-GO.**
 | controllers (root) | `cpuset cpu io memory hugetlb pids rdma misc dmem` |
 | root `cgroup.subtree_control` | empty (no controllers distributed to children) |
 | our cgroup | `/proc/self/cgroup` → `0::/` (we are AT the namespace root) |
-| ownership/writability | `/sys/fs/cgroup` `drwxr-xr-x root root`; `cgroup.procs`/`cgroup.subtree_control`/`cgroup.kill` all not-writable for uid 1000; `mkdir` probe → **EACCES** (probe dir never created) |
+| ownership/writability | `/sys/fs/cgroup` `drwxr-xr-x root root`; `cgroup.procs`/`cgroup.subtree_control`/`cgroup.kill` all not-writable for uid 1000; non-destructive `mkdir` probe → **EACCES** (nothing created) |
 | other cgroup2 mounts | none (`awk` over `/proc/mounts`: exactly one, `ro`) |
-| systemd path | `systemctl`/`systemd-run` **absent** — no transient delegated scope possible, with or without sudo |
+| systemd CLI route | `systemctl`/`systemd-run` **absent in this container** — the systemd transient-scope delegation route is unavailable HERE; this does not claim delegation is impossible on hosts that do run a user manager |
 | namespace identity | live mux `12053` and self share `cgroup:[4026534418]` — production vendor trees live inside this same read-only container cgroup namespace |
 
 No sudo/root used; no chmod; no pre-existing cgroup touched; the single
@@ -28,14 +31,15 @@ No sudo/root used; no chmod; no pre-existing cgroup touched; the single
 ## 2. Why this is the decisive fail-closed case
 
 - GO condition was "an already-delegated safe subtree or a disposable
-  user transient scope creatable without sudo". Neither exists: the only
-  visible cgroupfs is `ro` + root-owned, and there is no user manager.
+  user transient scope creatable without sudo". Neither exists HERE: the
+  only visible cgroupfs is `ro` + root-owned, and this container has no
+  user manager CLI route.
 - The production plugin/mux/vendor run **inside this container**, in the
-  same cgroup namespace. So candidate B (cgroup containment) is not
-  deployable under the current container runtime contract at all —
-  enabling it would require a **deployment change** (runtime delegation
-  of a writable subtree, e.g. via container manager configuration),
-  which is explicitly outside this slice's authority.
+  same cgroup namespace. So the **in-container `Popen` containment seam
+  is blocked without a deployment-level delegation change** (e.g. the
+  container runtime delegating a writable cgroup subtree), which is
+  explicitly outside this slice's authority. This is a statement about
+  the current deployment topology, not about cgroup v2 semantics.
 
 ## 3. Spike protocol (implemented, fail-closed; `tests/test_issue25_cgroup_spike.py`)
 
@@ -67,6 +71,9 @@ runtime that mounts a writable delegated cgroup subtree).
   their existing (weaker, group/poll-based) contracts unchanged. Nothing
   in the current codebase couples the platforms' teardown guarantees, so
   a Linux-only ACK precondition is contractually expressible.
+  **Expressible ≠ resolved**: this says nothing about Windows/macOS
+  descendant-containment being solved; their detached-descendant gap
+  remains open on those platforms too.
 - Production seam candidate (design ONLY, not implemented): exactly one
   assignment point at plugin `Popen(mux, …)` (spawn into a delegated
   child cgroup, or fail-closed fall back to today's group teardown with

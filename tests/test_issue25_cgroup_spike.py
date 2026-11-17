@@ -13,12 +13,21 @@ Fail-closed contract (reviewer-mandated):
   writable, delegated cgroup subtree via ``ACP_TEST_CGROUP_ROOT``
   (absolute, pre-existing, WRITABLE, exposes a writable ``cgroup.kill``,
   and is not the mount root).  Anything else — missing, read-only,
-  root-owned, no ``cgroup.kill`` — SKIPS with a BLOCKED reason.  No
-  sudo, no chmod, no mounts, no mutation of any pre-existing cgroup, no
-  moving of any pre-existing process.
+  root-owned, no ``cgroup.kill`` — SKIPS with a BLOCKED reason.  A
+  delegated root whose freshly created CHILD cgroup lacks a writable
+  ``cgroup.kill`` or is not a plain ``domain`` is ALSO a BLOCKED skip.
+  No sudo, no chmod, no mounts, no mutation of any pre-existing cgroup,
+  no moving of any pre-existing process.
 - Only processes this test spawns are ever written into a cgroup, and
   only into directories this test created under the delegated root.
-- Cleanup kills only its own fakes and rmdir's only its own empty dirs.
+- Termination truth: zombies are never "running" (``/proc`` state ``Z``
+  is checked); the authoritative whole-cgroup proof is
+  ``cgroup.events populated=0`` plus an empty ``cgroup.procs``; the
+  direct leader child is explicitly reaped and its exit status
+  inspected (signal death => negative returncode).
+- Cleanup is safe against any partial-construction state, always reaps
+  its direct child, and ``rmdir``s only its own directories — a failed
+  or incomplete removal FAILS the test (no silent residue).
 
 On the deployment container (hermes) the preflight is BLOCKED: the only
 cgroup2 mount is ``ro`` and root-owned (see
@@ -37,12 +46,10 @@ from pathlib import Path
 
 import pytest
 
-pytestmark = [
-    pytest.mark.skipif(
-        os.name != "posix" or not Path("/proc").is_dir(),
-        reason="Linux cgroup v2 semantics under test",
-    ),
-]
+pytestmark = pytest.mark.skipif(
+    os.name != "posix" or not Path("/proc").is_dir(),
+    reason="Linux cgroup v2 semantics under test",
+)
 
 ROOT_ENV = "ACP_TEST_CGROUP_ROOT"
 
@@ -82,6 +89,10 @@ _spike_gate = pytest.mark.skipif(
 )
 
 
+class _BlockedEnv(Exception):
+    """Delegated root accepted, but the child cgroup semantics failed."""
+
+
 def _wait(pred, timeout=20.0, step=0.05):
     end = time.monotonic() + timeout
     while time.monotonic() < end:
@@ -91,14 +102,16 @@ def _wait(pred, timeout=20.0, step=0.05):
     return False
 
 
-def _alive(pid: int) -> bool:
+def _running(pid: int) -> bool:
+    """True only for a live (non-zombie) process."""
     try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
+        with open(f"/proc/{pid}/stat") as fh:
+            state = fh.read().rsplit(")", 1)[1].split()[0]
+    except FileNotFoundError:
         return False
-    except PermissionError:
+    except (PermissionError, IndexError):
         return True
-    return True
+    return state != "Z"
 
 
 LEADER_SRC = """
@@ -126,34 +139,67 @@ time.sleep(600)
 
 
 class _Spike:
-    """One disposable child cgroup + fake tree joined into it."""
+    """One disposable child cgroup + fake tree joined into it.
+
+    Every resource is tracked the moment it comes into existence; the
+    constructor cleans up on ANY partial-construction failure, and
+    ``cleanup`` tolerates every partially-built state.
+    """
 
     def __init__(self, name: str):
         assert DELEGATED is not None
-        self.dir = DELEGATED / name
-        self.dir.mkdir()
-        self.procs = self.dir / "cgroup.procs"
-        self.killfile = self.dir / "cgroup.kill"
-        self.work = Path(f"/tmp/{name}-work-{os.getuid()}")
-        if self.work.exists():
-            shutil.rmtree(self.work)
-        self.work.mkdir()
-        (self.work / "leader.py").write_text(LEADER_SRC)
-        (self.work / "sleep.py").write_text("import time; time.sleep(600)\n")
-        self.proc = subprocess.Popen(
-            [sys.executable, str(self.work / "leader.py"),
-             str(self.work), self.dir.name],
-        )
-        # The documented join path for a delegatee moving its own child.
-        self.procs.write_text(f"{self.proc.pid}\n")
-        pids = self.work / "pids.json"
-        assert _wait(lambda: pids.exists(), 25), "fake tree failed to start"
-        self.pids = json.loads(pids.read_text())
+        self.dir: Path | None = None
+        self.work: Path | None = None
+        self.proc: subprocess.Popen | None = None
+        self.pids: dict | None = None
+        self.procs: Path | None = None
+        self.killfile: Path | None = None
+        try:
+            self.dir = DELEGATED / name
+            self.dir.mkdir()
+            self.killfile = self.dir / "cgroup.kill"
+            if not self.killfile.is_file() or not os.access(
+                self.killfile, os.W_OK
+            ):
+                raise _BlockedEnv(
+                    f"{name}: child cgroup lacks a writable cgroup.kill"
+                )
+            try:
+                ctype = (self.dir / "cgroup.type").read_text().strip()
+            except OSError:
+                ctype = ""
+            if ctype != "domain":
+                raise _BlockedEnv(
+                    f"{name}: child cgroup.type={ctype!r}, not domain"
+                )
+            self.procs = self.dir / "cgroup.procs"
+            self.work = Path(f"/tmp/{name}-work-{os.getuid()}")
+            if self.work.exists():
+                shutil.rmtree(self.work)
+            self.work.mkdir()
+            (self.work / "leader.py").write_text(LEADER_SRC)
+            (self.work / "sleep.py").write_text("import time; time.sleep(600)\n")
+            self.proc = subprocess.Popen(
+                [sys.executable, str(self.work / "leader.py"),
+                 str(self.work), self.dir.name],
+            )
+            # The documented join path for a delegatee moving its own child.
+            self.procs.write_text(f"{self.proc.pid}\n")
+            pids = self.work / "pids.json"
+            if not _wait(lambda: pids.exists(), 25):
+                raise RuntimeError("fake tree failed to start")
+            self.pids = json.loads(pids.read_text())
+        except _BlockedEnv as exc:
+            self.cleanup(strict=False)
+            pytest.skip(f"BLOCKED (fail-closed): {exc}")
+        except BaseException:
+            self.cleanup(strict=False)
+            raise
 
     def members(self) -> set[int]:
         try:
             return {int(x) for x in self.procs.read_text().split()}
-        except (FileNotFoundError, ValueError):
+        except (AttributeError, FileNotFoundError, ValueError):
             return set()
 
     def cgroup_of(self, pid: int) -> str:
@@ -163,25 +209,49 @@ class _Spike:
         return ""
 
     def populated(self) -> str:
-        for line in (self.dir / "cgroup.events").read_text().splitlines():
-            if line.startswith("populated"):
-                return line.split("=", 1)[1].strip()
+        try:
+            for line in (self.dir / "cgroup.events").read_text().splitlines():
+                if line.startswith("populated"):
+                    return line.split("=", 1)[1].strip()
+        except (AttributeError, OSError):
+            pass
         return "?"
 
-    def cleanup(self):
-        for pid in (self.pids["det"], self.pids["same"], self.proc.pid):
+    def cleanup(self, strict: bool = True):
+        # Grandchildren first (their parent is our direct child), then the
+        # direct child — which is ALWAYS reaped.
+        if self.pids is not None:
+            for pid in (self.pids["det"], self.pids["same"]):
+                try:
+                    os.kill(pid, 9)
+                except (ProcessLookupError, OSError):
+                    pass
+        if self.proc is not None:
             try:
-                os.kill(pid, 9)
-            except (ProcessLookupError, OSError):
+                self.proc.kill()
+            except OSError:
                 pass
-        assert _wait(lambda: self.populated() == "0", 20), (
-            "spike cgroup must be empty before rmdir"
-        )
-        try:
-            self.dir.rmdir()  # only ever our own, only when empty
-        except OSError:
-            pass
-        shutil.rmtree(self.work, ignore_errors=True)
+            try:
+                self.proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                if strict:
+                    raise
+        if self.dir is not None:
+            state = self.populated()
+            if state == "1":
+                empty = _wait(lambda: self.populated() == "0", 20)
+            else:
+                # "0" (real, empty) or "?" (no cgroup.events — construction
+                # failed before a real cgroup existed): attempt removal.
+                empty = True
+            if strict and not empty:
+                raise AssertionError("spike cgroup never reached populated=0")
+            if empty:
+                self.dir.rmdir()  # R3: failures propagate in strict mode
+                if strict and self.dir.exists():
+                    raise AssertionError(f"residue: {self.dir} still exists")
+        if self.work is not None:
+            shutil.rmtree(self.work, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -189,9 +259,16 @@ class _Spike:
 
 @_spike_gate
 def test_membership_survives_setsid_escape_and_cgroup_kill_sweeps():
-    target = _Spike("acp25-target")
-    sibling = _Spike("acp25-sibling")
+    spikes: list[_Spike] = []
     try:
+        target = _Spike("acp25-target")
+        spikes.append(target)
+        sibling = _Spike("acp25-sibling")
+        spikes.append(sibling)
+        # Construction completed: these attributes exist by contract.
+        assert target.pids and target.dir and target.proc and target.killfile
+        assert sibling.pids and sibling.proc
+
         # Layout: escaped descendant left the PGID/SID but NOT the cgroup.
         assert os.getpgid(target.pids["det"]) != target.proc.pid, (
             "setsid escape model failed"
@@ -204,20 +281,28 @@ def test_membership_survives_setsid_escape_and_cgroup_kill_sweeps():
         for key in ("leader", "same", "det"):
             assert sibling.pids[key] not in target.members()
 
-        # cgroup.kill sweep: everything in target dies, including the
-        # group-escaped descendant; the sibling cgroup is untouched.
+        # cgroup.kill sweep.  The leader is OUR direct child: reap it
+        # explicitly and inspect the exit status (signal death => negative).
         target.killfile.write_text("1")
-        for key in ("leader", "same", "det"):
-            assert _wait(lambda k=key: not _alive(target.pids[k]), 20), (
+        try:
+            rc = target.proc.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            raise AssertionError("direct leader survived cgroup.kill") from None
+        assert rc < 0, f"leader exited {rc}, expected signal death"
+        # Grandchildren: zombie-aware liveness only.
+        for key in ("same", "det"):
+            assert _wait(lambda k=key: not _running(target.pids[k]), 20), (
                 f"target {key} survived cgroup.kill"
             )
+        # Authoritative whole-cgroup termination proof:
+        assert _wait(lambda: target.populated() == "0", 20), "populated stuck"
+        assert target.members() == set(), "cgroup.procs not empty"
         time.sleep(0.5)
         for key in ("leader", "same", "det"):
-            assert _alive(sibling.pids[key]), "sibling cgroup was hit"
-        assert target.populated() == "0", "empty proof failed"
+            assert _running(sibling.pids[key]), "sibling cgroup was hit"
     finally:
-        target.cleanup()
-        sibling.cleanup()
+        for spike in spikes:
+            spike.cleanup()
 
 
 def test_preflight_never_touches_non_delegated_roots():
