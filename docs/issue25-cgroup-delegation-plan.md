@@ -216,8 +216,15 @@ tree + rw delegate subtree + env var), removed entirely afterwards.
    interface files (`cgroup.procs`, `cgroup.kill`) are created root-owned at
    `mkdir`, and a directory-only chown leaves them unwritable for uid 1000,
    failing `delegated_root()`'s capability checks (observed in the 2026-11-18
-   canary run: non-recursive chown → `delegated_root()` returned None):
-   `mount --bind /sys/fs/cgroup /sys/fs/cgroup && mount -o remount,bind,rw /sys/fs/cgroup && mkdir -p /sys/fs/cgroup/acp-delegate && chown -R 1000:1000 /sys/fs/cgroup/acp-delegate && echo 1 > /sys/fs/cgroup/acp-delegate/cgroup.procs && umount /sys/fs/cgroup && mount --bind /sys/fs/cgroup/acp-delegate /sys/fs/cgroup/acp-delegate && mount -o remount,bind,rw /sys/fs/cgroup/acp-delegate && findmnt /sys/fs/cgroup -o OPTIONS | grep -qw ro && findmnt -T /sys/fs/cgroup/acp-delegate -o OPTIONS | grep -qw rw && test "$(awk '$5=="/sys/fs/cgroup/acp-delegate"' /proc/self/mountinfo | wc -l)" -eq 1 && exec /init /opt/hermes/docker/main-wrapper.sh gateway run`
+   canary run: non-recursive chown → `delegated_root()` returned None). The
+   ns-root's own `cgroup.procs` is chowned to uid 1000 as a canary-only
+   accommodation: `cgroup_procs_write_permission()` requires MAY_WRITE on the
+   cgroup.procs of the src/dst COMMON ANCESTOR, and the docker-exec test
+   session starts in the ns-root (dockerd-created, root-owned); production
+   spawns the seam from the gateway's tree inside the delegate, so the scope's
+   `cgroup.procs` is never a migration ancestor there (observed in the
+   2026-11-18 canary run: uid-1000 trampoline join → EACCES):
+   `mount --bind /sys/fs/cgroup /sys/fs/cgroup && mount -o remount,bind,rw /sys/fs/cgroup && chown 1000:1000 /sys/fs/cgroup/cgroup.procs && mkdir -p /sys/fs/cgroup/acp-delegate && chown -R 1000:1000 /sys/fs/cgroup/acp-delegate && echo 1 > /sys/fs/cgroup/acp-delegate/cgroup.procs && umount /sys/fs/cgroup && mount --bind /sys/fs/cgroup/acp-delegate /sys/fs/cgroup/acp-delegate && mount -o remount,bind,rw /sys/fs/cgroup/acp-delegate && findmnt /sys/fs/cgroup -o OPTIONS | grep -qw ro && findmnt -T /sys/fs/cgroup/acp-delegate -o OPTIONS | grep -qw rw && test "$(awk '$5=="/sys/fs/cgroup/acp-delegate"' /proc/self/mountinfo | wc -l)" -eq 1 && exec /init /opt/hermes/docker/main-wrapper.sh gateway run`
    With `HERMES_ANTIGRAVITY_ACP_CGROUP_ROOT=/sys/fs/cgroup/acp-delegate`.
    Any `&&` link failing aborts the entrypoint before `/init` ever starts.
    The final `exec` targets `/opt/hermes/docker/main-wrapper.sh gateway run`
