@@ -197,6 +197,12 @@ targets mutable state, and Block D attests both mounts are ro. Everything
 else (state.db, sessions, profiles, cron) regenerates at boot; verified by
 booting the same image
 with an empty `/opt/data` (2026-11-18 probe: all s6 services started).
+The plugin dir is built from the reviewed seam PLUS the production
+deployment artifact `launch_config.json` (the mux `process_command`
+override; untracked in git, present in the installed plugin tree): without
+it the plugin falls back to the official launcher, skipping the mux and
+per-account HOME switching, and `session/new` dies with `Authentication
+required` (observed in the 2026-11-18 canary run).
 Container name
 `hermes-acp-canary`, `cap_add: [SYS_ADMIN]` (P2 shape standing in for the P1
 host helper — the kernel-relevant end state is identical: relocated process
