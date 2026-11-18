@@ -183,8 +183,16 @@ invariant or widen host visibility), scope-root `cgroup.procs` chown
 ## 5. Disposable canary procedure (production-equivalent, throwaway)
 
 A separate compose project (`nous-hermes-acp-canary`), same image
-`nousresearch/hermes-agent:v0.23.2`, **verified-copy** state dirs (the compose
-header rule: never share a state dir with the live gateway), container name
+`nousresearch/hermes-agent:v0.23.2`, **verified-copy** state (the compose
+header rule: never share a state dir with the live gateway). The copy is a
+WHITELIST, not the full state tree: config.yaml, .env, auth.json, `.hermes`
+ACP registry, and the ACP account homes under `home/.agy-acp` minus
+per-account `conversations/` and `brain/` history (~1G auth core; the full
+tree is ~270G and its caches/backups have zero bearing on the gate —
+operator veto 2026-11-18, SSD wear). Everything else (state.db, sessions,
+profiles, cron) regenerates at boot; verified by booting the same image
+with an empty `/opt/data` (2026-11-18 probe: all s6 services started).
+Container name
 `hermes-acp-canary`, `cap_add: [SYS_ADMIN]` (P2 shape standing in for the P1
 host helper — the kernel-relevant end state is identical: relocated process
 tree + rw delegate subtree + env var), removed entirely afterwards.
