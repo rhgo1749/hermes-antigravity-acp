@@ -199,8 +199,12 @@ tree + rw delegate subtree + env var), removed entirely afterwards.
    the delegate before `/init` execs, so every container process — gateway,
    mux, vendor children — is BORN inside it (§3 condition 2). The findmnt
    pre-flight is INSIDE the executable chain before `exec` — a literal
-   copy/paste cannot bypass it:
-   `mount --bind /sys/fs/cgroup /sys/fs/cgroup && mount -o remount,bind,rw /sys/fs/cgroup && mkdir -p /sys/fs/cgroup/acp-delegate && chown 1000:1000 /sys/fs/cgroup/acp-delegate && echo 1 > /sys/fs/cgroup/acp-delegate/cgroup.procs && umount /sys/fs/cgroup && mount --bind /sys/fs/cgroup/acp-delegate /sys/fs/cgroup/acp-delegate && mount -o remount,bind,rw /sys/fs/cgroup/acp-delegate && findmnt /sys/fs/cgroup -o OPTIONS | grep -qw ro && findmnt -T /sys/fs/cgroup/acp-delegate -o OPTIONS | grep -qw rw && test "$(awk '$5=="/sys/fs/cgroup/acp-delegate"' /proc/self/mountinfo | wc -l)" -eq 1 && exec /init gateway run`
+   copy/paste cannot bypass it. The `chown` MUST be recursive: cgroup2
+   interface files (`cgroup.procs`, `cgroup.kill`) are created root-owned at
+   `mkdir`, and a directory-only chown leaves them unwritable for uid 1000,
+   failing `delegated_root()`'s capability checks (observed in the 2026-11-18
+   canary run: non-recursive chown → `delegated_root()` returned None):
+   `mount --bind /sys/fs/cgroup /sys/fs/cgroup && mount -o remount,bind,rw /sys/fs/cgroup && mkdir -p /sys/fs/cgroup/acp-delegate && chown -R 1000:1000 /sys/fs/cgroup/acp-delegate && echo 1 > /sys/fs/cgroup/acp-delegate/cgroup.procs && umount /sys/fs/cgroup && mount --bind /sys/fs/cgroup/acp-delegate /sys/fs/cgroup/acp-delegate && mount -o remount,bind,rw /sys/fs/cgroup/acp-delegate && findmnt /sys/fs/cgroup -o OPTIONS | grep -qw ro && findmnt -T /sys/fs/cgroup/acp-delegate -o OPTIONS | grep -qw rw && test "$(awk '$5=="/sys/fs/cgroup/acp-delegate"' /proc/self/mountinfo | wc -l)" -eq 1 && exec /init gateway run`
    With `HERMES_ANTIGRAVITY_ACP_CGROUP_ROOT=/sys/fs/cgroup/acp-delegate`.
    Any `&&` link failing aborts the entrypoint before `/init` ever starts.
 2. Gate attestation (inside canary, as hermes uid 1000):
