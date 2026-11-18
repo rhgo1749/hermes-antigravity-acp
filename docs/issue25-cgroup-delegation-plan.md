@@ -207,6 +207,15 @@ Container name
 `hermes-acp-canary`, `cap_add: [SYS_ADMIN]` (P2 shape standing in for the P1
 host helper — the kernel-relevant end state is identical: relocated process
 tree + rw delegate subtree + env var), removed entirely afterwards.
+**Validation scope (stated honestly after the 2026-11-18 independent
+review):** the P2 canary proves the kernel end-state shape, the seam
+behavior, and the §5 gate mechanics. It does NOT exercise the P1 host
+helper's operational path — one-time traversal/migration of a LIVE
+production scope's PIDs, the mount-namespace helper against a running
+container, and their race windows. The P1 helper below is therefore
+**NOT production-validated by Gate B**; applying it requires a separate
+explicitly-approved P1 rehearsal gate (staged dry-run + rollback plan)
+before touching the live `hermes` container.
 
 1. Start canary with entrypoint override (root stage, disposable). The
    sequence reaches P1's EXACT mount end-state (parent = original ro,
@@ -252,24 +261,40 @@ tree + rw delegate subtree + env var), removed entirely afterwards.
 4. Production-equivalent live check: run one real ACP request through the
    canary gateway (mux + vendor children spawn normally). During the request:
    every mux/vendor descendant's `/proc/<pid>/cgroup` ends in
-   `/acp-delegate/acpmux-<nonce>` (fork-before-containment race closed);
-   a normal request completes with unchanged latency/semantics.
-5. After teardown (session close / idle teardown):
-   zero `acpmux-*` nonce dirs remain under `acp-delegate` (**residue 0**;
-   each nonce's `cgroup.events populated 0` + `cgroup.procs` empty precedes
-   its removal by the ladder); `acp-delegate` itself legitimately persists
-   and holds the relocated container processes; sibling cgroups (other
-   containers, host services) untouched.
+   `/acp-delegate/acpmux-<nonce>` (fork-before-containment race closed).
+   The check must sweep BOTH directions: (i) enumerate every ACP-signature
+   process inside the container (`antigravity-acp-mux`, `agy_acp_server`,
+   `localharness`) and assert each one's cgroup ends in an `acpmux-<nonce>`
+   path — an escaped descendant fails the gate; (ii) sample each nonce
+   cgroup's members and confirm the expected mux + vendor pair is present.
+   A normal request completes with unchanged latency/semantics.
+5. After teardown (idle eviction / shutdown): each evicted nonce's
+   `cgroup.events populated 0` + `cgroup.procs` empty PRECEDES its removal
+   by the ladder — this per-entry precondition is enforced by the seam code
+   and pinned by the step-3 real seam tests. Mid-run eviction is LAZY
+   (expired entries are swept only by the next same-key `_warm_acquire`,
+   and warm reuse refreshes `idle_since`), so a bounded "at least one
+   request-1 tree torn down while the gateway lives" observation is the
+   correct mid-run criterion; global residue 0 is guaranteed at shutdown by
+   the atexit warm-pool shutdown and must be attested after `docker stop`
+   (no-orphans + no-project-procs). `acp-delegate` itself legitimately
+   persists while the container runs and holds the relocated container
+   processes; sibling cgroups (other containers, host services) untouched.
 6. **Lifecycle-parity verification** (turns §4's systemd/Docker assumptions
    into evidence, with measurable criteria — `docker stats` nonzero alone
    proves nothing since it could reflect the gateway alone):
-   - **Aggregation:** take `docker stats --no-stream` CPU for the canary
-     while idle, then again DURING a busy ACP request (mux + vendor children
-     active). Criterion: the busy reading materially exceeds the idle one
-     AND, on the host, `cat <canary-scope>/cpu.stat` and
-     `<canary-scope>/acp-delegate/cpu.stat` both show nonzero `usage_usec`
-     growth over the same window (children's usage lands in the scope
-     aggregate because stats recurse).
+   - **Aggregation:** ACP requests are I/O-bound (the mux waits on the
+     remote LLM), so a `docker stats` busy/idle CPU% RATIO is NOT a valid
+     busy signal (it false-failed a healthy canary run on 2026-11-18 at
+     1.01% vs 0.69%; the ratio readings are retained as receipt evidence
+     only). The criterion is HIERARCHICAL ARITHMETIC over `cpu.stat
+     usage_usec` (hierarchical in cgroup v2) across a busy window:
+     nonce-cgroup CPU burned inside the window > 0 — per-tree
+     baseline-matched (a tree present at both samples contributes its
+     delta; a tree born mid-window contributes full usage; an evicted
+     tree drops out) — AND `nonce_delta <= delegate_delta <= scope_delta`
+     (contained accounting rolls up). All three levels must show nonzero
+     growth over the window.
    - **Stop semantics:** `docker stop hermes-acp-canary` completes within
      `stop_grace_period` (no SIGKILL fallback needed). Then on the host,
      with `SCOPE=/sys/fs/cgroup/system.slice/docker-<canary-id>.scope`,
