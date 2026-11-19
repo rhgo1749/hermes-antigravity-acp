@@ -4805,9 +4805,10 @@ class AntigravityACPClient:
                         finish_reason="tool_calls" if tool_calls else "stop",
                     )
                 ],
-                # Prefer the official prompt result's per-turn breakdown. If it
-                # is absent or invalid, retain the v0.7.4 usage_update proxy;
-                # the proxy does not provide a real input/output split.
+                # Per AC4-1, `turn_usage` is populated only from the official
+                # prompt result's per-turn breakdown; it is None when that
+                # breakdown is absent or invalid.  No usage_update proxy is
+                # retained (docs/acp-usage-telemetry.md, "Issue #6").
                 usage=session_result.get("turn_usage"),
                 model=session_result.get("effective_model") or model or "antigravity-acp",
             )

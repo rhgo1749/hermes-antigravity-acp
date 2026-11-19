@@ -332,6 +332,237 @@ def test_parent_and_sibling_children_keep_disjoint_native_continuations(
     assert sorted(resumed) == sorted(keyed_sessions)
 
 
+def test_nested_delegated_child_uses_its_own_identity_not_inherited_keys(
+    monkeypatch, tmp_path
+) -> None:
+    """Issue #34: parent -> child A -> nested child A1 identity isolation.
+
+    A1 must key its own durable affinity/native session: never the parent's
+    async routing key (HERMES_SESSION_KEY), never child A's affinity.  Child
+    A's own continuity must survive the nested scope exiting.
+    """
+    _require_real_core()
+    script, log_path = _write_unique_session_fake_server(tmp_path)
+    par = tmp_path / "par.py"
+    par.write_text(
+        "#!/usr/bin/env python3\n"
+        f"import sys\n"
+        f"sys.argv = [{str(script)!r}, {str(log_path)!r}]\n"
+        f"exec(compile(open({str(script)!r}).read(), {str(script)!r}, 'exec'))\n"
+    )
+    par.chmod(0o755)
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_REAL_HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    for pin in (
+        "ACP_MUX_SESSION_ID",
+        "ACP_MUX_AFFINITY",
+        "ACP_MUX_ACCOUNTS",
+        "ACP_MUX_STATE",
+        "ACP_MUX_LOG",
+        "ACP_MUX_PAR",
+    ):
+        monkeypatch.delenv(pin, raising=False)
+
+    accounts = []
+    for name in ("lane-a", "lane-b"):
+        home = tmp_path / name
+        (home / ".gemini" / "antigravity-acp" / "conversations").mkdir(parents=True)
+        accounts.append({"home": str(home), "label": name})
+    registry = tmp_path / ".hermes" / "acp-accounts.json"
+    registry.parent.mkdir(parents=True, exist_ok=True)
+    registry.write_text(json.dumps({"accounts": accounts}))
+
+    module = _load_client(monkeypatch, tmp_path)
+    client_mod = importlib.import_module(f"{module.__name__}.client")
+    monkeypatch.setattr(client_mod, "_read_par_pin", lambda: str(par))
+    client = module.antigravity_acp.create_client(
+        command=sys.executable,
+        args=[str(PLUGIN_DIR.parents[1] / "scripts" / "antigravity-acp-mux.py")],
+        acp_cwd=str(tmp_path),
+        rate_limit_retries=0,
+    )
+
+    parent_session_key = "agent:main:telegram:dm:nested-1:nested-2"
+    tokens = set_session_vars(
+        platform="telegram",
+        source="telegram",
+        chat_id="1",
+        session_key=parent_session_key,
+        session_id="parent-durable-nested",
+    )
+    # Expected affinity derivation, captured IN EACH SCOPE from the plugin's
+    # own derivation over that identity's first-user messages.  The state
+    # ledger keys must equal these; cross-scope key equality (identity
+    # inheritance drift) is asserted separately below.
+    expected_keys: dict[str, str] = {}
+
+    def capture(tag: str, messages: list) -> None:
+        expected_keys[tag] = client_mod._conversation_affinity(
+            messages, str(tmp_path)
+        )
+
+    try:
+        parent_request = [{"role": "user", "content": "parent task"}]
+        parent_messages = _turn(client, parent_request, "n-parent-1")
+        capture("parent", parent_request)
+        with delegated_child_context("child-a-1"):
+            a_request = [{"role": "user", "content": "child A task"}]
+            a_messages = _turn(client, a_request, "n-a-1")
+            capture("A", a_request)
+            with delegated_child_context("grandchild-a1-1"):
+                a1_request = [{"role": "user", "content": "nested A1 task"}]
+                a1_messages = _turn(client, a1_request, "n-a1-1")
+                capture("A1", a1_request)
+                a1_messages = _turn(
+                    client,
+                    a1_messages + [{"role": "user", "content": "nested A1 follow-up"}],
+                    "n-a1-2",
+                )
+            with delegated_child_context("grandchild-a2-1"):
+                # Nested sibling with byte-identical prompt to A1's first
+                # turn: must never share A1's affinity or frontier.
+                _turn(
+                    client,
+                    [{"role": "user", "content": "nested A1 task"}],
+                    "n-a2-1",
+                )
+                capture("A2", [{"role": "user", "content": "nested A1 task"}])
+            with delegated_child_context("grandchild-a1-1"):
+                # Same nested child re-entered in a SEPARATE scope: resumes
+                # A1's own session, not a fresh one.
+                _turn(
+                    client,
+                    a1_messages
+                    + [{"role": "user", "content": "nested A1 re-entry"}],
+                    "n-a1-3",
+                )
+            with delegated_child_context(""):
+                # Ambiguous nested child: stateless fail-closed, exactly as
+                # at flat depth.
+                amb_messages = _turn(
+                    client,
+                    [{"role": "user", "content": "ambiguous nested task"}],
+                    "n-amb-1",
+                )
+                _turn(
+                    client,
+                    amb_messages
+                    + [{"role": "user", "content": "ambiguous nested follow-up"}],
+                    "n-amb-2",
+                )
+            # Child A continues AFTER every nested scope exited: its own
+            # continuity must not have been hijacked by A1/A2/ambiguous.
+            _turn(
+                client,
+                a_messages + [{"role": "user", "content": "child A follow-up"}],
+                "n-a-2",
+            )
+        # Parent continues AFTER child A's scope exited: parent context and
+        # parent continuity must have been restored.
+        _turn(
+            client,
+            parent_messages + [{"role": "user", "content": "parent follow-up"}],
+            "n-parent-2",
+        )
+    finally:
+        clear_session_vars(tokens)
+
+    state = json.loads(
+        (tmp_path / "acp-conversation-state.json").read_text(encoding="utf-8")
+    )
+    states = state["states"]
+    keyed_sessions = {entry["session_id"] for entry in states.values()}
+
+    # Four keyed identities: parent, child A, nested A1, nested sibling A2.
+    # The ambiguous nested child has NO entry (stateless fail-closed).
+    assert len(states) == 4, sorted(states)
+    assert len(keyed_sessions) == 4, keyed_sessions
+    # Exact derivation: ledger keys equal the per-scope captured derivations,
+    # and no descendant ever collapsed onto an ancestor's key (identity
+    # inheritance drift) — including byte-identical-prompt nested siblings.
+    assert set(states) == set(expected_keys.values()), (states, expected_keys)
+    assert len(set(expected_keys.values())) == 4, expected_keys
+    # Negative: the async routing key never becomes an affinity/state key.
+    assert parent_session_key not in states
+    for affinity_key in states:
+        assert affinity_key != parent_session_key
+        assert affinity_key != "child-a-1"
+        assert affinity_key != "grandchild-a1-1"
+
+    rows = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    created = [r["sessionId"] for r in rows if r["method"] == "session/new" and r["sessionId"]]
+    resumed = [r["sessionId"] for r in rows if r["method"] == "session/resume"]
+
+    # Six native sessions: four keyed conversations plus two fresh
+    # stateless sessions for the ambiguous nested child's two turns.
+    assert len(created) == 6, created
+    unkeyed = [sid for sid in created if sid not in keyed_sessions]
+    assert len(unkeyed) == 2, unkeyed
+
+    # Lineage ownership via first-prompt text (a full-replay session's first
+    # prompt carries BOTH the historical task and the new follow-up, so
+    # originals are identified by the follow-up phrase being absent).
+    first_prompt: dict[str, str] = {}
+    for r in rows:
+        if r["method"] == "session/prompt" and r["sessionId"]:
+            first_prompt.setdefault(r["sessionId"], r.get("prompt") or "")
+
+    def original(task: str, *followups: str) -> str:
+        return next(
+            s for s, p in first_prompt.items()
+            if task in p and not any(f in p for f in followups)
+        )
+
+    parent_session = original("parent task", "parent follow-up")
+    a_session = original("child A task", "child A follow-up")
+    a1_session = original("nested A1 task", "nested A1 follow-up", "nested A1 re-entry")
+    a2_session = next(
+        s for s, p in first_prompt.items()
+        if "nested A1 task" in p and s != a1_session and "follow-up" not in p and "re-entry" not in p
+    )
+
+    # Resume OWNERSHIP correlated per server process: every session/resume
+    # must be followed (same pid, log order) by a prompt on the SAME session,
+    # and that prompt's text identifies the lineage whose session was
+    # resumed.  A resume of the wrong lineage — even with correctly-targeted
+    # later prompts — fails here.
+    by_pid: dict[int, list] = {}
+    for r in rows:
+        by_pid.setdefault(r["pid"], []).append(r)
+    resume_count = {"parent": 0, "A": 0, "A1": 0}
+    for pid, prs in by_pid.items():
+        for i, r in enumerate(prs):
+            if r["method"] != "session/resume":
+                continue
+            nxt = next(
+                (q for q in prs[i + 1:] if q["method"] == "session/prompt"), None
+            )
+            assert nxt is not None and nxt["sessionId"] == r["sessionId"], (
+                pid, r["sessionId"], nxt and nxt["sessionId"]
+            )
+            p = nxt["prompt"] or ""
+            if "nested A1 follow-up" in p or "nested A1 re-entry" in p:
+                expected, tag = a1_session, "A1"
+            elif "child A follow-up" in p:
+                expected, tag = a_session, "A"
+            elif "parent follow-up" in p:
+                expected, tag = parent_session, "parent"
+            else:
+                raise AssertionError(
+                    f"resume not attributable to any lineage: pid={pid} {p[:80]!r}"
+                )
+            assert r["sessionId"] == expected, (tag, r["sessionId"], expected)
+            resume_count[tag] += 1
+    # A1 resumed twice (in-scope follow-up + separate-scope re-entry);
+    # A and parent once each; A2 and the ambiguous child never resumed.
+    assert resume_count == {"parent": 1, "A": 1, "A1": 2}, resume_count
+    assert len(resumed) == 4, resumed
+    assert sorted(resumed) == sorted([parent_session, a_session, a1_session, a1_session])
+    assert not set(resumed) & {a2_session, *unkeyed}
+
+
 def _captured_child_context(child_id: str):
     """Snapshot the REAL core context a delegate child runs in.
 

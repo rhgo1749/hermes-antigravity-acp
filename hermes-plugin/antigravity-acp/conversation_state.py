@@ -36,6 +36,14 @@ _STATE_VERSION = 1
 _DEFAULT_TTL_SECONDS = 24 * 60 * 60
 _DEFAULT_MAX_ENTRIES = 512
 _USAGE_TOTALS_SCHEMA = "antigravity-acp-usage-totals-v1"
+# Issue #33 R2: additive marker identifying the source-verified per-call-delta
+# accumulation semantics.  Stamped on entries whose ENTIRE accumulated total
+# was produced under this contract (fresh entries, or entries already
+# carrying the marker).  A legacy entry that later receives a delta keeps the
+# key ABSENT: its stored sum mixes pre-marker history and must not claim the
+# verified classification.  Readers must treat a missing key as "pre-marker,
+# same v1 accumulation contract".
+_USAGE_TOTALS_SEMANTICS = "per_model_call_consumption_delta"
 _USAGE_TOTALS_PROVENANCE = "acp.usage_update.delta_sum(main-agent-only, may under-report)"
 _UNATTRIBUTED_MODEL = "__unattributed__"
 # Fleet diagnostics (historical reference): every usage_update frame carrying ``used`` is
@@ -337,6 +345,7 @@ class ConversationStateRegistry:
                         summed_tokens = previous_sum + used
                         frames_observed = previous["frames_observed"] + 1
                         first_seen = previous["first_seen"]
+                        accumulated = True
 
                         raw_by_model = previous.get("by_model")
                         if isinstance(raw_by_model, dict) and all(
@@ -373,6 +382,7 @@ class ConversationStateRegistry:
                         frames_observed = 1
                         first_seen = now
                         by_model = {}
+                        accumulated = False
 
                     if not self._valid_usage_number(summed_tokens):
                         return
@@ -392,6 +402,13 @@ class ConversationStateRegistry:
                         "native_session_id_hash": native_hash,
                         "provenance": _USAGE_TOTALS_PROVENANCE,
                     }
+                    # Issue #33 R2: stamp the semantics marker only when the
+                    # whole accumulated total is produced under this contract
+                    # (fresh entry, or an entry already carrying it).  A mixed
+                    # legacy+verified aggregate keeps the key absent so it
+                    # never claims the verified classification.
+                    if not accumulated or "semantics" in (previous or {}):
+                        totals[session_id]["semantics"] = _USAGE_TOTALS_SEMANTICS
                     payload["usage_totals"] = totals
                     self._write_payload(path, payload)
             except OSError as exc:

@@ -190,6 +190,8 @@ def test_usage_update_deltas_accumulate_for_explicit_hermes_session(monkeypatch,
     assert entry["provenance"] == (
         "acp.usage_update.delta_sum(main-agent-only, may under-report)"
     )
+    # Issue #33 R2: new writes carry the verified-semantics marker.
+    assert entry["semantics"] == "per_model_call_consumption_delta"
     serialized = json.dumps(payload)
     assert "raw-native-session-identifier" not in serialized
     assert "session-key-must-not-key-totals" not in serialized
@@ -271,6 +273,10 @@ def test_legacy_mixed_total_stays_unattributed_on_first_breakdown_write(
     assert entry["summed_tokens"] == 350
     assert entry["by_model"] == {"__unattributed__": 300, "model-a": 50}
     assert entry["model"] is None
+    # Issue #33 R2: a mixed legacy+verified aggregate keeps the semantics
+    # key ABSENT — the stored legacy portion was not produced under the
+    # verified contract and must not claim it.
+    assert "semantics" not in entry
 
 
 def test_single_usage_delta_is_recorded_and_absent_identity_is_not_guessed(monkeypatch, tmp_path) -> None:
