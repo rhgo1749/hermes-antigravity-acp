@@ -35,7 +35,14 @@ SCRIPTS = ROOT / "scripts"
 # entry/adjacent module by sibling path, so all three travel together).
 BUNDLE_FILES = ("acp_mux.py", "antigravity-acp-mux.py", "antigravity-acp-mux")
 MANIFEST_NAME = ".antigravity-acp-mux-packaging.json"
-BUNDLE_VERSION = "105.1"
+# Human-facing contract series for this bundle.  Bump only when the install
+# contract itself changes.  The full version written into manifests is derived
+# from the exact bundle bytes (see _bundle_version): a version string can no
+# longer survive a code change while still claiming to be the old one — the
+# 2026-11-19 production drift (F3/F4 merged, installed mux still reporting
+# "105.1" from Nov 13) was invisible precisely because the version was a
+# hand-maintained constant.
+BUNDLE_SERIES = "105.1"
 MUX_LAUNCHER_NAME = "antigravity-acp-mux"
 OFFICIAL_LAUNCHER_NAME = "antigravity-acp-official"
 
@@ -57,6 +64,16 @@ def _source_hashes() -> dict[str, str]:
             + ", ".join(missing)
         )
     return {name: _sha256(p) for name, p in sources.items()}
+
+
+def _bundle_version() -> str:
+    """Content-derived bundle version: the contract series plus a digest
+    over the exact bytes this checkout would install."""
+    digest = hashlib.sha256()
+    for name, sha in sorted(_source_hashes().items()):
+        digest.update(name.encode())
+        digest.update(sha.encode())
+    return f"{BUNDLE_SERIES}+{digest.hexdigest()[:12]}"
 
 
 def _manifest_path(bin_dir: Path) -> Path:
@@ -123,7 +140,7 @@ def _cmd_install(args: argparse.Namespace) -> int:
     _manifest_path(bin_dir).write_text(
         json.dumps(
             {
-                "bundle_version": BUNDLE_VERSION,
+                "bundle_version": _bundle_version(),
                 "source_repo": "rhgo1749/hermes-antigravity-acp",
                 "files": hashes,
             },
@@ -262,6 +279,18 @@ def _cmd_status(args: argparse.Namespace) -> int:
         **_resolve_par(),
         **_resolve_registry(),
     }
+    try:
+        repo_hashes = _source_hashes()
+    except SystemExit:
+        # Status must not crash outside a full checkout; it just cannot
+        # vouch for repo parity here.
+        repo_hashes = None
+    report["matches_repo_bundle"] = bool(
+        manifest
+        and not manifest.get("corrupt")
+        and repo_hashes is not None
+        and manifest.get("files") == repo_hashes
+    )
     if not report["par_resolved"]:
         print(
             "install_mux: ACP_MUX_PAR / HERMES_ANTIGRAVITY_ACP_PAR / "
@@ -269,6 +298,12 @@ def _cmd_status(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
     print(json.dumps(report, indent=2, sort_keys=True))
+    if args.strict and not (report["mux_bundle_ok"] and report["matches_repo_bundle"]):
+        # Machine gate for deploy pipelines and periodic ops checks: any
+        # divergence between the installed bundle and this checkout's
+        # bundle — or a missing/tampered manifest — exits non-zero.
+        print("install_mux: strict drift gate FAILED", file=sys.stderr)
+        return 1
     return 0
 
 
@@ -280,7 +315,13 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("install", help="copy the reviewed mux bundle (opt-in)")
     sub.add_parser("uninstall", help="remove exactly the installed bundle")
-    sub.add_parser("status", help="resolved contract report (no secrets)")
+    status = sub.add_parser("status", help="resolved contract report (no secrets)")
+    status.add_argument(
+        "--strict",
+        action="store_true",
+        help="exit non-zero unless the installed bundle is intact AND "
+        "byte-identical to this checkout's bundle (deploy-pipeline gate)",
+    )
     args = parser.parse_args(argv)
     handlers = {"install": _cmd_install, "uninstall": _cmd_uninstall,
                 "status": _cmd_status}

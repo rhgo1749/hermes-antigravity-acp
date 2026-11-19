@@ -127,6 +127,66 @@ def test_uninstall_without_manifest_refuses(tmp_path: Path) -> None:
     assert (bin_dir / "acp_mux.py").exists()
 
 
+def _load_installer_module():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("install_mux_under_test", INSTALLER)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_bundle_version_changes_with_bundle_bytes(tmp_path):
+    mod = _load_installer_module()
+    src = tmp_path / "scripts"
+    src.mkdir()
+    for name in BUNDLE_FILES:
+        (src / name).write_text("v1")
+    original = mod.SCRIPTS
+    mod.SCRIPTS = src
+    try:
+        v1 = mod._bundle_version()
+        (src / "acp_mux.py").write_text("v2")
+        v2 = mod._bundle_version()
+    finally:
+        mod.SCRIPTS = original
+    assert v1.startswith("105.1+")
+    assert v1 != v2
+
+
+def test_status_strict_gate_passes_when_fresh_and_fails_on_drift(tmp_path):
+    bin_dir = tmp_path / "bin"
+    assert _run(["--bin-dir", str(bin_dir), "install"]).returncode == 0
+    ok = _run(["--bin-dir", str(bin_dir), "status", "--strict"])
+    assert ok.returncode == 0, ok.stderr
+    assert json.loads(ok.stdout)["matches_repo_bundle"] is True
+    target = bin_dir / "acp_mux.py"
+    target.write_text(target.read_text() + "\n# drifted\n")
+    drift = _run(["--bin-dir", str(bin_dir), "status", "--strict"])
+    assert drift.returncode == 1
+    assert "strict drift gate FAILED" in drift.stderr
+    assert json.loads(drift.stdout)["mux_bundle_ok"] is False
+
+
+def test_status_strict_catches_stale_manifest_matching_disk(tmp_path):
+    # The 2026-11-19 production scenario: manifest and disk agree with each
+    # other (an intact older install) but are not this checkout's bundle.
+    bin_dir = tmp_path / "bin"
+    assert _run(["--bin-dir", str(bin_dir), "install"]).returncode == 0
+    manifest_path = bin_dir / ".antigravity-acp-mux-packaging.json"
+    manifest = json.loads(manifest_path.read_text())
+    old_bytes = b"old engine bytes\n"
+    (bin_dir / "acp_mux.py").write_bytes(old_bytes)
+    manifest["files"]["acp_mux.py"] = hashlib.sha256(old_bytes).hexdigest()
+    manifest_path.write_text(json.dumps(manifest))
+    result = _run(["--bin-dir", str(bin_dir), "status", "--strict"])
+    assert result.returncode == 1
+    report = json.loads(result.stdout)
+    assert report["mux_bundle_ok"] is True
+    assert report["matches_repo_bundle"] is False
+
+
 def test_status_reports_paths_and_never_registry_contents(tmp_path: Path) -> None:
     bin_dir = tmp_path / "bin"
     assert _run(["--bin-dir", str(bin_dir), "install"]).returncode == 0
