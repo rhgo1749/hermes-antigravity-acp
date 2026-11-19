@@ -96,6 +96,8 @@ def log(payload):
         "affinity_max_entries": os.environ.get("ACP_MUX_AFFINITY_MAX_ENTRIES", ""),
         "mux_session_id": os.environ.get("ACP_MUX_SESSION_ID", ""),
         "mux_session_gc": os.environ.get("ACP_MUX_SESSION_GC", ""),
+        "f3_cutover_ack": os.environ.get("ACP_MUX_F3_CUTOVER_ACK", ""),
+        "f4_process_tree_ack": os.environ.get("ACP_MUX_F4_PROCESS_TREE_ACK", ""),
         **payload,
     }
     with open(log_path, "a", encoding="utf-8") as fh:
@@ -1795,6 +1797,224 @@ def test_native_store_gc_opt_in_env_forwards_to_acp_child(monkeypatch, tmp_path)
     assert any(
         row["method"] == "session/new" and row["mux_session_gc"] == "1" for row in rows
     )
+
+
+def _ack_rows(log_path):
+    return [
+        row
+        for row in (
+            json.loads(line)
+            for line in log_path.read_text(encoding="utf-8").splitlines()
+        )
+        if row["method"] == "session/new"
+    ]
+
+
+def test_f4_acks_forward_to_mux_named_child(monkeypatch, tmp_path) -> None:
+    script, log_path = _write_fake_server(tmp_path)
+    mux_script = tmp_path / "mux.py"
+    mux_script.write_text(script.read_text(encoding="utf-8"))
+    client = _load_client(
+        monkeypatch,
+        command=sys.executable,
+        args=[str(mux_script), str(log_path)],
+        cwd=str(tmp_path),
+    )
+    monkeypatch.setenv("HERMES_ANTIGRAVITY_ACP_F3_CUTOVER_ACK", "1")
+    monkeypatch.setenv("HERMES_ANTIGRAVITY_ACP_F4_PROCESS_TREE_ACK", "1")
+    client.chat.completions.create(
+        model="gemini-3.1-pro",
+        messages=[{"role": "user", "content": "hello"}],
+        timeout=10,
+    )
+    rows = _ack_rows(log_path)
+    assert rows
+    assert all(row["f3_cutover_ack"] == "1" for row in rows)
+    assert all(row["f4_process_tree_ack"] == "1" for row in rows)
+
+
+def test_f4_acks_never_cross_single_named_child(monkeypatch, tmp_path) -> None:
+    script, log_path = _write_fake_server(tmp_path)
+    client = _load_client(
+        monkeypatch,
+        command=sys.executable,
+        args=[str(script), str(log_path)],
+        cwd=str(tmp_path),
+    )
+    monkeypatch.setenv("HERMES_ANTIGRAVITY_ACP_F3_CUTOVER_ACK", "1")
+    monkeypatch.setenv("HERMES_ANTIGRAVITY_ACP_F4_PROCESS_TREE_ACK", "1")
+    client.chat.completions.create(
+        model="gemini-3.1-pro",
+        messages=[{"role": "user", "content": "hello"}],
+        timeout=10,
+    )
+    rows = _ack_rows(log_path)
+    assert rows
+    assert all(row["f3_cutover_ack"] == "" for row in rows)
+    assert all(row["f4_process_tree_ack"] == "" for row in rows)
+
+
+def test_f4_acks_absent_operator_env_never_fabricated(monkeypatch, tmp_path) -> None:
+    script, log_path = _write_fake_server(tmp_path)
+    mux_script = tmp_path / "mux.py"
+    mux_script.write_text(script.read_text(encoding="utf-8"))
+    client = _load_client(
+        monkeypatch,
+        command=sys.executable,
+        args=[str(mux_script), str(log_path)],
+        cwd=str(tmp_path),
+    )
+    monkeypatch.delenv("HERMES_ANTIGRAVITY_ACP_F3_CUTOVER_ACK", raising=False)
+    monkeypatch.delenv("HERMES_ANTIGRAVITY_ACP_F4_PROCESS_TREE_ACK", raising=False)
+    client.chat.completions.create(
+        model="gemini-3.1-pro",
+        messages=[{"role": "user", "content": "hello"}],
+        timeout=10,
+    )
+    rows = _ack_rows(log_path)
+    assert rows
+    assert all(row["f3_cutover_ack"] == "" for row in rows)
+    assert all(row["f4_process_tree_ack"] == "" for row in rows)
+
+
+def test_f4_acks_legacy_acp_mux_names_are_normalized(monkeypatch, tmp_path) -> None:
+    """The documented incident config sets the ACP_MUX_* spellings.
+
+    The child env filter strips those inherited keys, so normalization must
+    re-inject them from the operator environment for a mux-shaped launch —
+    otherwise the fix would only work for the newer HERMES_* names.
+    """
+    script, log_path = _write_fake_server(tmp_path)
+    mux_script = tmp_path / "mux.py"
+    mux_script.write_text(script.read_text(encoding="utf-8"))
+    client = _load_client(
+        monkeypatch,
+        command=sys.executable,
+        args=[str(mux_script), str(log_path)],
+        cwd=str(tmp_path),
+    )
+    monkeypatch.delenv("HERMES_ANTIGRAVITY_ACP_F3_CUTOVER_ACK", raising=False)
+    monkeypatch.delenv("HERMES_ANTIGRAVITY_ACP_F4_PROCESS_TREE_ACK", raising=False)
+    monkeypatch.setenv("ACP_MUX_F3_CUTOVER_ACK", "1")
+    monkeypatch.setenv("ACP_MUX_F4_PROCESS_TREE_ACK", "1")
+    client.chat.completions.create(
+        model="gemini-3.1-pro",
+        messages=[{"role": "user", "content": "hello"}],
+        timeout=10,
+    )
+    rows = _ack_rows(log_path)
+    assert rows
+    assert all(row["f3_cutover_ack"] == "1" for row in rows)
+    assert all(row["f4_process_tree_ack"] == "1" for row in rows)
+
+
+def test_f4_acks_invalid_values_never_authorize(monkeypatch, tmp_path) -> None:
+    script, log_path = _write_fake_server(tmp_path)
+    mux_script = tmp_path / "mux.py"
+    mux_script.write_text(script.read_text(encoding="utf-8"))
+    client = _load_client(
+        monkeypatch,
+        command=sys.executable,
+        args=[str(mux_script), str(log_path)],
+        cwd=str(tmp_path),
+    )
+    monkeypatch.setenv("HERMES_ANTIGRAVITY_ACP_F3_CUTOVER_ACK", "true")
+    monkeypatch.setenv("HERMES_ANTIGRAVITY_ACP_F4_PROCESS_TREE_ACK", "01")
+    client.chat.completions.create(
+        model="gemini-3.1-pro",
+        messages=[{"role": "user", "content": "hello"}],
+        timeout=10,
+    )
+    rows = _ack_rows(log_path)
+    assert rows
+    assert all(row["f3_cutover_ack"] == "" for row in rows)
+    assert all(row["f4_process_tree_ack"] == "" for row in rows)
+
+
+def test_f4_acks_nonmux_named_wrapper_fails_safe(monkeypatch, tmp_path) -> None:
+    """A real mux behind a non-mux-shaped name gets NO ack (fail-safe).
+
+    The classifier is a launch-shape declaration, not an identity check;
+    the documented consequence is that such a mux stays audit-only rather
+    than silently gaining deletion authority.
+    """
+    script, log_path = _write_fake_server(tmp_path)
+    wrapper = tmp_path / "wrapper.py"
+    wrapper.write_text(script.read_text(encoding="utf-8"))
+    client = _load_client(
+        monkeypatch,
+        command=sys.executable,
+        args=[str(wrapper), str(log_path)],
+        cwd=str(tmp_path),
+    )
+    monkeypatch.setenv("HERMES_ANTIGRAVITY_ACP_F3_CUTOVER_ACK", "1")
+    monkeypatch.setenv("HERMES_ANTIGRAVITY_ACP_F4_PROCESS_TREE_ACK", "1")
+    client.chat.completions.create(
+        model="gemini-3.1-pro",
+        messages=[{"role": "user", "content": "hello"}],
+        timeout=10,
+    )
+    rows = _ack_rows(log_path)
+    assert rows
+    assert all(row["f3_cutover_ack"] == "" for row in rows)
+    assert all(row["f4_process_tree_ack"] == "" for row in rows)
+
+
+def test_f4_acks_reach_mux_but_never_vendor_child(monkeypatch, tmp_path) -> None:
+    """Full chain: client -> REAL mux -> fake vendor.
+
+    The acks must stop at the mux: bind() strips them before the vendor
+    subprocess spawn, exactly like the F2 declarations and the GC opt-in,
+    so deletion authority never becomes ambient for the official binary.
+    """
+    script, log_path = _write_fake_server(tmp_path)
+    par = tmp_path / "par.py"
+    par.write_text(
+        "#!/usr/bin/env python3\n"
+        f"import sys\n"
+        f"sys.argv = [{str(script)!r}, {str(log_path)!r}]\n"
+        f"exec(compile(open({str(script)!r}).read(), {str(script)!r}, 'exec'))\n"
+    )
+    par.chmod(0o755)
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_REAL_HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.delenv("ACP_MUX_SESSION_ID", raising=False)
+    monkeypatch.delenv("ACP_MUX_AFFINITY", raising=False)
+    monkeypatch.delenv("ACP_MUX_ACCOUNTS", raising=False)
+    monkeypatch.delenv("ACP_MUX_STATE", raising=False)
+    monkeypatch.delenv("ACP_MUX_LOG", raising=False)
+    monkeypatch.delenv("ACP_MUX_PAR", raising=False)
+
+    home = tmp_path / "lane-a"
+    (home / ".gemini" / "antigravity-acp" / "conversations").mkdir(parents=True)
+    registry = tmp_path / ".hermes" / "acp-accounts.json"
+    registry.parent.mkdir(parents=True, exist_ok=True)
+    registry.write_text(
+        json.dumps({"accounts": [{"home": str(home), "label": "lane-a"}]})
+    )
+
+    client = _load_client(
+        monkeypatch,
+        command=sys.executable,
+        args=[str(PLUGIN_DIR.parent.parent / "scripts" / "antigravity-acp-mux.py")],
+        cwd=str(tmp_path),
+    )
+    client_mod = importlib.import_module("antigravity_acp_fake_e2e.client")
+    monkeypatch.setattr(client_mod, "_read_par_pin", lambda: str(par))
+    monkeypatch.setenv("HERMES_ANTIGRAVITY_ACP_F3_CUTOVER_ACK", "1")
+    monkeypatch.setenv("HERMES_ANTIGRAVITY_ACP_F4_PROCESS_TREE_ACK", "1")
+    client.chat.completions.create(
+        model="gemini-3.1-pro",
+        messages=[{"role": "user", "content": "inspect"}],
+        tools=[_tool_schema()],
+        timeout=20,
+    )
+    rows = _ack_rows(log_path)
+    assert rows
+    assert all(row["f3_cutover_ack"] == "" for row in rows), f"rows={rows}"
+    assert all(row["f4_process_tree_ack"] == "" for row in rows), f"rows={rows}"
 
 
 def test_provider_through_mux_to_fake_server_owner_routing(monkeypatch, tmp_path) -> None:

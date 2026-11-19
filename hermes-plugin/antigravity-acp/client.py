@@ -4838,6 +4838,34 @@ class AntigravityACPClient:
             if os.environ.get("HERMES_ANTIGRAVITY_ACP_NATIVE_GC", "").strip() == "1"
             else "0"
         )
+        # Issue #24 F4: the deletion-authority acks are operator evidence,
+        # not secrets, but the ACP child env filter strips every inherited
+        # ACP_MUX_* key by design — so an ack set only in the host
+        # environment would silently never reach a plugin-spawned mux, and
+        # the mux-side fences would keep reading an un-acked fleet.
+        # Normalize BOTH documented operator spellings (the original
+        # ACP_MUX_* names and the plugin-owned HERMES_* names) through an
+        # exact-key allowlist, and only to a launch target that IS a mux
+        # (the fences are mux-only; a Single-mode direct child must not
+        # receive MUX-only authority any more than the F2 declarations).
+        if _acp_launch_is_mux(self._acp_command, self._acp_args):
+            for _child_key, _operator_keys in (
+                (
+                    "ACP_MUX_F3_CUTOVER_ACK",
+                    ("ACP_MUX_F3_CUTOVER_ACK", "HERMES_ANTIGRAVITY_ACP_F3_CUTOVER_ACK"),
+                ),
+                (
+                    "ACP_MUX_F4_PROCESS_TREE_ACK",
+                    (
+                        "ACP_MUX_F4_PROCESS_TREE_ACK",
+                        "HERMES_ANTIGRAVITY_ACP_F4_PROCESS_TREE_ACK",
+                    ),
+                ),
+            ):
+                if any(
+                    os.environ.get(_k, "").strip() == "1" for _k in _operator_keys
+                ):
+                    child_env[_child_key] = "1"
         child_env["ACP_MUX_AFFINITY_PIN"] = "1" if pin_affinity else "0"
         # Session-class declaration (issue #24 F2): the explicit llm_backend
         # one-shot policy declares backend/ephemeral, but only when the

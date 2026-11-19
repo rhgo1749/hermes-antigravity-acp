@@ -3162,6 +3162,12 @@ def main() -> int:
         # official server: strip them before the vendor subprocess spawn.
         env.pop("ACP_MUX_SESSION_ORIGIN", None)
         env.pop("ACP_MUX_SESSION_LIFECYCLE", None)
+        # Issue #24: the F3/F4 deletion-authority acks are the mux fence's
+        # operator evidence.  They must not become ambient authority for
+        # the vendor child (or anything it spawns) — strip at the same
+        # boundary as the other mux-only control signals.
+        env.pop("ACP_MUX_F3_CUTOVER_ACK", None)
+        env.pop("ACP_MUX_F4_PROCESS_TREE_ACK", None)
         env["HOME"] = home
         env["GEMINI_HOME"] = pinned_gemini_home(home)
         violation = mcp_config_violation(env["GEMINI_HOME"])

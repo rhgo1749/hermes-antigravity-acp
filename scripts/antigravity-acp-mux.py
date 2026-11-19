@@ -387,6 +387,14 @@ def main() -> int:
         env.pop("ACP_MUX_AFFINITY_MAX_ENTRIES", None)
         env.pop("ACP_MUX_SESSION_ID", None)
         env.pop("ACP_MUX_SESSION_GC", None)
+        # Issue #24: F3/F4 deletion-authority acks are the mux fence's
+        # operator evidence; never ambient authority for the vendor child.
+        env.pop("ACP_MUX_F3_CUTOVER_ACK", None)
+        env.pop("ACP_MUX_F4_PROCESS_TREE_ACK", None)
+        # F2 declarations belong to the mux's owner ledger, never to the
+        # official server (same boundary as scripts/acp_mux.py bind).
+        env.pop("ACP_MUX_SESSION_ORIGIN", None)
+        env.pop("ACP_MUX_SESSION_LIFECYCLE", None)
         env["HOME"] = home
         # Pin the Gemini home per account lane: the official server roots all
         # token/global-MCP state at $GEMINI_HOME, and a stray parent value
