@@ -53,6 +53,72 @@ PROMPT = (
     "not output Hermes-style tool_call blocks.\n"
 )
 
+# Issue #13 item 1 profile: a neutral mutation-plus-command task that makes
+# native tools the model's natural first choice WITHOUT instructing the model
+# toward or away from any tool class (the issue's canary spec forbids forcing
+# or forbidding tools in the prompt text).
+NEUTRAL_PROMPT = (
+    "Workspace task: calc.py defines add(a, b). Create helpers.py containing "
+    "exactly: def add2(a, b): return a + b. Then edit calc.py so add() imports "
+    "add2 from helpers and returns add2(a, b). Then run ./run_tests.sh in the "
+    "workspace and copy its final summary line verbatim into your answer. "
+    "Use whichever tools you judge best for each step.\n"
+)
+
+# Issue #13 items 2/3: a same-conversation follow-up. Sent as a second
+# completion over [user, assistant, user] history, it exercises the plugin's
+# affinity resume path against the live server and asks for the exact test
+# summary line (item 2's completion evidence).
+FOLLOW_UP_PROMPT = (
+    "Report the exact final summary line produced by the test run in the "
+    "previous step, verbatim. Do not redo completed work.\n"
+)
+
+CANARY_CALC = "def add(a, b):\n    return a + b\n"
+CANARY_TEST = '''import unittest
+
+from calc import add
+
+
+class CalcTest(unittest.TestCase):
+    def test_add(self):
+        self.assertEqual(add(2, 3), 5)
+
+
+if __name__ == "__main__":
+    unittest.main()
+'''
+# The 2026-11-12 run's 12-round cap was a PATH artifact (no pytest on the
+# workspace PATH). This runner keeps a runnable test command on PATH in every
+# environment: pytest when importable, stdlib unittest otherwise.
+CANARY_RUNNER = (
+    "#!/bin/sh\n"
+    "if python3 -c 'import pytest' >/dev/null 2>&1; then\n"
+    "    python3 -m pytest -q\n"
+    "else\n"
+    "    python3 -m unittest -q\n"
+    "fi\n"
+)
+
+
+def prepare_workspace(cwd: str) -> list[str]:
+    """Create the canary task files; never overwrite existing files."""
+    created: list[str] = []
+    for name, body in (
+        ("calc.py", CANARY_CALC),
+        ("test_calc.py", CANARY_TEST),
+        ("run_tests.sh", CANARY_RUNNER),
+    ):
+        path = Path(cwd) / name
+        if path.exists():
+            continue
+        path.write_text(body, encoding="utf-8")
+        if name == "run_tests.sh":
+            # Only files this function created get their mode changed.
+            path.chmod(0o755)
+        created.append(name)
+    return created
+
 SUMMARY_RE = re.compile(
     r"\b\d+ (?:passed|failed|error[s]?|skipped|deselected)\b[^\n]{0,80}"
 )
@@ -432,11 +498,20 @@ def _sanitize_raw_protocol(frame: Any, clean_text: Any, *, context: str = _CTX_E
 
 class FrameRecorder:
     def __init__(
-        self, path: Path, clean_text: Any, *, sanitizer: Any = _sanitize
+        self,
+        path: Path,
+        clean_text: Any,
+        *,
+        sanitizer: Any = _sanitize,
+        denial_fact_bits: bool = False,
     ) -> None:
         self._fh = path.open("x", encoding="utf-8")
         self._clean = clean_text
         self._sanitize = sanitizer
+        # Pre-sanitization denial presence bits are a default-mode evidence
+        # extension only; the strict raw-probe evidence format stays bit-exact
+        # to its pre-existing contract.
+        self._denial_fact_bits = denial_fact_bits
         self.frames: list[dict[str, Any]] = []
 
     def record(self, direction: str, payload: str) -> None:
@@ -449,6 +524,33 @@ class FrameRecorder:
             "dir": direction,
             "frame": self._sanitize(frame, self._clean),
         }
+        if self._denial_fact_bits:
+            # A denial marker can ride inside a long server error string that
+            # the sanitizer collapses into summary lines; keep only the
+            # boolean fact, never the text. Scoped to inbound
+            # session/update tool-activity frames' rawOutput so unrelated
+            # fields cannot trigger a false positive.
+            if (
+                direction == "in"
+                and isinstance(frame, dict)
+                and frame.get("method") == "session/update"
+            ):
+                params = frame.get("params")
+                update = params.get("update") if isinstance(params, dict) else None
+                if (
+                    isinstance(update, dict)
+                    and str(update.get("sessionUpdate") or "").startswith("tool_call")
+                ):
+                    try:
+                        scoped_text = json.dumps(
+                            update.get("rawOutput"), ensure_ascii=False
+                        )
+                    except (TypeError, ValueError):
+                        scoped_text = ""
+                    if "denied by pre-tool hook" in scoped_text:
+                        entry["pre_tool_hook_denial_fact"] = True
+                    if "denied by user" in scoped_text:
+                        entry["server_denied_by_user_fact"] = True
         self.frames.append(entry)
         self._fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
         self._fh.flush()
@@ -532,6 +634,13 @@ class TelemetryCollector(logging.Handler):
             self.messages.append(message[:300])
 
 
+def _jsonrpc_id_is_scalar(value: Any) -> bool:
+    # JSON-RPC ids correlate only as str/int; bool is excluded despite being
+    # an int subclass (True == 1 would collide with numeric id 1), and
+    # dict/list ids are never hashed.
+    return isinstance(value, (str, int)) and not isinstance(value, bool)
+
+
 def analyze_frames(recorder: FrameRecorder) -> dict[str, Any]:
     tools: dict[str, dict[str, Any]] = {}
     pending_permission_ids: dict[Any, str] = {}
@@ -542,7 +651,7 @@ def analyze_frames(recorder: FrameRecorder) -> dict[str, Any]:
             {"stages": [], "names": set(), "origins": set(), "kinds": set()},
         )
 
-    for entry in recorder.frames:
+    for ordinal, entry in enumerate(recorder.frames):
         frame = entry["frame"]
         direction = entry["dir"]
         params = frame.get("params") or {}
@@ -550,6 +659,7 @@ def analyze_frames(recorder: FrameRecorder) -> dict[str, Any]:
         if isinstance(update, dict) and str(update.get("sessionUpdate") or "").startswith("tool_call"):
             call_id = str(update.get("toolCallId") or "unknown")
             rec = tool(call_id)
+            rec.setdefault("first_activity_ordinal", ordinal)
             for key in ("name", "toolName"):
                 if isinstance(update.get(key), str):
                     rec["names"].add(update[key])
@@ -569,6 +679,10 @@ def analyze_frames(recorder: FrameRecorder) -> dict[str, Any]:
                     stage["pre_tool_hook_denial"] = True
                 if "denied by user" in text:
                     stage["server_reported_denied_by_user"] = True
+            if entry.get("pre_tool_hook_denial_fact"):
+                stage["pre_tool_hook_denial"] = True
+            if entry.get("server_denied_by_user_fact"):
+                stage["server_reported_denied_by_user"] = True
             rec["stages"].append(stage)
         if frame.get("method") == "session/request_permission":
             call = (params.get("toolCall") or {})
@@ -925,7 +1039,26 @@ def main() -> int:
         "--operator-supervised-live", action="store_true",
         help="Interactive live lane; separate human approval is still required",
     )
-    parser.add_argument("--prompt", default=PROMPT)
+    parser.add_argument("--prompt", default=None)
+    parser.add_argument(
+        "--prompt-profile",
+        choices=("legacy-native-forcing", "neutral"),
+        default="legacy-native-forcing",
+        help="neutral = issue #13 item 1 adversarial profile (no tool forcing/forbidding)",
+    )
+    parser.add_argument(
+        "--follow-up",
+        nargs="?",
+        const=FOLLOW_UP_PROMPT,
+        default=None,
+        help="send one same-conversation follow-up completion (default text: exact "
+        "test summary line request); exercises the live session/resume path",
+    )
+    parser.add_argument(
+        "--prepare-workspace",
+        action="store_true",
+        help="create calc.py/test_calc.py/run_tests.sh in --cwd if absent before running",
+    )
     parser.add_argument(
         "--command",
         default=str(Path.home() / ".local" / "bin" / "antigravity-acp-official"),
@@ -973,8 +1106,21 @@ def main() -> int:
         if confirmation.strip() != "RUN_ONE_SUPERVISED_CANARY":
             print("live canary not confirmed", file=sys.stderr)
             return 2
-    if args.mode == "raw-probe" and args.prompt == PROMPT:
-        args.prompt = "Reply with exactly pong."
+    if args.prompt is None:
+        if args.mode == "raw-probe":
+            args.prompt = "Reply with exactly pong."
+        else:
+            args.prompt = (
+                NEUTRAL_PROMPT if args.prompt_profile == "neutral" else PROMPT
+            )
+    if args.mode != "default" and (
+        args.follow_up is not None or args.prepare_workspace
+    ):
+        print(
+            "--follow-up/--prepare-workspace apply to --mode default only",
+            file=sys.stderr,
+        )
+        return 2
 
     cwd = str(Path(args.cwd).resolve())
     if not Path(cwd).is_dir():
@@ -986,13 +1132,21 @@ def main() -> int:
     except FileExistsError:
         print("evidence path already exists; refusing to append/overwrite", file=sys.stderr)
         return 2
+    # Workspace preparation runs only after every preflight (including the
+    # exclusive evidence directory) has passed, so a refused run never
+    # leaves files behind.
+    if args.prepare_workspace:
+        print(json.dumps({"workspace_files_created": prepare_workspace(cwd)}))
 
     # client submodules are imported lazily by create_client; the raw driver
     # has no plugin client, so it falls back to the identity redactor.
     clean_text = _redact_factory(None)
     sanitizer = _sanitize_raw_protocol if args.mode == "raw-probe" else _sanitize
     recorder = FrameRecorder(
-        evidence_dir / "frames.jsonl", clean_text, sanitizer=sanitizer
+        evidence_dir / "frames.jsonl",
+        clean_text,
+        sanitizer=sanitizer,
+        denial_fact_bits=(args.mode != "raw-probe"),
     )
 
     if args.mode == "raw-probe":
@@ -1011,8 +1165,16 @@ def main() -> int:
     # must fail closed by design; record it so an environment mistake can
     # never be mistaken for a policy result.
     import importlib.util
+    try:
+        hermes_policy_available = (
+            importlib.util.find_spec("agent.file_safety") is not None
+        )
+    except (ImportError, ValueError):
+        # find_spec on a dotted name imports the parent package and raises
+        # when it is absent; the recorded fact below is the contract.
+        hermes_policy_available = False
     summary_environment = {
-        "hermes_policy_available": importlib.util.find_spec("agent.file_safety") is not None,
+        "hermes_policy_available": hermes_policy_available,
         "python": sys.version.split()[0],
     }
     (evidence_dir / "environment.json").write_text(
@@ -1043,6 +1205,7 @@ def main() -> int:
     started = time.monotonic()
     error = None
     answer = None
+    follow_up_answer = None
     try:
         completion = client.chat.completions.create(
             messages=[{"role": "user", "content": args.prompt}],
@@ -1051,6 +1214,22 @@ def main() -> int:
             stream=False,
         )
         answer = completion.choices[0].message.content
+        if error is None and args.follow_up is not None:
+            # Same conversation, one turn later: identical opening user
+            # message keeps the standalone affinity key stable, so the plugin
+            # must resume the native session created above (issue #13 item 3
+            # observes what survives that boundary).
+            follow_completion = client.chat.completions.create(
+                messages=[
+                    {"role": "user", "content": args.prompt},
+                    {"role": "assistant", "content": answer or ""},
+                    {"role": "user", "content": args.follow_up},
+                ],
+                model=args.model,
+                timeout=args.timeout,
+                stream=False,
+            )
+            follow_up_answer = follow_completion.choices[0].message.content
     except BaseException as exc:  # noqa: BLE001 - report every failure class truthfully
         error = f"{type(exc).__name__}: {clean_text(str(exc))[:300]}"
     finally:
@@ -1070,15 +1249,156 @@ def main() -> int:
         effects["calc_py_modified"] = "add2" in calc.read_text(encoding="utf-8")
 
     analysis = analyze_frames(recorder)
+    launch_seq = [
+        stage
+        for stage in analysis["tools"].get("__session__", {}).get("stages", [])
+        if isinstance(stage, dict)
+        and stage.get("method") in {"session/new", "session/resume"}
+    ]
+    new_positions = [
+        i for i, s in enumerate(launch_seq) if s["method"] == "session/new"
+    ]
+    resume_positions = [
+        i for i, s in enumerate(launch_seq) if s["method"] == "session/resume"
+    ]
+    first_resume = resume_positions[0] if resume_positions else None
+    # Response-level resume outcome: the resume request's own JSON-RPC
+    # response (a later frame carrying result or error under the same id)
+    # must exist and carry no error. A resume that the server rejected is a
+    # failure even when no full-replay session/new follows. Ids are matched
+    # only when hashable scalars; a non-response frame under the same id
+    # never counts.
+    resume_request_ordinals: dict[Any, int] = {}
+    for ordinal, entry in enumerate(recorder.frames):
+        frame = entry["frame"]
+        if (
+            entry["dir"] == "out"
+            and isinstance(frame, dict)
+            and frame.get("method") == "session/resume"
+        ):
+            request_id = frame.get("id")
+            if _jsonrpc_id_is_scalar(request_id):
+                resume_request_ordinals.setdefault(request_id, ordinal)
+    resume_response_seen = False
+    resume_response_error = False
+    for ordinal, entry in enumerate(recorder.frames):
+        frame = entry["frame"]
+        if entry["dir"] != "in" or not isinstance(frame, dict):
+            continue
+        response_id = frame.get("id")
+        if (
+            not _jsonrpc_id_is_scalar(response_id)
+            or response_id not in resume_request_ordinals
+            or ordinal <= resume_request_ordinals[response_id]
+        ):
+            continue
+        if "result" not in frame and "error" not in frame:
+            continue
+        resume_response_seen = True
+        if isinstance(frame.get("error"), dict):
+            resume_response_error = True
+    resume_fell_back = (
+        first_resume is not None
+        and any(i > first_resume for i in new_positions)
+    )
+    resume_succeeded = (
+        first_resume is not None
+        and resume_response_seen
+        and not resume_response_error
+        and not resume_fell_back
+    )
+    new_dt = (
+        launch_seq[new_positions[0]].get("disabled_tools")
+        if new_positions
+        else None
+    )
+    resume_dt = (
+        launch_seq[first_resume].get("disabled_tools")
+        if first_resume is not None
+        else None
+    )
+    # Vacuity guard: two missing/empty restriction lists are NOT evidence of
+    # preservation; only a non-empty pin observed on BOTH launches can be
+    # compared. Otherwise the result stays undetermined (None).
+    disabled_tools_preserved = None
+    if (
+        resume_succeeded
+        and isinstance(new_dt, list)
+        and isinstance(resume_dt, list)
+        and new_dt
+        and resume_dt
+    ):
+        disabled_tools_preserved = sorted(new_dt) == sorted(resume_dt)
+    resume_observation: dict[str, Any] = {
+        "follow_up_requested": args.follow_up is not None,
+        "resume_seen": first_resume is not None,
+        "resume_succeeded": resume_succeeded if first_resume is not None else None,
+        "resume_fell_back_to_new": resume_fell_back if first_resume is not None else None,
+        "new_launch_disabled_tools": new_dt,
+        "resume_launch_disabled_tools": resume_dt,
+        "resume_response_seen": resume_response_seen,
+        "resume_response_error": resume_response_error,
+        "run_command_pinned_on_both": (
+            isinstance(new_dt, list)
+            and isinstance(resume_dt, list)
+            and "run_command" in new_dt
+            and "run_command" in resume_dt
+        ),
+        "disabled_tools_preserved": disabled_tools_preserved,
+    }
+    denial_records = []
+    activity_sequence = []
+    for tool_id, rec in analysis["tools"].items():
+        if tool_id == "__session__":
+            continue
+        positions = [
+            i for i, stage in enumerate(rec["stages"])
+            if stage.get("pre_tool_hook_denial")
+        ]
+        ordinal = rec.get("first_activity_ordinal")
+        activity_sequence.append({
+            "tool_call_id": tool_id,
+            "names": rec["names"],
+            "first_activity_ordinal": ordinal,
+        })
+        if positions:
+            denial_records.append({
+                "names": rec["names"],
+                "origins": rec["origins"],
+                "kinds": rec["kinds"],
+                "denial_stage_positions": positions,
+                "stage_count": len(rec["stages"]),
+                "first_activity_ordinal": ordinal,
+            })
+    activity_sequence.sort(
+        key=lambda record: (
+            record["first_activity_ordinal"]
+            if record["first_activity_ordinal"] is not None
+            else -1
+        )
+    )
+    fallback_observation = {
+        "denied_tool_records": denial_records,
+        "tool_activity_sequence": activity_sequence,
+        "note": (
+            "facts only; the native-denial -> fallback transition verdict is "
+            "made by the evidence reviewer against issue #13 criteria"
+        ),
+    }
     summary = {
         "mode": args.mode,
         "cwd": cwd,
         "elapsed_seconds": round(time.monotonic() - started, 1),
         "answer_char_count": len(answer or ""),
+        "follow_up_answer_char_count": (
+            len(follow_up_answer or "") if args.follow_up is not None else None
+        ),
         "error": error,
         "effects": effects,
         "permission_telemetry": collector.events,
         "permission_log_messages": collector.messages[:20],
+        "resume_observation": resume_observation,
+        "fallback_observation": fallback_observation,
         "analysis": analysis,
     }
     (evidence_dir / "summary.json").write_text(
@@ -1092,6 +1412,7 @@ def main() -> int:
         "effects": effects,
         "tool_ids": sorted(tools),
         "telemetry_events": len(collector.events),
+        "resume_observation": resume_observation,
         "evidence": str(evidence_dir),
     }, indent=2))
     recorder._fh.close()

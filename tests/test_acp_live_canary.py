@@ -40,6 +40,7 @@ def receive():
         log.write(json.dumps(msg) + "\n")
     return msg
 
+prompt_count = 0
 while True:
     request = receive()
     if request is None:
@@ -86,6 +87,16 @@ while True:
             # A separate incoming frame is required before session/prompt.
             time.sleep(0.04)
             emit({"jsonrpc": "2.0", "id": rpc_id, "result": {}})
+    elif method == "session/set_config_option":
+        emit({"jsonrpc": "2.0", "id": rpc_id, "result": {}})
+    elif method == "session/resume":
+        if scenario == "resume_follow_up":
+            params = request.get("params") or {}
+            emit({
+                "jsonrpc": "2.0",
+                "id": rpc_id,
+                "result": {"sessionId": str(params.get("sessionId") or "")},
+            })
     elif method == "session/prompt":
         if scenario == "hostile_values":
             # Every string below is a server-controlled value the strict
@@ -110,6 +121,54 @@ while True:
                                                     "text": "CANARY_SENTINEL_CHUNK_TEXT_4839207"}}}})
             emit({"jsonrpc": "2.0", "id": rpc_id,
                   "result": {"stopReason": "CANARY_SENTINEL_STOP_REASON_4839207"}})
+            time.sleep(3)
+            break
+        if scenario in ("denial_facts", "denial_facts_long"):
+            # The long variant exceeds the sanitizer's inline-text budget so
+            # detection must survive via the pre-sanitization presence fact.
+            denial_error = "Tool execution denied by pre-tool hook."
+            if scenario == "denial_facts_long":
+                denial_error += " " + "vendor context " * 12
+            emit({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "session-secret-opaque", "update": {
+                "sessionUpdate": "tool_call", "toolCallId": "native-denied",
+                "name": "write_file",
+                "title": "write_file", "kind": "edit", "status": "failed",
+                "rawOutput": {"error": denial_error},
+            }}})
+            time.sleep(0.2)
+            emit({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "session-secret-opaque", "update": {
+                "sessionUpdate": "tool_call", "toolCallId": "bridge-1",
+                "title": "bridge tool_call", "kind": "other", "status": "pending",
+                "rawInput": {"tool": "terminal"},
+            }}})
+            time.sleep(0.2)
+            emit({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "session-secret-opaque", "update": {
+                "sessionUpdate": "tool_call_update", "toolCallId": "bridge-1",
+                "status": "completed", "rawOutput": {"content": "ok"},
+            }}})
+            time.sleep(0.2)
+            emit({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "session-secret-opaque", "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "FALLBACK_FACTS_DONE"},
+            }}})
+            emit({"jsonrpc": "2.0", "id": rpc_id, "result": {"stopReason": "end_turn"}})
+            time.sleep(3)
+            break
+        if scenario == "resume_follow_up":
+            prompt_count += 1
+            text = (
+                "FIRST_ANSWER_SENTINEL"
+                if prompt_count == 1
+                else "1 passed in 0.01s"
+            )
+            emit({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "session-secret-opaque", "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": text},
+            }}})
+            emit({"jsonrpc": "2.0", "id": rpc_id, "result": {"stopReason": "end_turn"}})
+            if prompt_count < 2:
+                # Stay alive on the same connection for the follow-up resume.
+                continue
             time.sleep(3)
             break
         if scenario == "hostile_keys":
@@ -1044,3 +1103,180 @@ def test_nonempty_model_ordered_handshake_positive_control(
     assert status["set_model_acknowledged"] is True
     assert status["effective_model_verified"] is False
     assert status["prompt_count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Issue #13 live-canary extensions: same-conversation follow-up resume,
+# neutral prompt profile, denial/fallback facts, workspace preparation.
+# ---------------------------------------------------------------------------
+
+def _baked_fake(tmp_path: Path, scenario: str, log_path: Path) -> Path:
+    """Fake ACP server with scenario/log baked in.
+
+    The plugin's child-env allowlist strips ACP_FAKE_* from inherited
+    environment, so the default-mode lane bakes them via a wrapper preamble
+    instead of monkeypatch.setenv.
+    """
+    executable = tmp_path / f"fake_acp_server_{scenario}"
+    executable.write_text(
+        f"#!{sys.executable}\n"
+        "import os\n"
+        f"os.environ.setdefault('ACP_FAKE_SCENARIO', {scenario!r})\n"
+        f"os.environ.setdefault('ACP_FAKE_LOG', {str(log_path)!r})\n"
+        + FAKE_SOURCE,
+        encoding="utf-8",
+    )
+    executable.chmod(0o700)
+    return executable
+
+
+def test_prepare_workspace_creates_once_and_never_overwrites(canary, tmp_path):
+    (tmp_path / "calc.py").write_text("CUSTOM\n", encoding="utf-8")
+    created = canary.prepare_workspace(str(tmp_path))
+    assert created == ["test_calc.py", "run_tests.sh"]
+    assert (tmp_path / "calc.py").read_text(encoding="utf-8") == "CUSTOM\n"
+    assert canary.prepare_workspace(str(tmp_path)) == []
+    assert (tmp_path / "run_tests.sh").stat().st_mode & 0o111
+
+
+def test_follow_up_and_prepare_rejected_outside_default_mode(
+    canary, monkeypatch, tmp_path
+):
+    binary = _fake(tmp_path)
+    log_path = tmp_path / "requests.jsonl"
+    monkeypatch.setenv("ACP_FAKE_SCENARIO", "ok")
+    monkeypatch.setenv("ACP_FAKE_LOG", str(log_path))
+    monkeypatch.setattr(sys, "argv", [
+        "acp_live_canary.py", "--cwd", str(tmp_path), "--mode", "raw-probe",
+        "--evidence", str(tmp_path / "evidence"), "--command", str(binary),
+        "--fake-acp-only", "--model", "fake-test-model", "--follow-up",
+    ])
+    assert canary.main() == 2
+    assert not log_path.exists()
+
+
+def _default_mode_argv(tmp_path, binary, evidence, *extra):
+    return [
+        "acp_live_canary.py", "--cwd", str(tmp_path), "--mode", "default",
+        "--evidence", str(evidence), "--command", str(binary),
+        "--model", "gemini-3.1-pro", "--timeout", "90", *extra,
+    ]
+
+
+def test_default_mode_follow_up_resumes_same_session_with_tool_pin(
+    canary, monkeypatch, tmp_path
+):
+    """Issue #13 item 3 (client side): a same-conversation follow-up must
+    travel over session/resume — not a fresh session — and the resume request
+    must re-pin the same disabledTools set the session was created with."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("ACP_MUX_SESSION_ID", raising=False)
+    log_path = tmp_path / "requests.jsonl"
+    binary = _baked_fake(tmp_path, "resume_follow_up", log_path)
+    evidence = tmp_path / "evidence"
+    monkeypatch.setattr(sys, "argv", _default_mode_argv(
+        tmp_path, binary, evidence, "--follow-up", "--prompt-profile", "neutral",
+    ))
+    assert canary.main() == 0
+    requests = [
+        json.loads(line)
+        for line in log_path.read_text(encoding="utf-8").splitlines()
+    ]
+    methods = [frame.get("method") for frame in requests if frame.get("method")]
+    assert methods.count("session/new") == 1
+    assert methods.count("session/resume") == 1
+    assert methods.count("session/prompt") == 2
+    # The follow-up prompt must be the neutral profile text, not the legacy
+    # native-forcing text.
+    prompts = [
+        frame for frame in requests if frame.get("method") == "session/prompt"
+    ]
+    first_text = json.dumps(prompts[0].get("params", {}))
+    assert "whichever tools you judge best" in first_text
+    assert "Hermes-style tool_call blocks" not in first_text
+    resume_request = next(
+        frame for frame in requests if frame.get("method") == "session/resume"
+    )
+    pinned = (
+        ((resume_request.get("params") or {}).get("_meta") or {})
+        .get("agy", {}).get("disabledTools")
+    )
+    assert pinned == ["run_command"]
+    summary = json.loads((evidence / "summary.json").read_text(encoding="utf-8"))
+    observation = summary["resume_observation"]
+    assert observation["follow_up_requested"] is True
+    assert observation["resume_seen"] is True
+    assert observation["resume_succeeded"] is True
+    assert observation["resume_fell_back_to_new"] is False
+    assert observation["resume_response_seen"] is True
+    assert observation["resume_response_error"] is False
+    assert observation["run_command_pinned_on_both"] is True
+    assert observation["disabled_tools_preserved"] is True
+    assert observation["new_launch_disabled_tools"] == ["run_command"]
+    assert observation["resume_launch_disabled_tools"] == ["run_command"]
+    assert summary["error"] is None
+    assert summary["follow_up_answer_char_count"] > 0
+
+
+@pytest.mark.parametrize("scenario", ["denial_facts", "denial_facts_long"])
+def test_default_mode_records_denial_and_fallback_facts_without_verdict(
+    canary, monkeypatch, tmp_path, scenario
+):
+    """Issue #13 item 1 (harness side): a pre-tool-hook denial frame and the
+    subsequent bridge activity must be captured as ordered facts; the driver
+    itself never renders the transition verdict. The long-error variant must
+    be detected even after the sanitizer collapses the error string."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    log_path = tmp_path / "requests.jsonl"
+    binary = _baked_fake(tmp_path, scenario, log_path)
+    evidence = tmp_path / "evidence"
+    monkeypatch.setattr(sys, "argv", _default_mode_argv(
+        tmp_path, binary, evidence,
+    ))
+    assert canary.main() == 0
+    summary = json.loads((evidence / "summary.json").read_text(encoding="utf-8"))
+    records = summary["fallback_observation"]["denied_tool_records"]
+    assert len(records) == 1
+    assert "write_file" in records[0]["names"]
+    assert records[0]["denial_stage_positions"]
+    assert "facts only" in summary["fallback_observation"]["note"]
+    # Global activity order: the denied native attempt must precede the
+    # bridge activity, as recorded ordinals (not per-tool stage indices).
+    sequence = summary["fallback_observation"]["tool_activity_sequence"]
+    by_id = {
+        record["tool_call_id"]: record["first_activity_ordinal"]
+        for record in sequence
+    }
+    denial_ordinal = records[0]["first_activity_ordinal"]
+    bridge_ordinal = by_id["bridge-1"]
+    assert denial_ordinal is not None and bridge_ordinal is not None
+    assert denial_ordinal < bridge_ordinal
+    assert summary["resume_observation"]["resume_seen"] is False
+    assert summary["resume_observation"]["resume_succeeded"] is None
+    assert summary["resume_observation"]["disabled_tools_preserved"] is None
+    assert summary["error"] is None
+
+
+def test_prepare_workspace_never_runs_on_refused_invocation(
+    canary, monkeypatch, tmp_path
+):
+    """A refused invocation (existing evidence dir) must not leave workspace
+    files behind: preparation runs only after every preflight passes."""
+    binary = _fake(tmp_path)
+    monkeypatch.setenv("ACP_FAKE_SCENARIO", "ok")
+    monkeypatch.setenv("ACP_FAKE_LOG", str(tmp_path / "requests.jsonl"))
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    monkeypatch.setattr(sys, "argv", [
+        "acp_live_canary.py", "--cwd", str(workspace), "--mode", "default",
+        "--evidence", str(evidence), "--command", str(binary),
+        "--model", "gemini-3.1-pro", "--prepare-workspace",
+    ])
+    assert canary.main() == 2
+    assert list(workspace.iterdir()) == []
