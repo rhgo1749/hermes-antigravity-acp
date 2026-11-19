@@ -1799,6 +1799,17 @@ def test_native_store_gc_opt_in_env_forwards_to_acp_child(monkeypatch, tmp_path)
     )
 
 
+def _clear_f4_ack_env(monkeypatch) -> None:
+    """Hermetic baseline: no inherited operator ack of any spelling."""
+    for _k in (
+        "ACP_MUX_F3_CUTOVER_ACK",
+        "ACP_MUX_F4_PROCESS_TREE_ACK",
+        "HERMES_ANTIGRAVITY_ACP_F3_CUTOVER_ACK",
+        "HERMES_ANTIGRAVITY_ACP_F4_PROCESS_TREE_ACK",
+    ):
+        monkeypatch.delenv(_k, raising=False)
+
+
 def _ack_rows(log_path):
     return [
         row
@@ -1811,6 +1822,7 @@ def _ack_rows(log_path):
 
 
 def test_f4_acks_forward_to_mux_named_child(monkeypatch, tmp_path) -> None:
+    _clear_f4_ack_env(monkeypatch)
     script, log_path = _write_fake_server(tmp_path)
     mux_script = tmp_path / "mux.py"
     mux_script.write_text(script.read_text(encoding="utf-8"))
@@ -1834,6 +1846,7 @@ def test_f4_acks_forward_to_mux_named_child(monkeypatch, tmp_path) -> None:
 
 
 def test_f4_acks_never_cross_single_named_child(monkeypatch, tmp_path) -> None:
+    _clear_f4_ack_env(monkeypatch)
     script, log_path = _write_fake_server(tmp_path)
     client = _load_client(
         monkeypatch,
@@ -1855,6 +1868,7 @@ def test_f4_acks_never_cross_single_named_child(monkeypatch, tmp_path) -> None:
 
 
 def test_f4_acks_absent_operator_env_never_fabricated(monkeypatch, tmp_path) -> None:
+    _clear_f4_ack_env(monkeypatch)
     script, log_path = _write_fake_server(tmp_path)
     mux_script = tmp_path / "mux.py"
     mux_script.write_text(script.read_text(encoding="utf-8"))
@@ -1884,6 +1898,7 @@ def test_f4_acks_legacy_acp_mux_names_are_normalized(monkeypatch, tmp_path) -> N
     re-inject them from the operator environment for a mux-shaped launch —
     otherwise the fix would only work for the newer HERMES_* names.
     """
+    _clear_f4_ack_env(monkeypatch)
     script, log_path = _write_fake_server(tmp_path)
     mux_script = tmp_path / "mux.py"
     mux_script.write_text(script.read_text(encoding="utf-8"))
@@ -1909,6 +1924,7 @@ def test_f4_acks_legacy_acp_mux_names_are_normalized(monkeypatch, tmp_path) -> N
 
 
 def test_f4_acks_invalid_values_never_authorize(monkeypatch, tmp_path) -> None:
+    _clear_f4_ack_env(monkeypatch)
     script, log_path = _write_fake_server(tmp_path)
     mux_script = tmp_path / "mux.py"
     mux_script.write_text(script.read_text(encoding="utf-8"))
@@ -1938,6 +1954,7 @@ def test_f4_acks_nonmux_named_wrapper_fails_safe(monkeypatch, tmp_path) -> None:
     the documented consequence is that such a mux stays audit-only rather
     than silently gaining deletion authority.
     """
+    _clear_f4_ack_env(monkeypatch)
     script, log_path = _write_fake_server(tmp_path)
     wrapper = tmp_path / "wrapper.py"
     wrapper.write_text(script.read_text(encoding="utf-8"))
@@ -1986,6 +2003,7 @@ def test_f4_acks_reach_mux_but_never_vendor_child(monkeypatch, tmp_path) -> None
     monkeypatch.delenv("ACP_MUX_STATE", raising=False)
     monkeypatch.delenv("ACP_MUX_LOG", raising=False)
     monkeypatch.delenv("ACP_MUX_PAR", raising=False)
+    _clear_f4_ack_env(monkeypatch)
 
     home = tmp_path / "lane-a"
     (home / ".gemini" / "antigravity-acp" / "conversations").mkdir(parents=True)
