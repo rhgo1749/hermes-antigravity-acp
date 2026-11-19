@@ -231,6 +231,7 @@ def main() -> int:
     upstream: subprocess.Popen[str] | None = None
     bound_home = ""
     bound_label = ""
+    lease: base._LaneLease | None = None
     session_gc_run = False
     owner_prune_run = False
     pump_threads: list[threading.Thread] = []
@@ -379,7 +380,7 @@ def main() -> int:
             sys.stderr.flush()
 
     def bind(home: str, label: str, reason: str) -> bool:
-        nonlocal upstream, bound_home, bound_label
+        nonlocal upstream, bound_home, bound_label, lease
         env = dict(os.environ)
         env.pop("ACP_MUX_AFFINITY", None)
         env.pop("ACP_MUX_AFFINITY_PIN", None)
@@ -405,19 +406,39 @@ def main() -> int:
             base._log(f"mcp-config-guard {label}: {violation}")
             base._mark_failure(home, label, "mcp-config", violation)
             return False
+        # Issue #24 F3: take the lane lease before the child exists, exactly
+        # as scripts/acp_mux.py's own bind does.  This entrypoint is what the
+        # launcher ships, so a lease gap here meant every deployed mux ran
+        # without lease evidence and the native GC protected every lane
+        # forever (fail-closed on ``absent``).
+        new_lease: base._LaneLease | None = None
+        if base.fcntl is not None:
+            try:
+                new_lease = base._LaneLease(home, label)
+            except OSError as exc:
+                base._log(f"lease-unavailable {label}: {exc}; refusing bind")
+                return False
+        popen_kwargs: dict = {
+            "stdin": subprocess.PIPE,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "env": env,
+            "text": True,
+            "bufsize": 1,
+        }
+        if new_lease is not None:
+            # Issue #24 F3 (review B1): the official child inherits the lease
+            # fd, so the shared lock covers the direct child too.
+            popen_kwargs["pass_fds"] = (new_lease.fd,)
         try:
-            upstream = subprocess.Popen(
-                [base.PAR, "--uid="],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=env,
-                text=True,
-                bufsize=1,
-            )
+            upstream = subprocess.Popen([base.PAR, "--uid="], **popen_kwargs)
         except OSError as exc:
             base._log(f"spawn-failed {label}: {exc}")
+            if new_lease is not None:
+                new_lease.close()
             return False
+        lease = new_lease
+        owner_relay.attach_lease(new_lease)
         bound_home = home
         bound_label = label
         base._log(f"bound account {label} ({reason}) pid={upstream.pid}")
@@ -629,6 +650,15 @@ def main() -> int:
                         upstream.wait(timeout=5)
             for thread in pump_threads:
                 thread.join(timeout=1)
+        if lease is not None:
+            # Orderly exit records a final heartbeat, then releases the
+            # lease: the lane stays protected through the same grace window
+            # a crash would leave (mirrors scripts/acp_mux.py teardown).
+            try:
+                lease.touch()
+            except OSError:
+                pass
+            lease.close()
     return 0
 
 

@@ -457,6 +457,145 @@ def test_mux_bind_takes_lease_and_sigkill_lands_in_grace(lanes, tmp_path):
             proc.kill()
 
 
+def _read_reply(proc, timeout: float = 20.0) -> dict:
+    """One reply read bounded by a whole-line deadline (buffer-safe).
+
+    A reader thread owns the blocking readline; the deadline governs the
+    entire line and works regardless of TextIOWrapper read-ahead, which
+    makes select-before-readline unsound for back-to-back replies.
+    """
+    import queue
+    import threading
+
+    box: queue.Queue = queue.Queue()
+
+    def _reader() -> None:
+        try:
+            box.put(proc.stdout.readline())
+        except Exception as exc:  # pragma: no cover - failure path
+            box.put(exc)
+
+    threading.Thread(target=_reader, daemon=True).start()
+    try:
+        line = box.get(timeout=timeout)
+    except queue.Empty:
+        raise AssertionError(
+            f"mux produced no complete stdout line within {timeout}s"
+        ) from None
+    if isinstance(line, BaseException):
+        raise line
+    if not line:
+        raise AssertionError("mux closed stdout before replying")
+    return json.loads(line)
+
+
+def test_shipped_entrypoint_bind_takes_lease(lanes, tmp_path):
+    """The launcher ships antigravity-acp-mux.py, not acp_mux.py.
+
+    Issue #24 follow-up: the entrypoint's duplicated ``bind`` predated F3 and
+    never took the lane lease, so every deployed mux ran without lease
+    evidence and the native GC fail-closed on ``absent`` for every lane
+    forever.  The base-only tests above stayed green the whole time; this
+    test pins the lease contract to the entrypoint that actually ships.
+    """
+    a, _b, _state = lanes
+    env = _mux_env(tmp_path, lanes)
+    proc = subprocess.Popen(
+        [sys.executable, str(ROOT / "scripts" / "antigravity-acp-mux.py")],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+        env=env, bufsize=1,
+    )
+    try:
+        proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize"}) + "\n")
+        proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 2, "method": "session/new",
+                                     "params": {}}) + "\n")
+        proc.stdin.flush()
+        replies = {}
+        for _ in range(2):
+            msg = _read_reply(proc)
+            replies[msg["id"]] = msg
+        assert "error" not in replies[2]
+        assert mux._lane_lease_state(str(a), "lane-alpha", now=time.time()) == "live"
+        proc.kill()
+        proc.wait(timeout=10)
+        deadline = time.time() + 10
+        state = "live"
+        while time.time() < deadline:
+            state = mux._lane_lease_state(str(a), "lane-alpha", now=time.time())
+            if state != "live":
+                break
+            time.sleep(0.05)
+        assert state == "grace"
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=10)
+        # Failure-path cleanup: the fake vendor normally exits on stdin EOF,
+        # but a mid-test failure must not leave it holding the lease.
+        for pid in _vendor_pids(env["ACP_MUX_PAR"]):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+def test_shipped_entrypoint_b1_surviving_child_keeps_lease_live(lanes, tmp_path):
+    """B1 lease-fd inheritance must hold on the SHIPPED entrypoint too.
+
+    Mirrors test_b1_surviving_vendor_child_keeps_lease_live_after_mux_sigkill
+    against scripts/antigravity-acp-mux.py: the direct child inherits the
+    lease fd, so SIGKILLing the mux leaves the lane ``live`` while the child
+    survives, and only the full lineage's death makes it reclaimable.
+    """
+    a, _b, _state = lanes
+    lease_path = mux._lane_lease_path(str(a), "lane-alpha")
+    env = _mux_env(tmp_path, lanes)
+    fake = _longlived_fake_vendor(tmp_path, lease_path)
+    env["ACP_MUX_PAR"] = str(fake)
+    proc = subprocess.Popen(
+        [sys.executable, str(ROOT / "scripts" / "antigravity-acp-mux.py")],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+        env=env, bufsize=1,
+    )
+    child_pids: list[int] = []
+    try:
+        proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 1,
+                                     "method": "initialize"}) + "\n")
+        proc.stdin.flush()
+        reply = _read_reply(proc)
+        assert reply["result"]["leaseInherited"] is True
+        assert mux._lane_lease_state(str(a), "lane-alpha",
+                                     now=time.time()) == "live"
+        _age_lease_heartbeat(a, "lane-alpha",
+                             at=time.time() - 10 * mux.LEASE_GRACE_SECONDS)
+        assert mux._lane_lease_state(str(a), "lane-alpha",
+                                     now=time.time()) == "live"
+        child_pids = _vendor_pids(str(fake))
+        assert child_pids, "fake vendor child did not start"
+        proc.kill()
+        proc.wait(timeout=10)
+        assert _vendor_pids(str(fake)), "vendor child died with the mux"
+        assert mux._lane_lease_state(str(a), "lane-alpha",
+                                     now=time.time()) == "live"
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=10)
+        for pid in child_pids + _vendor_pids(str(fake)):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+    deadline = time.time() + 10
+    state = "live"
+    while time.time() < deadline:
+        state = mux._lane_lease_state(str(a), "lane-alpha", now=time.time())
+        if state != "live":
+            break
+        time.sleep(0.05)
+    assert state == "stale"
+
+
 def test_mux_heartbeat_touches_lease_on_turn_completion(lanes, tmp_path):
     a, _b, _state = lanes
     env = _mux_env(tmp_path, lanes)
