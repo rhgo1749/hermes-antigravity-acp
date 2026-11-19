@@ -1,0 +1,16 @@
+[Unit]
+Description=ACP cgroup delegation for hermes container (issue #25 P1)
+Documentation=https://github.com/rhgo1749/hermes-antigravity-acp/pull/54
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/acp25-p1-event-listener.sh hermes
+Restart=always
+RestartSec=5
+# Kill switch (plan §7): systemctl disable --now acp-cgroup-delegate.service
+# then run acp25-p1-rollback.sh hermes production.
+
+[Install]
+WantedBy=multi-user.target

@@ -1,11 +1,18 @@
-# Issue #25 — Linux production cgroup-delegation plan (GO-ready, PROPOSAL ONLY)
+# Issue #25 — Linux production cgroup-delegation plan (APPLIED on operator host, 2026-11-19)
 
-Status: **PROPOSED — nothing in this document has been applied.** No compose,
-systemd, container, or live-process change was made for this plan. Gate B
-remains **NO-GO** until the canary below passes AND the operator approves the
-production mutation. This document is the Phase-3 deliverable for the
-containment seam (PR #53, stacked on #50); the seam itself is inert
-(`containment=UNKNOWN`) until the conditions in §3 hold.
+Status: **APPLIED on the operator host (2026-11-19) after both gates closed.**
+Gate B canary: PASS (run 20261118-225037, see PR #54 review comments). Gate C
+P1 production-shape rehearsal: PASS (run 20261119-144120, EXIT=0, PR #54
+comment `7000962504`). Production now runs the §4 P1 shape: compose env
+`HERMES_ANTIGRAVITY_ACP_CGROUP_ROOT` + host unit `acp-cgroup-delegate.service`
+(docker start-event listener → pinned helper) on the operator's `hermes`
+container; verified live (`delegated_root()` returns the delegate path; env
+absent ⇒ `None`, i.e. zero dependency for regular plugin users). The plugin
+itself is NOT yet installed in production; the seam stays inert until it is.
+The rehearsal artifacts (helper v6, rollback v4.4, runner, unit, listener,
+runbook) are committed under `docs/issue25-rehearsal/` with the md5 chain
+recorded in PR #54. Sections below retain their as-authored "proposed / NOT
+applied" wording as the pre-gate record; this paragraph is the current truth.
 
 ## 1. Topology fresh-read (2026-11-18, read-only evidence)
 
