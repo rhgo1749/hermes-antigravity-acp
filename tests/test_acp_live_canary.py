@@ -1279,6 +1279,15 @@ def test_default_mode_advertised_bridge_tool_calls_are_recorded_not_executed(
     assert len(initial_calls) == 1
     assert initial_calls[0]["name"] == "terminal"
     assert "./run_tests.sh" in initial_calls[0]["arguments"]
+    # A turn that ended with unexecuted bridge calls must NOT be replayed
+    # as a content-only follow-up: that would fingerprint-mismatch the
+    # plugin's continuation state and fake the resume observations.
+    assert facts["follow_up_skipped_reason"] == "pending_bridge_tool_calls"
+    assert not [c for c in facts["calls"] if c["phase"] == "follow_up"]
+    assert summary["follow_up_answer_char_count"] is None
+    methods = [f.get("method") for f in requests if f.get("method")]
+    assert methods.count("session/prompt") == 1
+    assert "session/resume" not in methods
     # The driver must not have executed anything: no workspace mutation.
     assert summary["effects"]["safe_file_created"] is False
     assert summary["error"] is None

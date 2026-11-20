@@ -40,7 +40,7 @@ import threading
 import time
 import types
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 PROMPT = (
     "Complete these steps in order, then answer DONE_STEPS.\n"
@@ -118,13 +118,22 @@ _BRIDGE_TERMINAL_TOOL: dict[str, Any] = {
 }
 
 
-def _bridge_tool_call_facts(completion: Any, phase: str) -> list[dict[str, Any]]:
+_BRIDGE_FACT_MAX_CHARS = 300
+
+
+def _bridge_tool_call_facts(
+    completion: Any, phase: str, clean_text: Callable[[str], str]
+) -> list[dict[str, Any]]:
     """Record (never execute) Hermes-bridge tool calls the model emitted.
 
     The plugin converts ``<tool_call>`` blocks into OpenAI-shaped
     ``message.tool_calls``.  A non-empty list is the bridge-transition fact
     issue #13 goal 1 asks for; execution belongs to the Hermes core, never
-    to this driver.
+    to this driver.  Model-authored arguments are secret-redacted through
+    the run's established clean_text redactor and length-bounded before
+    they reach summary.json, exactly like the error field.  The helper
+    assumes the plugin's SimpleNamespace-shaped completion contract (the
+    same contract ``message.content`` access already assumes).
     """
     facts: list[dict[str, Any]] = []
     try:
@@ -138,7 +147,9 @@ def _bridge_tool_call_facts(completion: Any, phase: str) -> list[dict[str, Any]]
         facts.append({
             "phase": phase,
             "name": str(getattr(function, "name", "") or ""),
-            "arguments": str(getattr(function, "arguments", "") or ""),
+            "arguments": clean_text(
+                str(getattr(function, "arguments", "") or "")
+            )[:_BRIDGE_FACT_MAX_CHARS],
         })
     return facts
 
@@ -1258,6 +1269,7 @@ def main() -> int:
         [dict(_BRIDGE_TERMINAL_TOOL)] if args.advertise_bridge_tools else []
     )
     bridge_facts: list[dict[str, Any]] = []
+    follow_up_skipped_reason: str | None = None
     started = time.monotonic()
     error = None
     answer = None
@@ -1271,8 +1283,23 @@ def main() -> int:
             stream=False,
         )
         answer = completion.choices[0].message.content
-        bridge_facts.extend(_bridge_tool_call_facts(completion, "initial"))
-        if error is None and args.follow_up is not None:
+        bridge_facts.extend(
+            _bridge_tool_call_facts(completion, "initial", clean_text)
+        )
+        if (
+            error is None
+            and args.follow_up is not None
+            and bridge_facts
+        ):
+            # The initial turn ended with bridge tool calls this driver will
+            # never execute. Re-sending the transcript as content-only would
+            # mismatch the plugin's response_fingerprint(content, tool_calls)
+            # and silently degrade the run's resume/continuation facts into
+            # replay artifacts of an incomplete history. A faithful
+            # continuation would require synthesizing tool results, which is
+            # forbidden; skip the follow-up and record why.
+            follow_up_skipped_reason = "pending_bridge_tool_calls"
+        elif error is None and args.follow_up is not None:
             # Same conversation, one turn later: identical opening user
             # message keeps the standalone affinity key stable, so the plugin
             # must resume the native session created above (issue #13 item 3
@@ -1290,7 +1317,9 @@ def main() -> int:
             )
             follow_up_answer = follow_completion.choices[0].message.content
             bridge_facts.extend(
-                _bridge_tool_call_facts(follow_completion, "follow_up")
+                _bridge_tool_call_facts(
+                    follow_completion, "follow_up", clean_text
+                )
             )
     except BaseException as exc:  # noqa: BLE001 - report every failure class truthfully
         error = f"{type(exc).__name__}: {clean_text(str(exc))[:300]}"
@@ -1453,7 +1482,9 @@ def main() -> int:
         "elapsed_seconds": round(time.monotonic() - started, 1),
         "answer_char_count": len(answer or ""),
         "follow_up_answer_char_count": (
-            len(follow_up_answer or "") if args.follow_up is not None else None
+            None
+            if args.follow_up is None or follow_up_skipped_reason is not None
+            else len(follow_up_answer or "")
         ),
         "error": error,
         "effects": effects,
@@ -1462,6 +1493,7 @@ def main() -> int:
         "bridge_tool_call_facts": {
             "advertised": bool(bridge_tools),
             "calls": bridge_facts,
+            "follow_up_skipped_reason": follow_up_skipped_reason,
         },
         "resume_observation": resume_observation,
         "fallback_observation": fallback_observation,
