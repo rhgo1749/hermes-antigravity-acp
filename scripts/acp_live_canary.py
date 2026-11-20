@@ -101,6 +101,48 @@ CANARY_RUNNER = (
 )
 
 
+_BRIDGE_TERMINAL_TOOL: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "terminal",
+        "description": (
+            "Run a shell command in the workspace via the Hermes approval-gated "
+            "terminal tool."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {"command": {"type": "string"}},
+            "required": ["command"],
+        },
+    },
+}
+
+
+def _bridge_tool_call_facts(completion: Any, phase: str) -> list[dict[str, Any]]:
+    """Record (never execute) Hermes-bridge tool calls the model emitted.
+
+    The plugin converts ``<tool_call>`` blocks into OpenAI-shaped
+    ``message.tool_calls``.  A non-empty list is the bridge-transition fact
+    issue #13 goal 1 asks for; execution belongs to the Hermes core, never
+    to this driver.
+    """
+    facts: list[dict[str, Any]] = []
+    try:
+        message = completion.choices[0].message
+    except (AttributeError, IndexError, TypeError):
+        return facts
+    for call in getattr(message, "tool_calls", None) or []:
+        function = getattr(call, "function", None)
+        if function is None:
+            continue
+        facts.append({
+            "phase": phase,
+            "name": str(getattr(function, "name", "") or ""),
+            "arguments": str(getattr(function, "arguments", "") or ""),
+        })
+    return facts
+
+
 def prepare_workspace(cwd: str) -> list[str]:
     """Create the canary task files; never overwrite existing files."""
     created: list[str] = []
@@ -1055,6 +1097,13 @@ def main() -> int:
         "test summary line request); exercises the live session/resume path",
     )
     parser.add_argument(
+        "--advertise-bridge-tools",
+        action="store_true",
+        help="advertise one Hermes terminal function tool so the plugin "
+             "renders the <tool_call> bridge; the driver records the "
+             "model's bridge tool calls without executing them",
+    )
+    parser.add_argument(
         "--prepare-workspace",
         action="store_true",
         help="create calc.py/test_calc.py/run_tests.sh in --cwd if absent before running",
@@ -1114,10 +1163,13 @@ def main() -> int:
                 NEUTRAL_PROMPT if args.prompt_profile == "neutral" else PROMPT
             )
     if args.mode != "default" and (
-        args.follow_up is not None or args.prepare_workspace
+        args.follow_up is not None
+        or args.prepare_workspace
+        or args.advertise_bridge_tools
     ):
         print(
-            "--follow-up/--prepare-workspace apply to --mode default only",
+            "--follow-up/--prepare-workspace/--advertise-bridge-tools "
+            "apply to --mode default only",
             file=sys.stderr,
         )
         return 2
@@ -1202,6 +1254,10 @@ def main() -> int:
 
     client._spawn = spawn_and_wrap
 
+    bridge_tools = (
+        [dict(_BRIDGE_TERMINAL_TOOL)] if args.advertise_bridge_tools else []
+    )
+    bridge_facts: list[dict[str, Any]] = []
     started = time.monotonic()
     error = None
     answer = None
@@ -1210,10 +1266,12 @@ def main() -> int:
         completion = client.chat.completions.create(
             messages=[{"role": "user", "content": args.prompt}],
             model=args.model,
+            tools=bridge_tools,
             timeout=args.timeout,
             stream=False,
         )
         answer = completion.choices[0].message.content
+        bridge_facts.extend(_bridge_tool_call_facts(completion, "initial"))
         if error is None and args.follow_up is not None:
             # Same conversation, one turn later: identical opening user
             # message keeps the standalone affinity key stable, so the plugin
@@ -1226,10 +1284,14 @@ def main() -> int:
                     {"role": "user", "content": args.follow_up},
                 ],
                 model=args.model,
+                tools=bridge_tools,
                 timeout=args.timeout,
                 stream=False,
             )
             follow_up_answer = follow_completion.choices[0].message.content
+            bridge_facts.extend(
+                _bridge_tool_call_facts(follow_completion, "follow_up")
+            )
     except BaseException as exc:  # noqa: BLE001 - report every failure class truthfully
         error = f"{type(exc).__name__}: {clean_text(str(exc))[:300]}"
     finally:
@@ -1397,6 +1459,10 @@ def main() -> int:
         "effects": effects,
         "permission_telemetry": collector.events,
         "permission_log_messages": collector.messages[:20],
+        "bridge_tool_call_facts": {
+            "advertised": bool(bridge_tools),
+            "calls": bridge_facts,
+        },
         "resume_observation": resume_observation,
         "fallback_observation": fallback_observation,
         "analysis": analysis,
