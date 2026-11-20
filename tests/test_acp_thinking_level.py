@@ -93,8 +93,8 @@ for line in sys.stdin:
         config_options = [{
             "id": "model",
             "category": "model",
-            "currentValue": "gemini-3.8-flash",
-            "options": [{"value": "gemini-3.8-flash"}],
+            "currentValue": "fake-model-b",
+            "options": [{"value": "fake-model-b"}],
         }]
         if THINKING_OPTION is not None:
             config_options.append(THINKING_OPTION)
@@ -125,7 +125,7 @@ def _logged_methods(log_path: Path) -> list[dict]:
 
 def _complete(client, **kwargs):
     return client.chat.completions.create(
-        model="gemini-3.8-flash",
+        model="fake-model-b",
         messages=[{"role": "user", "content": "hi"}],
         timeout=30,
         **kwargs,

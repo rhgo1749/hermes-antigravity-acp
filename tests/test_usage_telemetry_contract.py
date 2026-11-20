@@ -74,7 +74,7 @@ def test_bridge_propagates_telemetry_onto_stream_chunks_unchanged(monkeypatch, t
         "schema_id": "antigravity-acp-usage-v1",
         "status": "unavailable",
         "provider": "antigravity-acp",
-        "model": "gemini-3.8-flash-high",
+        "model": "fake-model-b-high",
         "request_usage": {bucket: None for bucket in (
             "input_tokens", "output_tokens", "cache_read_tokens",
             "cache_write_tokens", "reasoning_tokens")},
@@ -89,7 +89,7 @@ def test_bridge_propagates_telemetry_onto_stream_chunks_unchanged(monkeypatch, t
             finish_reason="stop",
         )],
         usage=None,
-        model="gemini-3.8-flash-high",
+        model="fake-model-b-high",
         antigravity_usage_telemetry=telemetry,
     )
 
@@ -107,7 +107,7 @@ def test_bridge_propagates_telemetry_onto_stream_chunks_unchanged(monkeypatch, t
 def test_stream_chunks_are_json_free_of_raw_identity(monkeypatch, tmp_path) -> None:
     client, _ = _load_client_module(monkeypatch, tmp_path)
     telemetry = client._build_usage_telemetry(
-        model="gemini-3.8-flash-high",
+        model="fake-model-b-high",
         session_id="raw-native-session-id",
         turn_id_hash=None,
         context_occupancy={"source": "acp.session/update:usage_update",
@@ -157,7 +157,7 @@ def test_usage_update_deltas_accumulate_for_explicit_hermes_session(monkeypatch,
     )
     stats = {
         "native_session_id": "raw-native-session-identifier",
-        "model": "gemini-3.8-flash-high",
+        "model": "fake-model-b-high",
         "prompt": "prompt text secret",
         "command": "private-command",
         "path": "/private/workspace",
@@ -181,9 +181,9 @@ def test_usage_update_deltas_accumulate_for_explicit_hermes_session(monkeypatch,
     entry = totals["hermes-session-explicit"]
     assert entry["schema"] == "antigravity-acp-usage-totals-v1"
     assert entry["hermes_session_id"] == "hermes-session-explicit"
-    assert entry["model"] == "gemini-3.8-flash-high"
+    assert entry["model"] == "fake-model-b-high"
     assert entry["summed_tokens"] == 650
-    assert entry["by_model"] == {"gemini-3.8-flash-high": 650}
+    assert entry["by_model"] == {"fake-model-b-high": 650}
     assert entry["frames_observed"] == 3
     assert entry["first_seen"] <= entry["last_seen"]
     assert entry["native_session_id_hash"].startswith("sha256:")

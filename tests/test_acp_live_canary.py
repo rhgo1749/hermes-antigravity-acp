@@ -1182,7 +1182,7 @@ def _default_mode_argv(tmp_path, binary, evidence, *extra):
     return [
         "acp_live_canary.py", "--cwd", str(tmp_path), "--mode", "default",
         "--evidence", str(evidence), "--command", str(binary),
-        "--model", "gemini-3.1-pro", "--timeout", "90", *extra,
+        "--model", "fake-model-a", "--timeout", "90", *extra,
     ]
 
 
@@ -1354,7 +1354,7 @@ def test_prepare_workspace_never_runs_on_refused_invocation(
     monkeypatch.setattr(sys, "argv", [
         "acp_live_canary.py", "--cwd", str(workspace), "--mode", "default",
         "--evidence", str(evidence), "--command", str(binary),
-        "--model", "gemini-3.1-pro", "--prepare-workspace",
+        "--model", "fake-model-a", "--prepare-workspace",
     ])
     assert canary.main() == 2
     assert list(workspace.iterdir()) == []

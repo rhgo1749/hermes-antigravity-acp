@@ -88,7 +88,7 @@ def test_discover_models_uses_only_server_authored_rows(monkeypatch) -> None:
     assert ids == ["server-model-a", "server-model-c"]
     assert rows[0]["label"] == "Server Model A"
     assert "label" not in rows[1]
-    assert "gemini-3.8-flash-high" not in ids or all(
+    assert "fake-model-b-high" not in ids or all(
         row["id"] in {"server-model-a", "server-model-c"} for row in rows
     )
 

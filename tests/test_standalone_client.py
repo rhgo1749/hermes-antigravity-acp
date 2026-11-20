@@ -318,7 +318,7 @@ def test_tool_result_continues_same_native_session_with_delta_and_affinity(monke
 
     first_messages = [{"role": "user", "content": "inspect"}]
     first = client.chat.completions.create(
-        model="gemini-3.1-pro",
+        model="fake-model-a",
         messages=first_messages,
         tools=tools,
     )
@@ -350,7 +350,7 @@ def test_tool_result_continues_same_native_session_with_delta_and_affinity(monke
         },
     ]
     second = client.chat.completions.create(
-        model="gemini-3.1-pro",
+        model="fake-model-a",
         messages=second_messages,
         tools=tools,
     )
@@ -882,7 +882,7 @@ def test_unchanged_tool_repeat_is_quarantined_and_corrected(monkeypatch) -> None
     ]
 
     completion = client.chat.completions.create(
-        model="gemini-3.1-pro", messages=messages, tools=tools
+        model="fake-model-a", messages=messages, tools=tools
     )
 
     assert completion.choices[0].message.content == "use the existing state"
@@ -1013,7 +1013,7 @@ def test_native_activity_survives_prompt_error(monkeypatch) -> None:
         yield {
             "sessionId": "s1",
             "_hermes_resumed": True,
-            "models": {"currentModelId": "gemini-3.8-flash-high"},
+            "models": {"currentModelId": "fake-model-b-high"},
         }, request, activity
 
     monkeypatch.setattr(client, "_session", fake_session)
@@ -1119,7 +1119,7 @@ def test_pre_asserted_1m_limit_rotates_only_at_ninety_percent(monkeypatch) -> No
         return "first answer", ""
 
     monkeypatch.setattr(client, "_run_prompt", first_run)
-    client.chat.completions.create(model="gemini-3.8-flash-high", messages=messages)
+    client.chat.completions.create(model="fake-model-b-high", messages=messages)
 
     # Inflate to 600k (~well past 128k, well under 900k): must still resume.
     registry = client_module.conversation_registry
@@ -1138,7 +1138,7 @@ def test_pre_asserted_1m_limit_rotates_only_at_ninety_percent(monkeypatch) -> No
     monkeypatch.setattr(client, "_run_prompt", resum_run)
     grown = [*messages, {"role": "assistant", "content": "first answer"},
              {"role": "user", "content": "second request"}]
-    client.chat.completions.create(model="gemini-3.8-flash-high", messages=grown)
+    client.chat.completions.create(model="fake-model-b-high", messages=grown)
 
     # Push past 900k (90% of 1M): rotation must fire even under the big cap.
     state = registry.get(affinity)
@@ -1155,7 +1155,7 @@ def test_pre_asserted_1m_limit_rotates_only_at_ninety_percent(monkeypatch) -> No
     monkeypatch.setattr(client, "_run_prompt", rotate_run)
     grown2 = [*grown, {"role": "assistant", "content": "still resuming at 600k"},
               {"role": "user", "content": "third request"}]
-    client.chat.completions.create(model="gemini-3.8-flash-high", messages=grown2)
+    client.chat.completions.create(model="fake-model-b-high", messages=grown2)
     assert seen == [""]
 
 
@@ -1163,8 +1163,8 @@ def test_default_native_limit_is_one_million_and_rotates_at_ninety_percent(monke
     _, _, client_module = _load(monkeypatch)
     monkeypatch.delenv("HERMES_ANTIGRAVITY_ACP_NATIVE_TOKEN_LIMIT", raising=False)
 
-    assert client_module._native_token_limit("gemini-3.8-flash-high") == 1_000_000
-    assert client_module._rotation_threshold("gemini-3.8-flash-high") == 900_000
+    assert client_module._native_token_limit("fake-model-b-high") == 1_000_000
+    assert client_module._rotation_threshold("fake-model-b-high") == 900_000
 
 
 def test_server_reported_native_limit_persists_across_plugin_reload(monkeypatch) -> None:
@@ -1447,7 +1447,7 @@ def test_completion_reports_usage_unavailable_instead_of_fabricated_zero(monkeyp
     monkeypatch.setattr(client, "_run_prompt", fake_run_prompt)
 
     completion = client.chat.completions.create(
-        model="gemini-3.8-flash-low",
+        model="fake-model-b-low",
         messages=[{"role": "user", "content": "hello"}],
     )
 
@@ -1457,7 +1457,7 @@ def test_completion_reports_usage_unavailable_instead_of_fabricated_zero(monkeyp
     assert telemetry["schema_id"] == "antigravity-acp-usage-v1"
     assert telemetry["status"] == "unavailable"
     assert telemetry["provider"] == "antigravity-acp"
-    assert telemetry["model"] == "gemini-3.8-flash-low"
+    assert telemetry["model"] == "fake-model-b-low"
     assert telemetry["request_usage"] == {
         "input_tokens": None,
         "output_tokens": None,
@@ -1491,7 +1491,7 @@ def test_stream_usage_chunk_preserves_unavailable_usage(monkeypatch) -> None:
     monkeypatch.setattr(client_module, "completion_to_stream_chunks", capture_bridge)
 
     chunks = client.chat.completions.create(
-        model="gemini-3.8-flash-low",
+        model="fake-model-b-low",
         messages=[{"role": "user", "content": "hello"}],
         stream=True,
     )
@@ -1535,7 +1535,7 @@ def test_stream_preserves_adapter_observed_native_read_evidence(monkeypatch) -> 
     monkeypatch.setattr(client, "_run_prompt", fake_run_prompt)
 
     chunks = client.chat.completions.create(
-        model="gemini-3.8-flash-high",
+        model="fake-model-b-high",
         messages=[{"role": "user", "content": "review this"}],
         stream=True,
     )
@@ -1583,7 +1583,7 @@ def test_failed_tool_cannot_be_reported_as_live_verification(monkeypatch) -> Non
     ]
     with pytest.raises(RuntimeError, match="unsupported PASS"):
         client.chat.completions.create(
-            model="gemini-3.8-flash-high", messages=messages
+            model="fake-model-b-high", messages=messages
         )
 
 
@@ -1604,7 +1604,7 @@ def test_native_failed_call_cannot_launder_verification_pass(monkeypatch) -> Non
     monkeypatch.setattr(client, "_run_prompt", fake_run_prompt)
     with pytest.raises(RuntimeError, match="unsupported PASS"):
         client.chat.completions.create(
-            model="gemini-3.8-flash-high",
+            model="fake-model-b-high",
             messages=[{"role": "user", "content": "verify DB"}],
         )
 
@@ -1630,7 +1630,7 @@ def test_auditable_review_forces_read_tool_before_accepting_final(monkeypatch) -
     monkeypatch.setattr(client, "_run_prompt", fake_run_prompt)
 
     completion = client.chat.completions.create(
-        model="gemini-3.8-flash-high",
+        model="fake-model-b-high",
         messages=[{
             "role": "user",
             "content": (
@@ -1664,7 +1664,7 @@ def test_auditable_review_without_read_evidence_fails_closed(monkeypatch) -> Non
 
     with pytest.raises(RuntimeError, match="auditable source-read evidence"):
         client.chat.completions.create(
-            model="gemini-3.8-flash-high",
+            model="fake-model-b-high",
             messages=[{
                 "role": "user",
                 "content": (
@@ -1719,7 +1719,7 @@ def test_auditable_review_accepts_completed_hermes_read_result(monkeypatch) -> N
         },
     ]
     completion = client.chat.completions.create(
-        model="gemini-3.8-flash-high",
+        model="fake-model-b-high",
         messages=messages,
         tools=[_tool_schema("read_file")],
     )
@@ -1757,7 +1757,7 @@ def test_auditable_review_accepts_completed_native_read_evidence(monkeypatch) ->
     monkeypatch.setattr(client, "_run_prompt", fake_run_prompt)
 
     completion = client.chat.completions.create(
-        model="gemini-3.8-flash-high",
+        model="fake-model-b-high",
         messages=[{
             "role": "user",
             "content": (
@@ -1977,7 +1977,7 @@ def test_replay_diagnostics_report_utf8_bytes_not_chars(monkeypatch) -> None:
     try:
         client_module._log_full_replay_diagnostics(
             reason="frontier_mismatch", prompt_text=prompt,
-            model="gemini-3.8-flash-high", affinity_key="sha256:abcd",
+            model="fake-model-b-high", affinity_key="sha256:abcd",
         )
     finally:
         client_module._log_full_replay_diagnostics.__globals__["logger"] = real_logger
@@ -2073,7 +2073,7 @@ def test_full_replay_diagnostics_classify_reason_and_hide_content(monkeypatch, c
     ]
     with caplog.at_level(_logging.INFO):
         client.chat.completions.create(
-            model="gemini-3.8-flash-high", messages=[*history, {"role": "user", "content": secret}]
+            model="fake-model-b-high", messages=[*history, {"role": "user", "content": secret}]
         )
     replay_lines = [m for m in caplog.messages if "ACP full replay:" in m]
     assert len(replay_lines) == 1
@@ -2086,7 +2086,7 @@ def test_full_replay_diagnostics_classify_reason_and_hide_content(monkeypatch, c
     caplog.clear()
     with caplog.at_level(_logging.INFO):
         client.chat.completions.create(
-            model="gemini-3.8-flash-high",
+            model="fake-model-b-high",
             messages=[*history, {"role": "user", "content": secret},
                       {"role": "assistant", "content": "확인했습니다."},
                       {"role": "user", "content": "이어서 검토해줘"}],
@@ -2097,7 +2097,7 @@ def test_full_replay_diagnostics_classify_reason_and_hide_content(monkeypatch, c
     caplog.clear()
     with caplog.at_level(_logging.INFO):
         client.chat.completions.create(
-            model="gemini-3.8-flash-high",
+            model="fake-model-b-high",
             messages=[*history, {"role": "user", "content": "이어서 검토해줘"}],
             tools=[_tool_schema()],
         )

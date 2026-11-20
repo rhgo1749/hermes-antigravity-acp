@@ -98,8 +98,8 @@ def text_update(text):
         "content": {"type": "text", "text": text}}}})
 
 AVAILABLE = [
-    {"modelId": "gemini-3.8-flash-high", "name": "Gemini 3.8 Flash (High)"},
-    {"modelId": "gemini-3.8-flash-medium", "name": "Gemini 3.8 Flash (Medium)"},
+    {"modelId": "fake-model-b-high", "name": "Fake Model B (High)"},
+    {"modelId": "fake-model-b-medium", "name": "Fake Model B (Medium)"},
     {"modelId": "gemini-4-argon-high", "name": "Gemini 4 Argon (High)"},
     {"modelId": "gemini-4-argon-medium", "name": "Gemini 4 Argon (Medium)"},
     {"modelId": "gemini-4-argon-low", "name": "Gemini 4 Argon (Low)"},
@@ -124,7 +124,7 @@ for line in sys.stdin:
     elif method == "session/new":
         emit({"jsonrpc": "2.0", "id": rid, "result": {
             "sessionId": "s-140",
-            "models": {"currentModelId": "gemini-3.8-flash-high",
+            "models": {"currentModelId": "fake-model-b-high",
                        "availableModels": AVAILABLE}}})
     elif method == "session/set_model":
         record(msg.get("params"))
@@ -171,7 +171,7 @@ def test_argon_ids_survive_list_models(monkeypatch, tmp_path) -> None:
     assert "gemini-4-argon-high" in models
     assert "gemini-4-argon-medium" in models
     assert "gemini-4-argon-low" in models
-    assert "gemini-3.8-flash-high" in models
+    assert "fake-model-b-high" in models
 
 
 def test_argon_selection_reaches_server_set_model(monkeypatch, tmp_path) -> None:

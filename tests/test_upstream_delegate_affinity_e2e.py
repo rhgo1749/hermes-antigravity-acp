@@ -130,10 +130,10 @@ for line in sys.stdin:
                 "configOptions": [{
                     "id": "model",
                     "category": "model",
-                    "currentValue": "gemini-3.8-flash-high",
+                    "currentValue": "fake-model-b-high",
                     "options": [
-                        {"value": "gemini-3.1-pro"},
-                        {"value": "gemini-3.8-flash-high"},
+                        {"value": "fake-model-a"},
+                        {"value": "fake-model-b-high"},
                     ],
                 }],
             },
@@ -197,7 +197,7 @@ def _load_client(monkeypatch, tmp_path: Path):
 
 def _turn(client, messages, label):
     response = client.chat.completions.create(
-        model="gemini-3.1-pro",
+        model="fake-model-a",
         messages=messages,
     )
     content = response.choices[0].message.content
@@ -652,7 +652,7 @@ def test_concurrent_same_prompt_siblings_never_share_affinity_or_frontier(
             [{"role": "user", "content": extra}] if extra else []
         )
         response = actor.chat.completions.create(
-            model="gemini-3.1-pro", messages=messages
+            model="fake-model-a", messages=messages
         )
         content = response.choices[0].message.content
         assert isinstance(content, str) and content, cid

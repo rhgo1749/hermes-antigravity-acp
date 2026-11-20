@@ -340,10 +340,10 @@ for line in sys.stdin:
     elif method in ("session/new", "session/resume"):
         emit({"jsonrpc": "2.0", "id": rid, "result": {
             "sessionId": "s-video",
-            "models": {"currentModelId": "gemini-3.8-flash-high",
+            "models": {"currentModelId": "fake-model-b-high",
                        "availableModels": [
-                           {"modelId": "gemini-3.8-flash-high",
-                            "name": "Gemini 3.8 Flash (High)"}]}}})
+                           {"modelId": "fake-model-b-high",
+                            "name": "Fake Model B (High)"}]}}})
     elif method == "session/prompt":
         if REC:
             with open(REC, "a", encoding="utf-8") as fh:
@@ -487,7 +487,7 @@ for line in sys.stdin:
     elif method == "session/new":
         emit({"jsonrpc": "2.0", "id": rid, "result": {
             "sessionId": "s-replayed",
-            "models": {"currentModelId": "gemini-3.8-flash-high", "availableModels": []}}})
+            "models": {"currentModelId": "fake-model-b-high", "availableModels": []}}})
     elif method == "session/prompt":
         with open(REC, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(msg.get("params")) + "\n")

@@ -64,9 +64,9 @@ _CREDENTIAL_PATH_RE = re.compile(
 
 # Model ids the fake server advertises through the session/new model option.
 _FAKE_MODELS = (
-    "gemini-3.8-flash-high",
-    "gemini-3.8-flash-medium",
-    "gemini-3.1-pro-low",
+    "fake-model-b-high",
+    "fake-model-b-medium",
+    "fake-model-a-low",
 )
 
 # Synthetic, obviously-fake secret material. Never long enough to resemble a

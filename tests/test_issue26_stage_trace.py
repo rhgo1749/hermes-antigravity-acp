@@ -202,7 +202,7 @@ for line in sys.stdin:
     elif method == "session/new":
         current = (
             "123e4567-e89b-12d3-a456-426614174000"
-            if mode == "hostile_model" else "gemini-3.8-flash"
+            if mode == "hostile_model" else "fake-model-b"
         )
         emit({"jsonrpc": "2.0", "id": mid, "result": {
             "sessionId": "fake-session-SECRETSESSION0001",
@@ -308,7 +308,7 @@ def test_normal_lifecycle_trace(monkeypatch, tmp_path):
     # Requested-vs-effective model pair distinguishes a silent model
     # substitution from a plain slow turn (issue scope item 3).
     assert prompt_event["detail"]["requested_model"] == "unspecified"
-    assert prompt_event["detail"]["effective_model"] == "gemini-3.8-flash"
+    assert prompt_event["detail"]["effective_model"] == "fake-model-b"
     response_event = records[4]
     assert response_event["detail"]["outcome"] == "completed"
     assert response_event["detail"]["stop_reason"] == "end_turn"
@@ -489,7 +489,7 @@ def test_local_rejection_and_retry_classification(monkeypatch, tmp_path):
 
     monkeypatch.setattr(client, "_run_prompt", fake_run_prompt)
     result = client.chat.completions.create(
-        model="gemini-3.8-flash-high",
+        model="fake-model-b-high",
         messages=[{"role": "user", "content": f"{SECRET_PROMPT_MARKER} read router.py"}],
         tools=[_tool_schema("read_file")],
     )
@@ -540,12 +540,12 @@ def test_frontier_mismatch_replay_is_classified(monkeypatch, tmp_path):
     client, _ = _make_client(module, tmp_path, "normal")
     try:
         client.chat.completions.create(
-            model="gemini-3.8-flash-high",
+            model="fake-model-b-high",
             messages=[{"role": "user", "content": "hello"}],
             tools=[_tool_schema("read_file")],
         )
         client.chat.completions.create(
-            model="gemini-3.8-flash-high",
+            model="fake-model-b-high",
             messages=[
                 {"role": "user", "content": "hello"},
                 {"role": "assistant", "content": "done"},
@@ -777,8 +777,8 @@ def test_model_surface_gate_never_echoes_credential_shapes(monkeypatch, tmp_path
     # Ordinary model names stay verbatim: the substitution-comparison feature
     # is preserved for the normal path.
     assert (
-        client_module._classify_model_surface("gemini-3.8-flash-high")
-        == "gemini-3.8-flash-high"
+        client_module._classify_model_surface("fake-model-b-high")
+        == "fake-model-b-high"
     )
     assert (
         client_module._classify_model_surface("claude-sonnet-4-20250514")
