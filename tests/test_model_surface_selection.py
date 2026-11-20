@@ -379,3 +379,114 @@ def test_resumed_session_already_on_requested_model_sends_no_selection(monkeypat
         affinity_key="conv-2", resume_session_id="s-resume",
     )
     assert not [r for r in _resume_rows(rec) if r["method"].startswith("session/set_")]
+
+
+# --- Resumed reselection across the config axis and under refusal -------------
+# Completes the resumed-reselection matrix: the configOptions-only offer path
+# (selection must route through session/set_config_option, and the fake now
+# updates its active model there) and the server-refusal fallback (the turn
+# continues on the reported default with an explicit warning).
+RESUME_CFG_FAKE = r'''
+import json, sys
+REC = REC
+def emit(p):
+    sys.stdout.write(json.dumps(p) + "\n"); sys.stdout.flush()
+def record(o):
+    with open(REC, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(o) + "\n")
+LEGACY = [{"modelId": m, "name": m} for m in
+          ("fake-model-b-high", "fake-model-a-xhigh")]
+CFG = [{"id": "model", "category": "model", "type": "select", "currentValue": "fake-model-b",
+        "options": [{"value": "fake-model-b"}, {"value": "fake-model-a"}]}]
+current = "fake-model-b-high"   # server default; never persisted across processes
+for line in sys.stdin:
+    msg = json.loads(line); method, rid = msg.get("method"), msg.get("id")
+    if method == "initialize":
+        emit({"jsonrpc": "2.0", "id": rid, "result": {"protocolVersion": 1,
+              "agentInfo": {"name": "antigravity-acp", "version": "1.4.4"},
+              "agentCapabilities": {"loadSession": True,
+                                    "sessionCapabilities": {"list": {}, "resume": {}},
+                                    "promptCapabilities": {}, "mcpCapabilities": {}},
+              "authMethods": []}})
+    elif method in ("session/new", "session/resume"):
+        record({"method": method})
+        sid = (msg.get("params") or {}).get("sessionId") or "s-resume"
+        emit({"jsonrpc": "2.0", "id": rid, "result": {"sessionId": sid, "configOptions": CFG,
+              "models": {"currentModelId": current, "availableModels": LEGACY}}})
+    elif method == "session/set_model":
+        record({"method": method, "modelId": msg["params"]["modelId"]})
+        if msg["params"]["modelId"] == "fake-model-a-xhigh":
+            emit({"jsonrpc": "2.0", "id": rid,
+                  "error": {"code": -32603, "message": "model unavailable"}})
+        else:
+            current = msg["params"]["modelId"]
+            emit({"jsonrpc": "2.0", "id": rid, "result": {}})
+    elif method == "session/set_config_option":
+        record({"method": method, "params": msg.get("params")})
+        current = (msg.get("params") or {}).get("value", current)
+        emit({"jsonrpc": "2.0", "id": rid, "result": {}})
+    elif method == "session/prompt":
+        record({"method": method, "served_by": current})
+        emit({"jsonrpc": "2.0", "method": "session/update", "params": {"update": {
+              "sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "ok"}}}})
+        emit({"jsonrpc": "2.0", "id": rid, "result": {"stopReason": "end_turn"}})
+'''
+
+
+def _resume_cfg_client(monkeypatch, tmp_path):
+    rec = tmp_path / "rec.jsonl"
+    script = tmp_path / "fake_acp_resume_cfg.py"
+    script.write_text(f"REC = {str(rec)!r}\n" + RESUME_CFG_FAKE, encoding="utf-8")
+    module, client = _load_client(monkeypatch, args=[str(script)], cwd=str(tmp_path))
+    return module, client, rec
+
+
+def test_resumed_session_reselects_through_config_option_axis(monkeypatch, tmp_path) -> None:
+    # fake-model-a is offered ONLY on the configOptions axis; reselection must
+    # route through session/set_config_option and the follow-up prompt must be
+    # served by the requested model.
+    _, client, rec = _resume_cfg_client(monkeypatch, tmp_path)
+    client._run_prompt_once(
+        "continue", timeout_seconds=20, model="fake-model-a",
+        affinity_key="conv-cfg", resume_session_id="s-resume",
+    )
+    rows = _resume_rows(rec)
+    assert rows[0] == {"method": "session/resume"}
+    assert any(
+        r["method"] == "session/set_config_option"
+        and (r.get("params") or {}).get("value") == "fake-model-a"
+        for r in rows
+    ), rows
+    prompt = [r for r in rows if r["method"] == "session/prompt"]
+    assert prompt and prompt[-1]["served_by"] == "fake-model-a", rows
+
+
+def test_resumed_reselection_refusal_falls_back_to_reported_default(
+    monkeypatch, tmp_path
+) -> None:
+    # The server refuses set_model for the offered-but-unavailable id; the turn
+    # must continue on the reported default and warn explicitly instead of
+    # silently claiming the requested model.
+    module, client, rec = _resume_cfg_client(monkeypatch, tmp_path)
+    warnings: list[str] = []
+
+    class _RecordingLogger:
+        def warning(self, fmt, *args):
+            warnings.append(fmt % args if args else fmt)
+
+        def __getattr__(self, _name):
+            return lambda *a, **k: None
+
+    import sys as _sys
+    monkeypatch.setattr(
+        _sys.modules[type(client).__module__], "logger", _RecordingLogger()
+    )
+    client._run_prompt_once(
+        "continue", timeout_seconds=20, model="fake-model-a-xhigh",
+        affinity_key="conv-fail", resume_session_id="s-resume",
+    )
+    rows = _resume_rows(rec)
+    assert {"method": "session/set_model", "modelId": "fake-model-a-xhigh"} in rows, rows
+    prompt = [r for r in rows if r["method"] == "session/prompt"]
+    assert prompt and prompt[-1]["served_by"] == "fake-model-b-high", rows
+    assert any("resumed-session reselection" in w for w in warnings), warnings
