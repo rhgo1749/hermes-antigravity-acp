@@ -1254,7 +1254,12 @@ def main() -> int:
         command=args.command, args=[], acp_cwd=cwd, rate_limit_retries=0,
     )
     client_module = sys.modules[module.__name__ + ".client"]
-    recorder._clean = _redact_factory(client_module)
+    # The plugin-aware redactor must back BOTH the frame recorder and every
+    # summary-level fact (bridge arguments, error strings).  The pre-load
+    # _redact_factory(None) is an identity redactor; keeping the local
+    # clean_text bound to it would persist unredacted model text.
+    clean_text = _redact_factory(client_module)
+    recorder._clean = clean_text
     original_spawn = client._spawn
 
     def spawn_and_wrap(**kwargs):

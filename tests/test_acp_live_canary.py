@@ -179,7 +179,8 @@ while True:
                     "<tool_call>\n"
                     '{"id": "call_fake_1", "type": "function", "function": '
                     '{"name": "terminal", "arguments": '
-                    '{"command": "./run_tests.sh"}}}\n'
+                    '{"command": "export ACCESS_TOKEN=supersecret123 '
+                    '&& ./run_tests.sh"}}}\n'
                     "</tool_call>"
                 )
             else:
@@ -1279,6 +1280,10 @@ def test_default_mode_advertised_bridge_tool_calls_are_recorded_not_executed(
     assert len(initial_calls) == 1
     assert initial_calls[0]["name"] == "terminal"
     assert "./run_tests.sh" in initial_calls[0]["arguments"]
+    # Model-authored arguments must pass through the plugin-aware redactor
+    # (regression: the pre-load clean_text was an identity redactor).
+    assert "supersecret123" not in initial_calls[0]["arguments"]
+    assert "REDACTED" in initial_calls[0]["arguments"]
     # A turn that ended with unexecuted bridge calls must NOT be replayed
     # as a content-only follow-up: that would fingerprint-mismatch the
     # plugin's continuation state and fake the resume observations.
