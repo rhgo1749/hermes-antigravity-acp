@@ -27,6 +27,8 @@ from pathlib import Path
 import sys
 import types
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 PLUGIN_DIR = ROOT / "hermes-plugin" / "antigravity-acp"
@@ -314,9 +316,12 @@ def record(o):
         fh.write(json.dumps(o) + "\n")
 LEGACY = [{"modelId": m, "name": m} for m in
           ("fake-model-b-high", "fake-model-a-xhigh", "fake-model-a-high")]
-CFG = [{"id": "model", "category": "model", "type": "select", "currentValue": "fake-model-b",
+CFG = [{"id": "model", "category": "model", "type": "select",
+        "currentValue": "" if UNREPORTED else "fake-model-b",
         "options": [{"value": "fake-model-b"}, {"value": "fake-model-a"}]}]
-current = "fake-model-b-high"   # server default; never persisted across processes
+# server default; never persisted across processes. UNREPORTED simulates a
+# resume response reporting NO current model at all (P3-1).
+current = "" if UNREPORTED else "fake-model-b-high"
 for line in sys.stdin:
     msg = json.loads(line); method, rid = msg.get("method"), msg.get("id")
     if method == "initialize":
@@ -359,11 +364,12 @@ for line in sys.stdin:
 '''
 
 
-def _resume_client(monkeypatch, tmp_path, *, refused_model=None):
+def _resume_client(monkeypatch, tmp_path, *, refused_model=None, unreported=False):
     rec = tmp_path / "rec.jsonl"
     script = tmp_path / "fake_acp_resume.py"
     script.write_text(
-        f"REC = {str(rec)!r}\nREFUSED_MODEL = {refused_model!r}\n" + RESUME_FAKE,
+        f"REC = {str(rec)!r}\nREFUSED_MODEL = {refused_model!r}\n"
+        f"UNREPORTED = {unreported!r}\n" + RESUME_FAKE,
         encoding="utf-8",
     )
     module, client = _load_client(monkeypatch, args=[str(script)], cwd=str(tmp_path))
@@ -434,3 +440,44 @@ def test_resumed_reselection_refusal_falls_back_to_reported_default(
         for record in caplog.records
     ), caplog.text
     assert f"effective_model={default} outcome=resumed_reselect_failed_session_default" in caplog.text
+
+
+def test_resumed_session_without_reported_model_still_reselects(
+    monkeypatch, tmp_path,
+) -> None:
+    # P3-1: a resume response reporting NEITHER models.currentModelId NOR the
+    # model config currentValue used to skip re-selection entirely, silently
+    # running (and attributing) on an unknown server default. The offered
+    # surface still authorizes the requested model, so selection must be
+    # attempted.
+    requested = "fake-model-a-xhigh"
+    _, client, rec = _resume_client(monkeypatch, tmp_path, unreported=True)
+    client._run_prompt_once(
+        "continue", timeout_seconds=20, model=requested,
+        affinity_key="conv-unrep", resume_session_id="s-resume",
+    )
+    assert _resume_rows(rec) == [
+        {"method": "session/resume"},
+        {"method": "session/set_model", "modelId": requested},
+        {"method": "session/prompt", "served_by": requested},
+    ]
+
+
+def test_resumed_unreported_reselection_refusal_stays_fail_closed(
+    monkeypatch, tmp_path,
+) -> None:
+    # When the re-selection attempt is refused and no current/persisted model
+    # exists, the integrity guard's refusal still applies: the prompt must NOT
+    # run on an unknown model claiming the requested one.
+    requested = "fake-model-a-xhigh"
+    _, client, rec = _resume_client(
+        monkeypatch, tmp_path, refused_model=requested, unreported=True,
+    )
+    with pytest.raises(RuntimeError, match="refusing to claim a model"):
+        client._run_prompt_once(
+            "continue", timeout_seconds=20, model=requested,
+            affinity_key="conv-unrep-fail", resume_session_id="s-resume",
+        )
+    assert [row["method"] for row in _resume_rows(rec)] == [
+        "session/resume", "session/set_model",
+    ]

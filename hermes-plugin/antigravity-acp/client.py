@@ -5881,11 +5881,23 @@ class AntigravityACPClient:
                     persisted_model = prior_state.effective_model
             current_model = _session_current_model(session)
             if resumed and not (current_model or persisted_model):
-                raise RuntimeError(
-                    "Antigravity ACP cannot determine the active model for this resumed session; "
-                    "the server did not report it and no effective model is persisted for this "
-                    "exact sessionId, so refusing to claim a requested model."
-                )
+                # Integrity guard: never claim a model we cannot verify. One
+                # escape hatch: when the offered surface still authorizes the
+                # requested model, an explicit re-selection MAKES the effective
+                # model known (the resume branch below attempts it), so refuse
+                # only when that path is unavailable.
+                offered_for_guard = _session_model_ids(session)
+                if not (
+                    requested_model
+                    and requested_model != "antigravity-acp"
+                    and offered_for_guard
+                    and requested_model in offered_for_guard
+                ):
+                    raise RuntimeError(
+                        "Antigravity ACP cannot determine the active model for this resumed session; "
+                        "the server did not report it and no effective model is persisted for this "
+                        "exact sessionId, so refusing to claim a requested model."
+                    )
             effective_model = (
                 current_model or persisted_model or requested_model or "antigravity-acp"
             )
@@ -5918,7 +5930,9 @@ class AntigravityACPClient:
                             requested_model,
                             effective_model,
                         )
-                    elif current_model and current_model != requested_model:
+                    elif current_model != requested_model and (
+                        current_model or offered_models
+                    ):
                         # The official server does not persist a set_model /
                         # set_config_option choice with the session: a resume served
                         # by a fresh server process reports (and runs) the server
@@ -5927,21 +5941,47 @@ class AntigravityACPClient:
                         # re-selection every multi-step turn on a non-default model
                         # silently continued on the default. Re-apply the requested,
                         # offered model; keep the reported model only if refused.
+                        # A resume that reports NO current model is included
+                        # only when an offered surface still authorizes the
+                        # requested model: attempting selection then MAKES the
+                        # effective model known, which beats silently running
+                        # (and attributing) on an unknown default. With no
+                        # surface and no current model there is nothing to
+                        # authorize a blind attempt, so the persisted-model
+                        # ladder below stays in charge.
                         reselection = _model_selection_request(session, requested_model)
                         if reselection is not None:
                             try:
                                 request(*reselection)
                             except RuntimeError as exc:
-                                effective_model = current_model
-                                model_selection_outcome = "resumed_reselect_failed_session_default"
+                                if not current_model and not persisted_model:
+                                    # The guard's escape hatch failed: the
+                                    # effective model is still unknown, so the
+                                    # original refusal to claim applies.
+                                    raise RuntimeError(
+                                        f"Antigravity ACP could not re-select requested model "
+                                        f"{requested_model!r} for a resumed session that reports "
+                                        f"no current model; refusing to claim a model: {exc}"
+                                    ) from exc
+                                effective_model = (
+                                    current_model or persisted_model or "antigravity-acp"
+                                )
+                                model_selection_outcome = (
+                                    "resumed_reselect_failed_session_default"
+                                    if current_model
+                                    else "resumed_reselect_failed_unreported"
+                                )
                                 logger.warning(
                                     "Antigravity ACP resumed-session reselection of %r failed; "
-                                    "continuing with %r: %s", requested_model, current_model, exc)
+                                    "continuing with %r: %s", requested_model,
+                                    current_model or persisted_model or "the unreported model", exc)
                             else:
                                 effective_model = requested_model
                                 model_selection_outcome = "resumed_session_reselected"
                         else:
-                            effective_model = current_model
+                            effective_model = (
+                                current_model or persisted_model or "antigravity-acp"
+                            )
                     elif current_model:
                         effective_model = current_model
                 else:
