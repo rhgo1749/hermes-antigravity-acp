@@ -40,7 +40,7 @@ import threading
 import time
 import types
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 PROMPT = (
     "Complete these steps in order, then answer DONE_STEPS.\n"
@@ -99,6 +99,59 @@ CANARY_RUNNER = (
     "    python3 -m unittest -q\n"
     "fi\n"
 )
+
+
+_BRIDGE_TERMINAL_TOOL: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "terminal",
+        "description": (
+            "Run a shell command in the workspace via the Hermes approval-gated "
+            "terminal tool."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {"command": {"type": "string"}},
+            "required": ["command"],
+        },
+    },
+}
+
+
+_BRIDGE_FACT_MAX_CHARS = 300
+
+
+def _bridge_tool_call_facts(
+    completion: Any, phase: str, clean_text: Callable[[str], str]
+) -> list[dict[str, Any]]:
+    """Record (never execute) Hermes-bridge tool calls the model emitted.
+
+    The plugin converts ``<tool_call>`` blocks into OpenAI-shaped
+    ``message.tool_calls``.  A non-empty list is the bridge-transition fact
+    issue #13 goal 1 asks for; execution belongs to the Hermes core, never
+    to this driver.  Model-authored arguments are secret-redacted through
+    the run's established clean_text redactor and length-bounded before
+    they reach summary.json, exactly like the error field.  The helper
+    assumes the plugin's SimpleNamespace-shaped completion contract (the
+    same contract ``message.content`` access already assumes).
+    """
+    facts: list[dict[str, Any]] = []
+    try:
+        message = completion.choices[0].message
+    except (AttributeError, IndexError, TypeError):
+        return facts
+    for call in getattr(message, "tool_calls", None) or []:
+        function = getattr(call, "function", None)
+        if function is None:
+            continue
+        facts.append({
+            "phase": phase,
+            "name": str(getattr(function, "name", "") or ""),
+            "arguments": clean_text(
+                str(getattr(function, "arguments", "") or "")
+            )[:_BRIDGE_FACT_MAX_CHARS],
+        })
+    return facts
 
 
 def prepare_workspace(cwd: str) -> list[str]:
@@ -1055,6 +1108,13 @@ def main() -> int:
         "test summary line request); exercises the live session/resume path",
     )
     parser.add_argument(
+        "--advertise-bridge-tools",
+        action="store_true",
+        help="advertise one Hermes terminal function tool so the plugin "
+             "renders the <tool_call> bridge; the driver records the "
+             "model's bridge tool calls without executing them",
+    )
+    parser.add_argument(
         "--prepare-workspace",
         action="store_true",
         help="create calc.py/test_calc.py/run_tests.sh in --cwd if absent before running",
@@ -1114,10 +1174,13 @@ def main() -> int:
                 NEUTRAL_PROMPT if args.prompt_profile == "neutral" else PROMPT
             )
     if args.mode != "default" and (
-        args.follow_up is not None or args.prepare_workspace
+        args.follow_up is not None
+        or args.prepare_workspace
+        or args.advertise_bridge_tools
     ):
         print(
-            "--follow-up/--prepare-workspace apply to --mode default only",
+            "--follow-up/--prepare-workspace/--advertise-bridge-tools "
+            "apply to --mode default only",
             file=sys.stderr,
         )
         return 2
@@ -1191,7 +1254,12 @@ def main() -> int:
         command=args.command, args=[], acp_cwd=cwd, rate_limit_retries=0,
     )
     client_module = sys.modules[module.__name__ + ".client"]
-    recorder._clean = _redact_factory(client_module)
+    # The plugin-aware redactor must back BOTH the frame recorder and every
+    # summary-level fact (bridge arguments, error strings).  The pre-load
+    # _redact_factory(None) is an identity redactor; keeping the local
+    # clean_text bound to it would persist unredacted model text.
+    clean_text = _redact_factory(client_module)
+    recorder._clean = clean_text
     original_spawn = client._spawn
 
     def spawn_and_wrap(**kwargs):
@@ -1202,6 +1270,11 @@ def main() -> int:
 
     client._spawn = spawn_and_wrap
 
+    bridge_tools = (
+        [dict(_BRIDGE_TERMINAL_TOOL)] if args.advertise_bridge_tools else []
+    )
+    bridge_facts: list[dict[str, Any]] = []
+    follow_up_skipped_reason: str | None = None
     started = time.monotonic()
     error = None
     answer = None
@@ -1210,11 +1283,28 @@ def main() -> int:
         completion = client.chat.completions.create(
             messages=[{"role": "user", "content": args.prompt}],
             model=args.model,
+            tools=bridge_tools,
             timeout=args.timeout,
             stream=False,
         )
         answer = completion.choices[0].message.content
-        if error is None and args.follow_up is not None:
+        bridge_facts.extend(
+            _bridge_tool_call_facts(completion, "initial", clean_text)
+        )
+        if (
+            error is None
+            and args.follow_up is not None
+            and bridge_facts
+        ):
+            # The initial turn ended with bridge tool calls this driver will
+            # never execute. Re-sending the transcript as content-only would
+            # mismatch the plugin's response_fingerprint(content, tool_calls)
+            # and silently degrade the run's resume/continuation facts into
+            # replay artifacts of an incomplete history. A faithful
+            # continuation would require synthesizing tool results, which is
+            # forbidden; skip the follow-up and record why.
+            follow_up_skipped_reason = "pending_bridge_tool_calls"
+        elif error is None and args.follow_up is not None:
             # Same conversation, one turn later: identical opening user
             # message keeps the standalone affinity key stable, so the plugin
             # must resume the native session created above (issue #13 item 3
@@ -1226,10 +1316,16 @@ def main() -> int:
                     {"role": "user", "content": args.follow_up},
                 ],
                 model=args.model,
+                tools=bridge_tools,
                 timeout=args.timeout,
                 stream=False,
             )
             follow_up_answer = follow_completion.choices[0].message.content
+            bridge_facts.extend(
+                _bridge_tool_call_facts(
+                    follow_completion, "follow_up", clean_text
+                )
+            )
     except BaseException as exc:  # noqa: BLE001 - report every failure class truthfully
         error = f"{type(exc).__name__}: {clean_text(str(exc))[:300]}"
     finally:
@@ -1391,12 +1487,19 @@ def main() -> int:
         "elapsed_seconds": round(time.monotonic() - started, 1),
         "answer_char_count": len(answer or ""),
         "follow_up_answer_char_count": (
-            len(follow_up_answer or "") if args.follow_up is not None else None
+            None
+            if args.follow_up is None or follow_up_skipped_reason is not None
+            else len(follow_up_answer or "")
         ),
         "error": error,
         "effects": effects,
         "permission_telemetry": collector.events,
         "permission_log_messages": collector.messages[:20],
+        "bridge_tool_call_facts": {
+            "advertised": bool(bridge_tools),
+            "calls": bridge_facts,
+            "follow_up_skipped_reason": follow_up_skipped_reason,
+        },
         "resume_observation": resume_observation,
         "fallback_observation": fallback_observation,
         "analysis": analysis,

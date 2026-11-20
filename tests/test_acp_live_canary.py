@@ -90,7 +90,7 @@ while True:
     elif method == "session/set_config_option":
         emit({"jsonrpc": "2.0", "id": rpc_id, "result": {}})
     elif method == "session/resume":
-        if scenario == "resume_follow_up":
+        if scenario in ("resume_follow_up", "bridge_call"):
             params = request.get("params") or {}
             emit({
                 "jsonrpc": "2.0",
@@ -168,6 +168,29 @@ while True:
             emit({"jsonrpc": "2.0", "id": rpc_id, "result": {"stopReason": "end_turn"}})
             if prompt_count < 2:
                 # Stay alive on the same connection for the follow-up resume.
+                continue
+            time.sleep(3)
+            break
+        if scenario == "bridge_call":
+            prompt_count += 1
+            if prompt_count == 1:
+                text = (
+                    "Running the suite now.\n"
+                    "<tool_call>\n"
+                    '{"id": "call_fake_1", "type": "function", "function": '
+                    '{"name": "terminal", "arguments": '
+                    '{"command": "export ACCESS_TOKEN=supersecret123 '
+                    '&& ./run_tests.sh"}}}\n'
+                    "</tool_call>"
+                )
+            else:
+                text = "1 passed in 0.01s"
+            emit({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "session-secret-opaque", "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": text},
+            }}})
+            emit({"jsonrpc": "2.0", "id": rpc_id, "result": {"stopReason": "end_turn"}})
+            if prompt_count < 2:
                 continue
             time.sleep(3)
             break
@@ -1218,6 +1241,61 @@ def test_default_mode_follow_up_resumes_same_session_with_tool_pin(
     assert observation["resume_launch_disabled_tools"] == ["run_command"]
     assert summary["error"] is None
     assert summary["follow_up_answer_char_count"] > 0
+
+
+def test_default_mode_advertised_bridge_tool_calls_are_recorded_not_executed(
+    canary, monkeypatch, tmp_path
+):
+    """Issue #13 item 1 (transition fact): with one Hermes terminal function
+    tool advertised, a model-emitted <tool_call> block must surface as
+    an OpenAI-shaped tool_call fact in summary.json — recorded only; the
+    driver never executes bridge tools."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("ACP_MUX_SESSION_ID", raising=False)
+    log_path = tmp_path / "requests.jsonl"
+    binary = _baked_fake(tmp_path, "bridge_call", log_path)
+    evidence = tmp_path / "evidence"
+    monkeypatch.setattr(sys, "argv", _default_mode_argv(
+        tmp_path, binary, evidence, "--follow-up", "--prompt-profile", "neutral",
+        "--advertise-bridge-tools",
+    ))
+    assert canary.main() == 0
+    requests = [
+        json.loads(line)
+        for line in log_path.read_text(encoding="utf-8").splitlines()
+    ]
+    prompts = [
+        frame for frame in requests if frame.get("method") == "session/prompt"
+    ]
+    # The advertised tool must reach the ACP prompt rendering.
+    assert "run a shell command" in json.dumps(prompts[0]).lower()
+    summary = json.loads((evidence / "summary.json").read_text(encoding="utf-8"))
+    facts = summary["bridge_tool_call_facts"]
+    assert facts["advertised"] is True
+    initial_calls = [
+        call for call in facts["calls"] if call["phase"] == "initial"
+    ]
+    assert len(initial_calls) == 1
+    assert initial_calls[0]["name"] == "terminal"
+    assert "./run_tests.sh" in initial_calls[0]["arguments"]
+    # Model-authored arguments must pass through the plugin-aware redactor
+    # (regression: the pre-load clean_text was an identity redactor).
+    assert "supersecret123" not in initial_calls[0]["arguments"]
+    assert "REDACTED" in initial_calls[0]["arguments"]
+    # A turn that ended with unexecuted bridge calls must NOT be replayed
+    # as a content-only follow-up: that would fingerprint-mismatch the
+    # plugin's continuation state and fake the resume observations.
+    assert facts["follow_up_skipped_reason"] == "pending_bridge_tool_calls"
+    assert not [c for c in facts["calls"] if c["phase"] == "follow_up"]
+    assert summary["follow_up_answer_char_count"] is None
+    methods = [f.get("method") for f in requests if f.get("method")]
+    assert methods.count("session/prompt") == 1
+    assert "session/resume" not in methods
+    # The driver must not have executed anything: no workspace mutation.
+    assert summary["effects"]["safe_file_created"] is False
+    assert summary["error"] is None
 
 
 @pytest.mark.parametrize("scenario", ["denial_facts", "denial_facts_long"])
