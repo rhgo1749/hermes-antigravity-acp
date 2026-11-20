@@ -307,7 +307,6 @@ def test_single_surface_server_still_selects(monkeypatch, tmp_path) -> None:
 # multi-step turn on a non-default model continued on the default.
 RESUME_FAKE = r'''
 import json, sys
-REC = REC
 def emit(p):
     sys.stdout.write(json.dumps(p) + "\n"); sys.stdout.flush()
 def record(o):
@@ -333,12 +332,25 @@ for line in sys.stdin:
         emit({"jsonrpc": "2.0", "id": rid, "result": {"sessionId": sid, "configOptions": CFG,
               "models": {"currentModelId": current, "availableModels": LEGACY}}})
     elif method == "session/set_model":
-        current = msg["params"]["modelId"]
-        record({"method": method, "modelId": current})
-        emit({"jsonrpc": "2.0", "id": rid, "result": {}})
+        model = msg["params"]["modelId"]
+        record({"method": method, "modelId": model})
+        if model == REFUSED_MODEL:
+            emit({"jsonrpc": "2.0", "id": rid,
+                  "error": {"code": -32603, "message": "model unavailable"}})
+        else:
+            current = model
+            emit({"jsonrpc": "2.0", "id": rid, "result": {}})
     elif method == "session/set_config_option":
-        record({"method": method, "params": msg.get("params")})
-        emit({"jsonrpc": "2.0", "id": rid, "result": {}})
+        params = msg["params"]
+        record({"method": method, "params": params})
+        if params["configId"] == CFG[0]["id"] and params["value"] in {
+            option["value"] for option in CFG[0]["options"]
+        }:
+            current = params["value"]
+            emit({"jsonrpc": "2.0", "id": rid, "result": {}})
+        else:
+            emit({"jsonrpc": "2.0", "id": rid,
+                  "error": {"code": -32602, "message": "invalid model option"}})
     elif method == "session/prompt":
         record({"method": method, "served_by": current})
         emit({"jsonrpc": "2.0", "method": "session/update", "params": {"update": {
@@ -347,10 +359,13 @@ for line in sys.stdin:
 '''
 
 
-def _resume_client(monkeypatch, tmp_path):
+def _resume_client(monkeypatch, tmp_path, *, refused_model=None):
     rec = tmp_path / "rec.jsonl"
     script = tmp_path / "fake_acp_resume.py"
-    script.write_text(f"REC = {str(rec)!r}\n" + RESUME_FAKE, encoding="utf-8")
+    script.write_text(
+        f"REC = {str(rec)!r}\nREFUSED_MODEL = {refused_model!r}\n" + RESUME_FAKE,
+        encoding="utf-8",
+    )
     module, client = _load_client(monkeypatch, args=[str(script)], cwd=str(tmp_path))
     return module, client, rec
 
@@ -379,3 +394,43 @@ def test_resumed_session_already_on_requested_model_sends_no_selection(monkeypat
         affinity_key="conv-2", resume_session_id="s-resume",
     )
     assert not [r for r in _resume_rows(rec) if r["method"].startswith("session/set_")]
+
+
+def test_resumed_session_reselects_through_config_option_axis(monkeypatch, tmp_path) -> None:
+    # fake-model-a is offered only via configOptions, not via the legacy list.
+    _, client, rec = _resume_client(monkeypatch, tmp_path)
+    client._run_prompt_once(
+        "continue", timeout_seconds=20, model="fake-model-a",
+        affinity_key="conv-cfg", resume_session_id="s-resume",
+    )
+    assert _resume_rows(rec) == [
+        {"method": "session/resume"},
+        {"method": "session/set_config_option", "params": {
+            "sessionId": "s-resume", "configId": "model", "value": "fake-model-a",
+        }},
+        {"method": "session/prompt", "served_by": "fake-model-a"},
+    ]
+
+
+def test_resumed_reselection_refusal_falls_back_to_reported_default(
+    monkeypatch, tmp_path, caplog,
+) -> None:
+    requested = "fake-model-a-xhigh"
+    default = "fake-model-b-high"
+    _, client, rec = _resume_client(monkeypatch, tmp_path, refused_model=requested)
+    with caplog.at_level("INFO", logger=type(client).__module__):
+        client._run_prompt_once(
+            "continue", timeout_seconds=20, model=requested,
+            affinity_key="conv-fail", resume_session_id="s-resume",
+        )
+    assert _resume_rows(rec) == [
+        {"method": "session/resume"},
+        {"method": "session/set_model", "modelId": requested},
+        {"method": "session/prompt", "served_by": default},
+    ]
+    assert any(
+        record.levelname == "WARNING"
+        and f"reselection of {requested!r} failed; continuing with {default!r}" in record.message
+        for record in caplog.records
+    ), caplog.text
+    assert f"effective_model={default} outcome=resumed_reselect_failed_session_default" in caplog.text
