@@ -295,3 +295,87 @@ def test_single_surface_server_still_selects(monkeypatch, tmp_path) -> None:
     )
     rows = _selections(record)
     assert any(row["method"] == "session/set_config_option" for row in rows), rows
+
+
+# --- Resumed sessions keep the requested model -------------------------------
+# Live (official server, 2026-11-19, fake-model-a-xhigh): the server does not
+# persist a set_model choice with the session. A session/resume served by a new
+# server process reports and runs the server default (fake-model-b-high)
+# until the client selects again; re-selecting after resume is accepted and the
+# trajectory is kept. Tool-call continuations always resume in a fresh process
+# (parked warm processes never serve resumes), so without re-selection every
+# multi-step turn on a non-default model continued on the default.
+RESUME_FAKE = r'''
+import json, sys
+REC = REC
+def emit(p):
+    sys.stdout.write(json.dumps(p) + "\n"); sys.stdout.flush()
+def record(o):
+    with open(REC, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(o) + "\n")
+LEGACY = [{"modelId": m, "name": m} for m in
+          ("fake-model-b-high", "fake-model-a-xhigh", "fake-model-a-high")]
+CFG = [{"id": "model", "category": "model", "type": "select", "currentValue": "fake-model-b",
+        "options": [{"value": "fake-model-b"}, {"value": "fake-model-a"}]}]
+current = "fake-model-b-high"   # server default; never persisted across processes
+for line in sys.stdin:
+    msg = json.loads(line); method, rid = msg.get("method"), msg.get("id")
+    if method == "initialize":
+        emit({"jsonrpc": "2.0", "id": rid, "result": {"protocolVersion": 1,
+              "agentInfo": {"name": "antigravity-acp", "version": "1.4.4"},
+              "agentCapabilities": {"loadSession": True,
+                                    "sessionCapabilities": {"list": {}, "resume": {}},
+                                    "promptCapabilities": {}, "mcpCapabilities": {}},
+              "authMethods": []}})
+    elif method in ("session/new", "session/resume"):
+        record({"method": method})
+        sid = (msg.get("params") or {}).get("sessionId") or "s-resume"
+        emit({"jsonrpc": "2.0", "id": rid, "result": {"sessionId": sid, "configOptions": CFG,
+              "models": {"currentModelId": current, "availableModels": LEGACY}}})
+    elif method == "session/set_model":
+        current = msg["params"]["modelId"]
+        record({"method": method, "modelId": current})
+        emit({"jsonrpc": "2.0", "id": rid, "result": {}})
+    elif method == "session/set_config_option":
+        record({"method": method, "params": msg.get("params")})
+        emit({"jsonrpc": "2.0", "id": rid, "result": {}})
+    elif method == "session/prompt":
+        record({"method": method, "served_by": current})
+        emit({"jsonrpc": "2.0", "method": "session/update", "params": {"update": {
+              "sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "ok"}}}})
+        emit({"jsonrpc": "2.0", "id": rid, "result": {"stopReason": "end_turn"}})
+'''
+
+
+def _resume_client(monkeypatch, tmp_path):
+    rec = tmp_path / "rec.jsonl"
+    script = tmp_path / "fake_acp_resume.py"
+    script.write_text(f"REC = {str(rec)!r}\n" + RESUME_FAKE, encoding="utf-8")
+    module, client = _load_client(monkeypatch, args=[str(script)], cwd=str(tmp_path))
+    return module, client, rec
+
+
+def _resume_rows(rec: Path) -> list[dict]:
+    return [json.loads(x) for x in rec.read_text(encoding="utf-8").splitlines()]
+
+
+def test_resumed_session_reselects_requested_model(monkeypatch, tmp_path) -> None:
+    _, client, rec = _resume_client(monkeypatch, tmp_path)
+    client._run_prompt_once(
+        "continue", timeout_seconds=20, model="fake-model-a-xhigh",
+        affinity_key="conv-1", resume_session_id="s-resume",
+    )
+    rows = _resume_rows(rec)
+    assert rows[0] == {"method": "session/resume"}
+    assert {"method": "session/set_model", "modelId": "fake-model-a-xhigh"} in rows, rows
+    prompt = [r for r in rows if r["method"] == "session/prompt"]
+    assert prompt and prompt[-1]["served_by"] == "fake-model-a-xhigh", rows
+
+
+def test_resumed_session_already_on_requested_model_sends_no_selection(monkeypatch, tmp_path) -> None:
+    _, client, rec = _resume_client(monkeypatch, tmp_path)
+    client._run_prompt_once(
+        "continue", timeout_seconds=20, model="fake-model-b-high",
+        affinity_key="conv-2", resume_session_id="s-resume",
+    )
+    assert not [r for r in _resume_rows(rec) if r["method"].startswith("session/set_")]

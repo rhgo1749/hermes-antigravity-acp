@@ -5918,6 +5918,30 @@ class AntigravityACPClient:
                             requested_model,
                             effective_model,
                         )
+                    elif current_model and current_model != requested_model:
+                        # The official server does not persist a set_model /
+                        # set_config_option choice with the session: a resume served
+                        # by a fresh server process reports (and runs) the server
+                        # default, e.g. gemini-3.8-flash-high. Tool-call
+                        # continuations always resume in a fresh process, so without
+                        # re-selection every multi-step turn on a non-default model
+                        # silently continued on the default. Re-apply the requested,
+                        # offered model; keep the reported model only if refused.
+                        reselection = _model_selection_request(session, requested_model)
+                        if reselection is not None:
+                            try:
+                                request(*reselection)
+                            except RuntimeError as exc:
+                                effective_model = current_model
+                                model_selection_outcome = "resumed_reselect_failed_session_default"
+                                logger.warning(
+                                    "Antigravity ACP resumed-session reselection of %r failed; "
+                                    "continuing with %r: %s", requested_model, current_model, exc)
+                            else:
+                                effective_model = requested_model
+                                model_selection_outcome = "resumed_session_reselected"
+                        else:
+                            effective_model = current_model
                     elif current_model:
                         effective_model = current_model
                 else:
