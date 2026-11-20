@@ -83,8 +83,8 @@ for line in sys.stdin:
         emit({"jsonrpc": "2.0", "id": mid, "result": {
             "sessionId": "fake-session-1",
             "configOptions": [{"id": "model", "category": "model",
-                "currentValue": "gemini-3.8-flash-high",
-                "options": [{"value": "gemini-3.1-pro"}, {"value": "gemini-3.8-flash-high"}]}],
+                "currentValue": "fake-model-b-high",
+                "options": [{"value": "fake-model-a"}, {"value": "fake-model-b-high"}]}],
         }})
     elif method in ("session/set_config_option", "session/set_model", "session/resume"):
         emit({"jsonrpc": "2.0", "id": mid, "result": {}})
@@ -140,7 +140,7 @@ class _Worker(threading.Thread):
         kwargs = {"timeout": self.timeout} if self.timeout else {}
         try:
             self.result = self.client.chat.completions.create(
-                model="gemini-3.1-pro",
+                model="fake-model-a",
                 messages=[{"role": "user", "content": "hello fake"}],
                 **kwargs,
             )

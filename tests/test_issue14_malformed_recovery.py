@@ -94,7 +94,7 @@ def _fake_run_prompt(client, monkeypatch, responses):
 
 def _create(client, tools=None):
     return client.chat.completions.create(
-        model="gemini-3.8-flash-high",
+        model="fake-model-b-high",
         messages=[_REVIEW_MESSAGE],
         tools=tools or [_tool_schema("read_file")],
     )
@@ -640,8 +640,8 @@ MODEL_CONFIG = {
     "configOptions": [{
         "id": "model",
         "category": "model",
-        "currentValue": "gemini-3.1-pro",
-        "options": [{"value": "gemini-3.1-pro"}],
+        "currentValue": "fake-model-a",
+        "options": [{"value": "fake-model-a"}],
     }],
 }
 
@@ -771,7 +771,7 @@ def _wire_rows(tmp_path):
 
 def _wire_create(client):
     return client.chat.completions.create(
-        model="gemini-3.1-pro",
+        model="fake-model-a",
         messages=[{"role": "user", "content": "inspect state"}],
         tools=[_tool_schema()],
     )
@@ -797,7 +797,7 @@ def test_duplicate_regeneration_wire_never_prompts_foreign_session(monkeypatch, 
     client = _wire_client(module, tmp_path, "duplicate_wrong_id")
     with pytest.raises(RuntimeError, match="strict same-session"):
         client.chat.completions.create(
-            model="gemini-3.1-pro", messages=_duplicate_messages(),
+            model="fake-model-a", messages=_duplicate_messages(),
             tools=[_tool_schema("read_state"), _tool_schema("read_file")],
         )
     rows = _wire_rows(tmp_path)

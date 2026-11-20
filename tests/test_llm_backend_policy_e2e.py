@@ -137,8 +137,8 @@ MODEL_CONFIG = {
     "configOptions": [{
         "id": "model",
         "category": "model",
-        "currentValue": "gemini-3.1-pro",
-        "options": [{"value": "gemini-3.1-pro"}],
+        "currentValue": "fake-model-a",
+        "options": [{"value": "fake-model-a"}],
     }],
 }
 
@@ -322,12 +322,12 @@ def test_backend_mode_identical_requests_use_distinct_fresh_sessions(
     client = _make_client(module, tmp_path, postprocessing_policy="llm_backend")
 
     messages = [{"role": "user", "content": "summarize this note"}]
-    first = client.chat.completions.create(model="gemini-3.1-pro", messages=messages)
-    second = client.chat.completions.create(model="gemini-3.1-pro", messages=messages)
+    first = client.chat.completions.create(model="fake-model-a", messages=messages)
+    second = client.chat.completions.create(model="fake-model-a", messages=messages)
 
     assert first.choices[0].message.content == "backend answer: all clear."
     assert second.choices[0].message.content == "backend answer: all clear."
-    assert first.model == "gemini-3.1-pro"
+    assert first.model == "fake-model-a"
     assert second.usage is None
 
     issued = first.antigravity_usage_telemetry["native_session_id_hash"]
@@ -361,7 +361,7 @@ def test_backend_mode_evidence_phrased_prompt_with_tools_succeeds(
     client = _make_client(module, tmp_path, postprocessing_policy="llm_backend")
 
     completion = client.chat.completions.create(
-        model="gemini-3.1-pro",
+        model="fake-model-a",
         messages=[{"role": "user", "content": EVIDENCE_PROMPT}],
         tools=[_tool_schema()],
     )
@@ -393,7 +393,7 @@ def test_default_mode_same_evidence_prompt_still_refuses_without_read_evidence(
         RuntimeError, match="refused to provide the auditable source-read evidence"
     ):
         default_client.chat.completions.create(
-            model="gemini-3.1-pro",
+            model="fake-model-a",
             messages=[{"role": "user", "content": EVIDENCE_PROMPT}],
             tools=[_tool_schema()],
         )
@@ -421,7 +421,7 @@ def test_backend_mode_malformed_tool_call_json_still_fails_closed(
         RuntimeError, match="malformed Hermes tool-call JSON again after one correction"
     ):
         client.chat.completions.create(
-            model="gemini-3.1-pro",
+            model="fake-model-a",
             messages=[{"role": "user", "content": "inspect state"}],
             tools=[_tool_schema()],
         )
@@ -442,7 +442,7 @@ def test_backend_mode_same_request_correction_still_works(monkeypatch, tmp_path)
     client = _make_client(module, tmp_path, postprocessing_policy="llm_backend")
 
     completion = client.chat.completions.create(
-        model="gemini-3.1-pro",
+        model="fake-model-a",
         messages=[{"role": "user", "content": "inspect state"}],
         tools=[_tool_schema()],
     )
@@ -475,7 +475,7 @@ def test_mixed_default_and_backend_clients_do_not_contaminate_each_other(
     tools = [_tool_schema()]
     first_messages = [{"role": "user", "content": "inspect"}]
     default_first = default_client.chat.completions.create(
-        model="gemini-3.1-pro", messages=first_messages, tools=tools
+        model="fake-model-a", messages=first_messages, tools=tools
     )
     call = default_first.choices[0].message.tool_calls[0]
     default_session = next(
@@ -486,7 +486,7 @@ def test_mixed_default_and_backend_clients_do_not_contaminate_each_other(
 
     backend_messages = [{"role": "user", "content": "plain inference turn"}]
     backend_first = backend_client.chat.completions.create(
-        model="gemini-3.1-pro", messages=backend_messages
+        model="fake-model-a", messages=backend_messages
     )
     assert backend_first.choices[0].message.content == "backend answer: all clear."
     # The backend request touched nothing the default client relies on.
@@ -516,12 +516,12 @@ def test_mixed_default_and_backend_clients_do_not_contaminate_each_other(
         },
     ]
     default_second = default_client.chat.completions.create(
-        model="gemini-3.1-pro", messages=second_messages, tools=tools
+        model="fake-model-a", messages=second_messages, tools=tools
     )
     assert default_second.choices[0].message.content == "done after tool result"
 
     backend_second = backend_client.chat.completions.create(
-        model="gemini-3.1-pro", messages=backend_messages
+        model="fake-model-a", messages=backend_messages
     )
     assert backend_second.choices[0].message.content == "backend answer: all clear."
     assert (
@@ -550,7 +550,7 @@ def test_mixed_default_and_backend_clients_do_not_contaminate_each_other(
         RuntimeError, match="refused to provide the auditable source-read evidence"
     ):
         default_client.chat.completions.create(
-            model="gemini-3.1-pro",
+            model="fake-model-a",
             messages=[{"role": "user", "content": EVIDENCE_PROMPT}],
             tools=tools,
         )
@@ -570,7 +570,7 @@ def test_backend_mode_concurrent_identical_requests_get_fresh_sessions(
         completions = list(
             pool.map(
                 lambda _: client.chat.completions.create(
-                    model="gemini-3.1-pro", messages=messages
+                    model="fake-model-a", messages=messages
                 ),
                 range(4),
             )

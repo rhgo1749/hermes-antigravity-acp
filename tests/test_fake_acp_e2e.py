@@ -133,10 +133,10 @@ for line in sys.stdin:
             "configOptions": [{
                 "id": "model",
                 "category": "model",
-                "currentValue": "gemini-3.8-flash-high",
+                "currentValue": "fake-model-b-high",
                 "options": [
-                    {"value": "gemini-3.1-pro"},
-                    {"value": "gemini-3.8-flash-high"},
+                    {"value": "fake-model-a"},
+                    {"value": "fake-model-b-high"},
                 ],
             }],
         }
@@ -337,11 +337,11 @@ def _resumed_tool_request(client):
     tools = [_tool_schema()]
     first_messages = [{"role": "user", "content": "inspect"}]
     first = client.chat.completions.create(
-        model="gemini-3.1-pro",
+        model="fake-model-a",
         messages=first_messages,
         tools=tools,
     )
-    assert first.model == "gemini-3.8-flash-high"
+    assert first.model == "fake-model-b-high"
     call = first.choices[0].message.tool_calls[0]
     resumed_messages = [
         *first_messages,
@@ -466,8 +466,8 @@ def test_unoffered_model_records_effective_session_default_in_completion(
             "configOptions": [{
                 "id": "model",
                 "category": "model",
-                "currentValue": "gemini-3.1-pro",
-                "options": [{"value": "gemini-3.1-pro"}],
+                "currentValue": "fake-model-a",
+                "options": [{"value": "fake-model-a"}],
             }],
         },
     )
@@ -479,15 +479,15 @@ def test_unoffered_model_records_effective_session_default_in_completion(
     )
 
     completion = client.chat.completions.create(
-        model="gemini-3.8-flash-high",
+        model="fake-model-b-high",
         messages=[{"role": "user", "content": "hello"}],
     )
 
-    assert completion.model == "gemini-3.1-pro"
-    assert completion.antigravity_usage_telemetry["model"] == "gemini-3.1-pro"
+    assert completion.model == "fake-model-a"
+    assert completion.antigravity_usage_telemetry["model"] == "fake-model-a"
     assert "using the session default" in caplog.text
-    assert "'gemini-3.8-flash-high'" in caplog.text
-    assert "'gemini-3.1-pro' (effective model)" in caplog.text
+    assert "'fake-model-b-high'" in caplog.text
+    assert "'fake-model-a' (effective model)" in caplog.text
 
 
 def test_unoffered_model_persists_effective_model_across_resume(
@@ -500,8 +500,8 @@ def test_unoffered_model_persists_effective_model_across_resume(
             "configOptions": [{
                 "id": "model",
                 "category": "model",
-                "currentValue": "gemini-3.8-flash-high",
-                "options": [{"value": "gemini-3.8-flash-high"}],
+                "currentValue": "fake-model-b-high",
+                "options": [{"value": "fake-model-b-high"}],
             }],
         },
     )
@@ -515,11 +515,11 @@ def test_unoffered_model_persists_effective_model_across_resume(
     first_messages = [{"role": "user", "content": "inspect"}]
 
     first = client.chat.completions.create(
-        model="gemini-3.1-pro",
+        model="fake-model-a",
         messages=first_messages,
         tools=tools,
     )
-    assert first.model == "gemini-3.8-flash-high"
+    assert first.model == "fake-model-b-high"
     call = first.choices[0].message.tool_calls[0]
     resumed_messages = [
         *first_messages,
@@ -552,13 +552,13 @@ def test_unoffered_model_persists_effective_model_across_resume(
         cwd=str(tmp_path),
     )
     resumed = client.chat.completions.create(
-        model="gemini-3.1-pro",
+        model="fake-model-a",
         messages=resumed_messages,
         tools=tools,
     )
 
-    assert resumed.model == "gemini-3.8-flash-high"
-    assert resumed.antigravity_usage_telemetry["model"] == "gemini-3.8-flash-high"
+    assert resumed.model == "fake-model-b-high"
+    assert resumed.antigravity_usage_telemetry["model"] == "fake-model-b-high"
     rows = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
     assert any(row["method"] == "session/resume" for row in rows)
 
@@ -566,7 +566,7 @@ def test_unoffered_model_persists_effective_model_across_resume(
 def test_resumed_session_with_server_reported_model_is_accepted(
     monkeypatch, tmp_path
 ) -> None:
-    active_model = "gemini-3.8-flash-high"
+    active_model = "fake-model-b-high"
     model_option = {
         "id": "model",
         "category": "model",
@@ -607,7 +607,7 @@ def test_resumed_session_with_server_reported_model_is_accepted(
         cwd=str(tmp_path),
     )
     resumed = client.chat.completions.create(
-        model="gemini-3.1-pro",
+        model="fake-model-a",
         messages=resumed_messages,
         tools=tools,
     )
@@ -619,7 +619,7 @@ def test_resumed_session_with_server_reported_model_is_accepted(
 def test_resumed_session_with_legacy_checkpoint_without_server_model_fails_explicitly(
     monkeypatch, tmp_path
 ) -> None:
-    active_model = "gemini-3.8-flash-high"
+    active_model = "fake-model-b-high"
     script, log_path = _write_fake_server(
         tmp_path,
         session_result={
@@ -659,7 +659,7 @@ def test_resumed_session_with_legacy_checkpoint_without_server_model_fails_expli
     )
     try:
         client.chat.completions.create(
-            model="gemini-3.1-pro",
+            model="fake-model-a",
             messages=resumed_messages,
             tools=tools,
         )
@@ -673,7 +673,7 @@ def test_resumed_session_with_legacy_checkpoint_without_server_model_fails_expli
 def test_resumed_session_with_mismatched_session_id_without_server_model_fails_explicitly(
     monkeypatch, tmp_path
 ) -> None:
-    active_model = "gemini-3.8-flash-high"
+    active_model = "fake-model-b-high"
     script, log_path = _write_fake_server(
         tmp_path,
         session_result={
@@ -703,7 +703,7 @@ def test_resumed_session_with_mismatched_session_id_without_server_model_fails_e
     )
     try:
         client.chat.completions.create(
-            model="gemini-3.1-pro",
+            model="fake-model-a",
             messages=resumed_messages,
             tools=tools,
         )
@@ -724,7 +724,7 @@ def test_unoffered_model_without_reported_default_fails_explicitly(
             "configOptions": [{
                 "id": "model",
                 "category": "model",
-                "options": [{"value": "gemini-3.1-pro"}],
+                "options": [{"value": "fake-model-a"}],
             }],
         },
     )
@@ -758,7 +758,7 @@ def test_fake_subprocess_normal_tool_turn_and_native_resume(monkeypatch, tmp_pat
     )
 
     normal = client.chat.completions.create(
-        model="gemini-3.1-pro",
+        model="fake-model-a",
         messages=[{"role": "user", "content": "hello"}],
     )
     assert normal.choices[0].message.content == "normal response"
@@ -770,7 +770,7 @@ def test_fake_subprocess_normal_tool_turn_and_native_resume(monkeypatch, tmp_pat
     assert normal.antigravity_native_activity["update_kinds"]["agent_message_chunk"] >= 1
 
     native = client.chat.completions.create(
-        model="gemini-3.1-pro",
+        model="fake-model-a",
         messages=[{"role": "user", "content": "native inspect"}],
     )
     assert native.choices[0].message.content == "native result"
@@ -795,7 +795,7 @@ def test_fake_subprocess_normal_tool_turn_and_native_resume(monkeypatch, tmp_pat
     tools = [_tool_schema()]
     first_messages = [{"role": "user", "content": "inspect"}]
     first = client.chat.completions.create(
-        model="gemini-3.1-pro",
+        model="fake-model-a",
         messages=first_messages,
         tools=tools,
     )
@@ -829,7 +829,7 @@ def test_fake_subprocess_normal_tool_turn_and_native_resume(monkeypatch, tmp_pat
         },
     ]
     second = client.chat.completions.create(
-        model="gemini-3.1-pro",
+        model="fake-model-a",
         messages=second_messages,
         tools=tools,
     )
@@ -907,7 +907,7 @@ def test_fake_pre_tool_denial_is_distinguished_without_permission_response(
     caplog.set_level(logging.INFO)
 
     completion = client.chat.completions.create(
-        model="gemini-3.1-pro",
+        model="fake-model-a",
         messages=[{"role": "user", "content": "pre-tool denial"}],
     )
 
@@ -944,7 +944,7 @@ def test_fake_permission_request_selects_offered_reject_option(
     )
 
     completion = client.chat.completions.create(
-        model="gemini-3.1-pro",
+        model="fake-model-a",
         messages=[{"role": "user", "content": "permission rejection"}],
     )
 
@@ -969,7 +969,7 @@ def test_fake_native_web_permission_reject_keeps_hermes_fallback_separate(
     caplog.set_level(logging.INFO)
 
     completion = client.chat.completions.create(
-        model="gemini-3.8-flash-high",
+        model="fake-model-b-high",
         messages=[{
             "role": "user",
             "content": "native web permission rejection: research current public sources",
@@ -1018,7 +1018,7 @@ def test_fake_actual_turn_cancellation_remains_an_error(monkeypatch, tmp_path) -
 
     try:
         client.chat.completions.create(
-            model="gemini-3.1-pro",
+            model="fake-model-a",
             messages=[{"role": "user", "content": "actual cancellation"}],
         )
     except RuntimeError as exc:
@@ -1042,7 +1042,7 @@ def test_full_replay_prompt_orders_primer_before_history_e2e(monkeypatch, tmp_pa
         {"role": "user", "content": "FDE가 무엇인지 ppt 하나 만들어줘"},
     ]
     completion = client.chat.completions.create(
-        model="gemini-3.8-flash-high", messages=messages
+        model="fake-model-b-high", messages=messages
     )
     assert completion.choices[0].message.content == "normal response"
     rows = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
@@ -1121,7 +1121,7 @@ def test_fake_acp_intent_drift_after_model_switch_replay_and_reject_once(
         {"role": "user", "content": prose_objective},
     ]
     denied = client.chat.completions.create(
-        model="gemini-3.8-flash-high",
+        model="fake-model-b-high",
         messages=switched_messages,
     )
     assert denied.choices[0].message.content == (
@@ -1144,7 +1144,7 @@ def test_fake_acp_intent_drift_after_model_switch_replay_and_reject_once(
         {"role": "user", "content": elliptical_followup},
     ]
     followup = client.chat.completions.create(
-        model="gemini-3.8-flash-high",
+        model="fake-model-b-high",
         messages=followup_messages,
     )
     assert followup.choices[0].message.content == "normal response"
@@ -1156,7 +1156,7 @@ def test_fake_acp_intent_drift_after_model_switch_replay_and_reject_once(
     ]
     assert any(
         "reason=frontier_mismatch" in line
-        and "model=gemini-3.8-flash-high" in line
+        and "model=fake-model-b-high" in line
         and "effective_model=unknown" in line
         and "section_order=SYSTEM_INSTRUCTIONS,ACTIVE_REQUEST_PRIMER,HISTORICAL_CONTEXT,ACTIVE_REQUEST"
         in line
@@ -1175,7 +1175,7 @@ def test_fake_acp_intent_drift_after_model_switch_replay_and_reject_once(
         "section_order=ACTIVE_REQUEST_ANCHOR,UNRESOLVED_USER_OBJECTIVE,LATEST_USER_FOLLOW_UP"
         in continuation_lines[0]
     )
-    assert "requested_model=gemini-3.8-flash-high" in continuation_lines[0]
+    assert "requested_model=fake-model-b-high" in continuation_lines[0]
     assert "effective_model=unknown" in continuation_lines[0]
     assert prose_objective not in caplog.text
 
@@ -1262,7 +1262,7 @@ def test_denied_request_context_survives_model_switch_full_replay(
     objective = "Use the previously accessed Krafton API to write prose."
     followup = "아까는 요청해봤잖아"
     denied = client.chat.completions.create(
-        model="gemini-3.8-flash-high",
+        model="fake-model-b-high",
         messages=[{"role": "user", "content": objective}],
     )
     assert denied.choices[0].message.content == (
@@ -1271,7 +1271,7 @@ def test_denied_request_context_survives_model_switch_full_replay(
     assert denied.antigravity_native_activity.get("native_tool_calls", []) == []
 
     completion = client.chat.completions.create(
-        model="gemini-3.1-pro",
+        model="fake-model-a",
         messages=[
             {"role": "user", "content": objective},
             {"role": "assistant", "content": denied.choices[0].message.content},
@@ -1534,7 +1534,7 @@ def test_authorized_hermes_web_search_bridge_is_advertised_callable_and_traceabl
     messages = [{"role": "user", "content": "web research authorized lookup for the current project status"}]
 
     first = client.chat.completions.create(
-        model="gemini-3.8-flash-high", messages=messages, tools=tools
+        model="fake-model-b-high", messages=messages, tools=tools
     )
 
     call = first.choices[0].message.tool_calls[0]
@@ -1554,7 +1554,7 @@ def test_authorized_hermes_web_search_bridge_is_advertised_callable_and_traceabl
         "sources": [{"title": "Fixture source", "url": "https://example.test/source"}],
     }
     completed = client.chat.completions.create(
-        model="gemini-3.8-flash-high",
+        model="fake-model-b-high",
         tools=tools,
         messages=[
             *messages,
@@ -1628,7 +1628,7 @@ def test_hermes_web_tool_denied_cancelled_and_failed_results_are_distinguished(
     )
     call_id = "web-search-result-" + expected_status.lower()
     completion = client.chat.completions.create(
-        model="gemini-3.8-flash-high",
+        model="fake-model-b-high",
         tools=[_web_search_tool_schema()],
         messages=[
             {
@@ -1675,11 +1675,11 @@ def test_web_research_unavailable_and_not_attempted_are_truthful(monkeypatch, tm
     )
 
     unavailable = client.chat.completions.create(
-        model="gemini-3.8-flash-high",
+        model="fake-model-b-high",
         messages=[{"role": "user", "content": "web research unavailable: compare current upstream documentation"}],
     )
     not_attempted = client.chat.completions.create(
-        model="gemini-3.8-flash-high",
+        model="fake-model-b-high",
         tools=[_web_search_tool_schema()],
         messages=[{"role": "user", "content": "web research not attempted: compare current upstream documentation"}],
     )
@@ -1703,7 +1703,7 @@ def test_unadvertised_web_tool_call_is_not_returned_to_hermes(monkeypatch, tmp_p
 
     with pytest.raises(RuntimeError, match="unadvertised Hermes tool call.*web_search"):
         client.chat.completions.create(
-            model="gemini-3.8-flash-high",
+            model="fake-model-b-high",
             messages=[{"role": "user", "content": "web research unadvertised call"}],
             tools=[],
         )
@@ -1727,7 +1727,7 @@ def test_google_native_web_pre_tool_denial_is_separate_from_hermes_fallback(
     )
     caplog.set_level(logging.INFO)
     completion = client.chat.completions.create(
-        model="gemini-3.8-flash-high",
+        model="fake-model-b-high",
         messages=[{"role": "user", "content": "Google-native web pre-tool denial: research current project sources"}],
         tools=[_web_search_tool_schema()],
     )
@@ -1769,7 +1769,7 @@ def test_native_store_gc_defaults_off_for_acp_child(monkeypatch, tmp_path) -> No
         cwd=str(tmp_path),
     )
     client.chat.completions.create(
-        model="gemini-3.1-pro",
+        model="fake-model-a",
         messages=[{"role": "user", "content": "hello"}],
         timeout=10,
     )
@@ -1789,7 +1789,7 @@ def test_native_store_gc_opt_in_env_forwards_to_acp_child(monkeypatch, tmp_path)
     )
     monkeypatch.setenv("HERMES_ANTIGRAVITY_ACP_NATIVE_GC", "1")
     client.chat.completions.create(
-        model="gemini-3.1-pro",
+        model="fake-model-a",
         messages=[{"role": "user", "content": "hello"}],
         timeout=10,
     )
@@ -1835,7 +1835,7 @@ def test_f4_acks_forward_to_mux_named_child(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("HERMES_ANTIGRAVITY_ACP_F3_CUTOVER_ACK", "1")
     monkeypatch.setenv("HERMES_ANTIGRAVITY_ACP_F4_PROCESS_TREE_ACK", "1")
     client.chat.completions.create(
-        model="gemini-3.1-pro",
+        model="fake-model-a",
         messages=[{"role": "user", "content": "hello"}],
         timeout=10,
     )
@@ -1857,7 +1857,7 @@ def test_f4_acks_never_cross_single_named_child(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("HERMES_ANTIGRAVITY_ACP_F3_CUTOVER_ACK", "1")
     monkeypatch.setenv("HERMES_ANTIGRAVITY_ACP_F4_PROCESS_TREE_ACK", "1")
     client.chat.completions.create(
-        model="gemini-3.1-pro",
+        model="fake-model-a",
         messages=[{"role": "user", "content": "hello"}],
         timeout=10,
     )
@@ -1881,7 +1881,7 @@ def test_f4_acks_absent_operator_env_never_fabricated(monkeypatch, tmp_path) -> 
     monkeypatch.delenv("HERMES_ANTIGRAVITY_ACP_F3_CUTOVER_ACK", raising=False)
     monkeypatch.delenv("HERMES_ANTIGRAVITY_ACP_F4_PROCESS_TREE_ACK", raising=False)
     client.chat.completions.create(
-        model="gemini-3.1-pro",
+        model="fake-model-a",
         messages=[{"role": "user", "content": "hello"}],
         timeout=10,
     )
@@ -1913,7 +1913,7 @@ def test_f4_acks_legacy_acp_mux_names_are_normalized(monkeypatch, tmp_path) -> N
     monkeypatch.setenv("ACP_MUX_F3_CUTOVER_ACK", "1")
     monkeypatch.setenv("ACP_MUX_F4_PROCESS_TREE_ACK", "1")
     client.chat.completions.create(
-        model="gemini-3.1-pro",
+        model="fake-model-a",
         messages=[{"role": "user", "content": "hello"}],
         timeout=10,
     )
@@ -1937,7 +1937,7 @@ def test_f4_acks_invalid_values_never_authorize(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("HERMES_ANTIGRAVITY_ACP_F3_CUTOVER_ACK", "true")
     monkeypatch.setenv("HERMES_ANTIGRAVITY_ACP_F4_PROCESS_TREE_ACK", "01")
     client.chat.completions.create(
-        model="gemini-3.1-pro",
+        model="fake-model-a",
         messages=[{"role": "user", "content": "hello"}],
         timeout=10,
     )
@@ -1967,7 +1967,7 @@ def test_f4_acks_nonmux_named_wrapper_fails_safe(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("HERMES_ANTIGRAVITY_ACP_F3_CUTOVER_ACK", "1")
     monkeypatch.setenv("HERMES_ANTIGRAVITY_ACP_F4_PROCESS_TREE_ACK", "1")
     client.chat.completions.create(
-        model="gemini-3.1-pro",
+        model="fake-model-a",
         messages=[{"role": "user", "content": "hello"}],
         timeout=10,
     )
@@ -2024,7 +2024,7 @@ def test_f4_acks_reach_mux_but_never_vendor_child(monkeypatch, tmp_path) -> None
     monkeypatch.setenv("HERMES_ANTIGRAVITY_ACP_F3_CUTOVER_ACK", "1")
     monkeypatch.setenv("HERMES_ANTIGRAVITY_ACP_F4_PROCESS_TREE_ACK", "1")
     client.chat.completions.create(
-        model="gemini-3.1-pro",
+        model="fake-model-a",
         messages=[{"role": "user", "content": "inspect"}],
         tools=[_tool_schema()],
         timeout=20,
@@ -2086,7 +2086,7 @@ def test_provider_through_mux_to_fake_server_owner_routing(monkeypatch, tmp_path
     tools = [_tool_schema()]
     first_messages = [{"role": "user", "content": "inspect"}]
     first = client.chat.completions.create(
-        model="gemini-3.1-pro", messages=first_messages, tools=tools
+        model="fake-model-a", messages=first_messages, tools=tools
     )
     call = first.choices[0].message.tool_calls[0]
 
@@ -2112,7 +2112,7 @@ def test_provider_through_mux_to_fake_server_owner_routing(monkeypatch, tmp_path
          "content": '{"value":1}'},
     ]
     second = client.chat.completions.create(
-        model="gemini-3.1-pro", messages=second_messages, tools=tools
+        model="fake-model-a", messages=second_messages, tools=tools
     )
     assert second.choices[0].message.content == "done after tool result"
 

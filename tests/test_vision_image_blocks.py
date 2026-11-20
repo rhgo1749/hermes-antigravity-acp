@@ -104,10 +104,10 @@ for line in sys.stdin:
     elif method in ("session/new", "session/resume"):
         emit({"jsonrpc": "2.0", "id": rid, "result": {
             "sessionId": "s-vision",
-            "models": {"currentModelId": "gemini-3.8-flash-high",
+            "models": {"currentModelId": "fake-model-b-high",
                        "availableModels": [
-                           {"modelId": "gemini-3.8-flash-high",
-                            "name": "Gemini 3.8 Flash (High)"}]}}})
+                           {"modelId": "fake-model-b-high",
+                            "name": "Fake Model B (High)"}]}}})
     elif method == "session/prompt":
         if REC:
             with open(REC, "a", encoding="utf-8") as fh:
@@ -626,7 +626,7 @@ def test_legacy_multimodal_checkpoint_still_continues_and_sends_new_image(
             response_fingerprint=client_mod._response_fingerprint("ok-vision", []),
             updated_at=__import__("time").time(),
             native_tokens=100,
-            effective_model="gemini-3.8-flash-high",
+            effective_model="fake-model-b-high",
         ),
     )
 

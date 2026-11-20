@@ -98,15 +98,15 @@ def text_update(text):
         "content": {"type": "text", "text": text}}}})
 
 LEGACY = [
-    {"modelId": "gemini-3.8-flash-high", "name": "Gemini 3.8 Flash (High)"},
-    {"modelId": "gemini-3.8-flash-medium", "name": "Gemini 3.8 Flash (Medium)"},
-    {"modelId": "gemini-3.8-flash-low", "name": "Gemini 3.8 Flash (Low)"},
+    {"modelId": "fake-model-b-high", "name": "Fake Model B (High)"},
+    {"modelId": "fake-model-b-medium", "name": "Fake Model B (Medium)"},
+    {"modelId": "fake-model-b-low", "name": "Fake Model B (Low)"},
 ]
 
 MODEL_GROUP = {
     "id": "model", "category": "model", "type": "select",
-    "currentValue": "gemini-3.8-flash",
-    "options": [{"value": "gemini-3.8-flash", "name": "Gemini 3.8 Flash"}],
+    "currentValue": "fake-model-b",
+    "options": [{"value": "fake-model-b", "name": "Gemini 3.8 Flash"}],
 }
 ARGON_GROUP = {
     "id": "model_family_b", "category": "model", "type": "select",
@@ -148,7 +148,7 @@ for line in sys.stdin:
     elif method == "session/new":
         result = {"sessionId": "s-surface", "configOptions": CONFIG_OPTIONS}
         if MODE != "single":
-            result["models"] = {"currentModelId": "gemini-3.8-flash-high",
+            result["models"] = {"currentModelId": "fake-model-b-high",
                                 "availableModels": LEGACY}
         emit({"jsonrpc": "2.0", "id": rid, "result": result})
     elif method in ("session/set_model", "session/set_config_option"):
@@ -185,14 +185,14 @@ def test_legacy_composite_id_reaches_set_model(monkeypatch, tmp_path) -> None:
         cwd=str(tmp_path),
     )
     reply = client.chat.completions.create(
-        model="gemini-3.8-flash-low",
+        model="fake-model-b-low",
         messages=[{"role": "user", "content": "hi"}], timeout=10,
     )
     assert reply.choices[0].message.content == "ok-surface"
     rows = _selections(record)
     assert any(
         row["method"] == "session/set_model"
-        and row["params"].get("modelId") == "gemini-3.8-flash-low"
+        and row["params"].get("modelId") == "fake-model-b-low"
         for row in rows
     ), f"legacy composite id never reached session/set_model: {rows}"
 
@@ -204,14 +204,14 @@ def test_base_model_selects_through_its_config_group(monkeypatch, tmp_path) -> N
         cwd=str(tmp_path),
     )
     client.chat.completions.create(
-        model="gemini-3.8-flash",
+        model="fake-model-b",
         messages=[{"role": "user", "content": "hi"}], timeout=10,
     )
     rows = _selections(record)
     assert any(
         row["method"] == "session/set_config_option"
         and row["params"].get("configId") == "model"
-        and row["params"].get("value") == "gemini-3.8-flash"
+        and row["params"].get("value") == "fake-model-b"
         for row in rows
     ), f"base model never reached its config group: {rows}"
 
@@ -224,8 +224,8 @@ def test_every_listed_model_resolves_to_a_request(monkeypatch, tmp_path) -> None
     )
     listed = client.list_models(timeout_seconds=10)
     assert listed
-    assert "gemini-3.8-flash" in listed
-    assert "gemini-3.8-flash-low" in listed
+    assert "fake-model-b" in listed
+    assert "fake-model-b-low" in listed
     client_mod = importlib.import_module(module.__name__ + ".client")
     with client._session(timeout_seconds=30.0, allow_file_requests=False) as (session, _, _):
         dead = [
@@ -288,9 +288,9 @@ def test_single_surface_server_still_selects(monkeypatch, tmp_path) -> None:
         cwd=str(tmp_path),
     )
     listed = client.list_models(timeout_seconds=10)
-    assert listed == ["gemini-3.8-flash"], listed
+    assert listed == ["fake-model-b"], listed
     client.chat.completions.create(
-        model="gemini-3.8-flash",
+        model="fake-model-b",
         messages=[{"role": "user", "content": "hi"}], timeout=10,
     )
     rows = _selections(record)
