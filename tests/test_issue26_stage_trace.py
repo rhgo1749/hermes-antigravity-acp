@@ -13,8 +13,11 @@ Pins the opt-in trace contract agreed in the issue investigation:
 * no prompt text, raw session ids, labels, tokens, or private paths leak.
 
 The mux half (lane_bound with a lane fingerprint instead of the raw label,
-plus process_exit) is exercised through the real mux entrypoint against a
-fake official server, same harness style as tests/test_acp_mux.py.
+plus process_exit) is exercised against a fake official server through BOTH
+mux bodies: the base engine (``scripts/acp_mux.py``) and the shipped
+entrypoint (``scripts/antigravity-acp-mux.py``). Testing only the base engine
+let the entrypoint ship without the trace seams at all — the launcher ships
+the entrypoint, so a base-only test proves nothing about production.
 """
 
 from __future__ import annotations
@@ -33,7 +36,16 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 PLUGIN_DIR = ROOT / "hermes-plugin" / "antigravity-acp"
-MUX_ENTRYPOINT = ROOT / "scripts" / "acp_mux.py"
+BASE_MUX = ROOT / "scripts" / "acp_mux.py"
+SHIPPED_MUX_ENTRYPOINT = ROOT / "scripts" / "antigravity-acp-mux.py"
+
+# Every mux trace assertion must hold for both bodies; the shipped
+# entrypoint is what installers deploy.
+MUX_BODIES = pytest.mark.parametrize(
+    "mux_body",
+    [str(BASE_MUX), str(SHIPPED_MUX_ENTRYPOINT)],
+    ids=["base-engine", "shipped-entrypoint"],
+)
 
 TRACE_ENV = "HERMES_ANTIGRAVITY_ACP_TRACE"
 TRACE_FILE_ENV = "HERMES_ANTIGRAVITY_ACP_TRACE_FILE"
@@ -878,7 +890,8 @@ def test_bounded_events_rotation_and_retention(monkeypatch, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_mux_trace_lane_fingerprint_and_exit(monkeypatch, tmp_path):
+@MUX_BODIES
+def test_mux_trace_lane_fingerprint_and_exit(mux_body, monkeypatch, tmp_path):
     fake = tmp_path / "fake_acp.py"
     fake.write_text(
         "#!/usr/bin/env python3\n"
@@ -913,7 +926,7 @@ def test_mux_trace_lane_fingerprint_and_exit(monkeypatch, tmp_path):
     )
     request = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize"}) + "\n"
     mux_proc = subprocess.Popen(
-        [sys.executable, str(MUX_ENTRYPOINT)],
+        [sys.executable, mux_body],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -926,7 +939,7 @@ def test_mux_trace_lane_fingerprint_and_exit(monkeypatch, tmp_path):
         if mux_proc.poll() is None:
             mux_proc.kill()
     completed = subprocess.CompletedProcess(
-        args=[sys.executable, str(MUX_ENTRYPOINT)],
+        args=[sys.executable, mux_body],
         returncode=mux_proc.returncode,
         stdout=stdout,
         stderr=stderr,
@@ -947,7 +960,9 @@ def test_mux_trace_lane_fingerprint_and_exit(monkeypatch, tmp_path):
     assert process_exit["child_pid"] == lane_bound["child_pid"]
     assert isinstance(process_exit["exit_code"], int)
     # The join primitive is the fingerprint; the raw label never appears.
-    spec = importlib.util.spec_from_file_location("acp_mux_trace_probe", MUX_ENTRYPOINT)
+    # The fingerprint helper always comes from the base engine: the shipped
+    # entrypoint reuses it through ``base._lane_fingerprint``.
+    spec = importlib.util.spec_from_file_location("acp_mux_trace_probe", BASE_MUX)
     assert spec is not None and spec.loader is not None
     acp_mux = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(acp_mux)
@@ -959,7 +974,8 @@ def test_mux_trace_lane_fingerprint_and_exit(monkeypatch, tmp_path):
     assert str(tmp_path) not in text
 
 
-def test_mux_trace_disabled_by_default(monkeypatch, tmp_path):
+@MUX_BODIES
+def test_mux_trace_disabled_by_default(mux_body, monkeypatch, tmp_path):
     fake = tmp_path / "fake_acp.py"
     fake.write_text(
         "#!/usr/bin/env python3\n"
@@ -990,7 +1006,7 @@ def test_mux_trace_disabled_by_default(monkeypatch, tmp_path):
     proc_env.pop("ACP_MUX_TRACE", None)
     proc_env.pop("ACP_MUX_TRACE_FILE", None)
     completed = subprocess.run(
-        [sys.executable, str(MUX_ENTRYPOINT)],
+        [sys.executable, mux_body],
         input=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize"}) + "\n",
         text=True,
         capture_output=True,

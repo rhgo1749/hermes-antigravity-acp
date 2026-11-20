@@ -442,6 +442,19 @@ def main() -> int:
         bound_home = home
         bound_label = label
         base._log(f"bound account {label} ({reason}) pid={upstream.pid}")
+        # Issue #26 stage tracing: the shipped entrypoint must record the
+        # same lane_bound/process_exit seams as scripts/acp_mux.py's own
+        # main, or ACP_MUX_TRACE=1 silently produces nothing in production
+        # (the base engine is not what the launcher ships).
+        base._trace(
+            "lane_bound",
+            {
+                "mux_pid": os.getpid(),
+                "child_pid": upstream.pid,
+                "lane": base._lane_fingerprint(home, label),
+                "reason": reason,
+            },
+        )
         out_thread = threading.Thread(target=pump_upstream_out, daemon=True)
         err_thread = threading.Thread(target=pump_upstream_err, daemon=True)
         pump_threads.extend((out_thread, err_thread))
@@ -650,6 +663,14 @@ def main() -> int:
                         upstream.wait(timeout=5)
             for thread in pump_threads:
                 thread.join(timeout=1)
+            base._trace(
+                "process_exit",
+                {
+                    "mux_pid": os.getpid(),
+                    "child_pid": upstream.pid,
+                    "exit_code": upstream.returncode,
+                },
+            )
         if lease is not None:
             # Orderly exit records a final heartbeat, then releases the
             # lease: the lane stays protected through the same grace window
