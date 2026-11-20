@@ -25,16 +25,16 @@ Container (`hermes`, this workspace):
 | `/proc/self/status` caps | `CapEff=0000000000000000` (gateway runs as uid 1000, zero caps) |
 | `/.dockerenv` | present — Docker container |
 | image init tree | s6-overlay; `/etc/cont-init.d/{01-hermes-setup,015-supervise-perms,02-reconcile-profiles}`; `01-hermes-setup` execs `/opt/hermes/docker/stage2-hook.sh` (root stage). **No user-extensible root-stage hook** (no run-parts from `/opt/data`), and **no cgroup handling anywhere** in `/opt/hermes/docker/*.sh` |
-| `/opt/data` bind | host `/home/gonus/hermes-cloudcli/state/nous-migration-20261109-143536/data` (ext4 rw) |
+| `/opt/data` bind | operator host bind-mount directory (ext4 rw) |
 
-Host (`gonus-X870E`, via devspace read-only; docker socket not readable by the
+Host (operator's workstation, via read-only probe; docker socket not readable by the
 devspace-agent service account — least privilege, expected):
 
 | probe | observed |
 |---|---|
 | `/sys/fs/cgroup` | cgroup v2, controllers `cpuset cpu io memory hugetlb pids rdma misc dmem`, root `root:root 555`, `systemctl is-system-running` = running |
 | container placement | `system.slice/docker-<64hex>.scope` × 7 — Docker **systemd cgroup driver**, default `cgroupns=private` |
-| canonical compose | `/home/gonus/hermes-cloudcli/docker-compose.nous.yml` (project `nous-hermes`, image `nousresearch/hermes-agent:v0.23.2`, container `hermes`): **no cgroup-related keys at all** — no `cgroupns`, `cgroup_parent`, `cap_add`, `privileged`, no delegation |
+| canonical compose | operator's compose deployment (image `nousresearch/hermes-agent:v0.23.2`, single app container): **no cgroup-related keys at all** — no `cgroupns`, `cgroup_parent`, `cap_add`, `privileged`, no delegation |
 
 Consequence: inside the container the cgroupfs view is namespaced to the
 container's own subtree and mounted read-only, and the gateway has no
@@ -189,7 +189,7 @@ invariant or widen host visibility), scope-root `cgroup.procs` chown
 
 ## 5. Disposable canary procedure (production-equivalent, throwaway)
 
-A separate compose project (`nous-hermes-acp-canary`), same image
+A separate compose project (`acp-canary`), same image
 `nousresearch/hermes-agent:v0.23.2`, **verified-copy** state (the compose
 header rule: never share a state dir with the live gateway). The copy is a
 WHITELIST, not the full state tree: config.yaml, .env, auth.json, `.hermes`
@@ -330,9 +330,9 @@ before touching the live `hermes` container.
      silence), per-file read error (FAIL), nonempty CONTENTS (ORPHANS with
      the pids listed, FAIL). Content-based by design: `test -s` is vacuous
      on cgroupfs pseudo-files (st_size is 0 regardless of pids).
-     Additionally `pgrep -fa 'nous-hermes-acp-canary'` (the concrete quoted
+     Additionally `pgrep -fa 'acp-canary'` (the concrete quoted
      compose project marker used at canary creation) must be empty.
-7. Teardown canary: `docker compose -p nous-hermes-acp-canary down` + delete
+7. Teardown canary: `docker compose -p acp-canary down` + delete
    the copy dirs. No production artifact touched at any step.
 
 **Canary success criteria = steps 2–6 all PASS with zero nonce residue.

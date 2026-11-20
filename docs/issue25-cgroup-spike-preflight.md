@@ -6,15 +6,15 @@ runnable ONLY on an already-delegated writable subtree; fail closed with
 no sudo/chmod/mount/pre-existing-cgroup mutation otherwise.
 
 **Verdicts, kept environment-separate:
-- Deployment container `hermes`: preflight BLOCKED — spike NOT RUN
+- Deployment container: preflight BLOCKED — spike NOT RUN
   there (§1–§2, historical record, unchanged).
-- Host gonus-X870E, transient delegated scope at HEAD `fd03122`:
+- Operator's host, transient delegated scope at HEAD `fd03122`:
   spike EXECUTED — 10 passed / 0 skipped, RC=0, zero residue (§8).
   Linux cgroup-v2 containment hypothesis CONFIRMED on the host.
 F4 Gate B recommendation remains NO-GO: no production mux wiring or
 deployment-level delegation exists yet.**
 
-## 1. Preflight evidence (2026-11-17 KST, container `hermes`; all probes
+## 1. Preflight evidence (2026-11-17 KST, deployment container; all probes
 read-only except one explicitly non-destructive failed-create probe —
 `mkdir` under `/sys/fs/cgroup`, which returned EACCES and created
 nothing)
@@ -131,12 +131,12 @@ host. No production wiring until the spike PASSes there. Executed
 2026-11-18 on the host via a transient delegated scope (§8); the
 container-side deployment delegation remains the open production item.
 
-## 7. Real-kernel run (2026-11-17 KST, host gonus-X870E, operator-executed) — FAIL, root-cause split
+## 7. Real-kernel run (2026-11-17 KST, operator's host, operator-executed) — FAIL, root-cause split
 
-Operator ran HEAD 2b2acbc as `gonus` with
+Operator ran HEAD 2b2acbc as their desktop user with
 `ROOT=/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice`:
 **1 failed, 6 passed, RC=1**; three empty `acp25-target-*` dirs left
-(gonus-owned, `populated 0`, `cgroup.procs` empty — no process leak,
+(operator-owned, `populated 0`, `cgroup.procs` empty — no process leak,
 known residue, operator-cleared, not agent-cleared).
 
 Two independent real-kernel findings:
@@ -163,7 +163,7 @@ Two independent real-kernel findings:
 
 `Delegate=` on transient user scopes is supported at this systemd
 version. The agent could not exercise the user bus (DevSpace uid 997 has
-no access to the gonus user manager), so **step 0 is the operator-run
+no access to the operator's user manager), so **step 0 is the operator-run
 on-host verification of the exact invocation** before the real run:
 
 ```sh
@@ -196,7 +196,7 @@ production delegation/attestation); the three leftover dirs were
 operator-cleared (§8 fresh host read confirms `app.slice` `acp25-*`
 residue 0).
 
-## 8. Delegated-scope real run (2026-11-18 KST, host gonus-X870E, operator-executed, HEAD `fd03122`) — EXECUTED, PASS
+## 8. Delegated-scope real run (2026-11-18 KST, host operator host, operator-executed, HEAD `fd03122`) — EXECUTED, PASS
 
 The spike test file was UNMODIFIED from `fd03122` (this section is
 docs-only evidence closure; tests/source untouched).

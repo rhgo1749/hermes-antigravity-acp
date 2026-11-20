@@ -1,5 +1,5 @@
 # acp25-p1-rehearsal-runbook.md — P1 host-helper rehearsal gate (Gate C)
-# Target: DISPOSABLE container `hermes-acp-p1` in PRODUCTION SHAPE (no
+# Target: DISPOSABLE container `acp-p1` in PRODUCTION SHAPE (no
 # cap_add, no entrypoint override, env var set at boot) + the REAL P1 host
 # helper (acp25-p1-helper.sh v6) run against it while live, plus the REAL
 # rollback script (acp25-p1-rollback.sh, plan §7). Production `hermes` is
@@ -52,17 +52,17 @@ GATE_B_BLOCK_B_P1
 ```bash
 set -euo pipefail
 : "${R:?}"
-docker compose -p nous-hermes-acp-p1 -f /home/gonus/acp-p1/docker-compose.acp-p1.yml up -d
-ok=0; for i in $(seq 1 12); do [ "$(docker inspect -f '{{.State.Status}}' hermes-acp-p1 2>/dev/null)" = running ] && { ok=1; break; }; sleep 5; done
-[ "$ok" = 1 ] || { echo 'FAIL: p1 container never reached running'; docker logs --tail 80 hermes-acp-p1; exit 1; }
-docker inspect -f '{{.State.Status}} exit={{.State.ExitCode}}' hermes-acp-p1 | grep -qx 'running exit=0'
+docker compose -p acp-p1 -f $HOME/acp-p1/docker-compose.acp-p1.yml up -d
+ok=0; for i in $(seq 1 12); do [ "$(docker inspect -f '{{.State.Status}}' acp-p1 2>/dev/null)" = running ] && { ok=1; break; }; sleep 5; done
+[ "$ok" = 1 ] || { echo 'FAIL: p1 container never reached running'; docker logs --tail 80 acp-p1; exit 1; }
+docker inspect -f '{{.State.Status}} exit={{.State.ExitCode}}' acp-p1 | grep -qx 'running exit=0'
 echo CONTAINER-UP-OK
-P1CID=$(docker inspect -f '{{.Id}}' hermes-acp-p1)
+P1CID=$(docker inspect -f '{{.Id}}' acp-p1)
 S="/sys/fs/cgroup/system.slice/docker-${P1CID}.scope"
 if [ -d "$S/acp-delegate" ]; then echo "FAIL: delegate exists before helper"; exit 1; fi
 echo PRE-DELEGATION-SCOPE-ROOT-OK
 # gate UNKNOWN despite env var (root absent) — proven uid-1000 recipe
-docker exec -i -u 1000 hermes-acp-p1 sh -c 'cd /acp-seam/hermes-plugin/antigravity-acp && /opt/hermes/.venv/bin/python -' <<'PY' > "$R/delegated-root-pre.txt"
+docker exec -i -u 1000 acp-p1 sh -c 'cd /acp-seam/hermes-plugin/antigravity-acp && /opt/hermes/.venv/bin/python -' <<'PY' > "$R/delegated-root-pre.txt"
 import importlib.util as u
 s = u.spec_from_file_location("cgc", "cgroup_containment.py")
 m = u.module_from_spec(s); s.loader.exec_module(m)
@@ -73,12 +73,12 @@ echo GATE-UNKNOWN-PRE-OK
 # api_server readiness (proven Gate B recipe)
 KEY=$(cat "$R/.apik")
 ok=0; for i in $(seq 1 36); do curl -sf -o /dev/null --max-time 5 -H "Authorization: Bearer $KEY" http://127.0.0.1:18642/health && { ok=1; break; }; sleep 5; done
-[ "$ok" = 1 ] || { echo 'FAIL: p1 api_server never became healthy'; docker logs --tail 80 hermes-acp-p1; exit 1; }
+[ "$ok" = 1 ] || { echo 'FAIL: p1 api_server never became healthy'; docker logs --tail 80 acp-p1; exit 1; }
 echo API-READY-OK
 # Identity anchors for transition re-attestation (r5 MAJOR2): every later
 # gate must prove the SAME container instance (no silent restart).
-P1PID0=$(docker inspect -f '{{.State.Pid}}' hermes-acp-p1)
-P1START0=$(docker inspect -f '{{.State.StartedAt}}' hermes-acp-p1)
+P1PID0=$(docker inspect -f '{{.State.Pid}}' acp-p1)
+P1START0=$(docker inspect -f '{{.State.StartedAt}}' acp-p1)
 test -n "$P1PID0" -a -n "$P1START0"
 # Rehearsal precondition: the global delegate unit must NOT exist yet
 # (read-only query; rollback also enforces this in rehearsal mode).
@@ -98,10 +98,10 @@ set -euo pipefail
 # (D1) 50 short-lived children INSIDE the container: the scope-root snapshot
 #      goes stale during relocation — deterministic race exercise for the
 #      v2 re-pass loop.
-docker exec -d hermes-acp-p1 sh -c 'for i in $(seq 1 50); do sleep 3 & done; wait'
+docker exec -d acp-p1 sh -c 'for i in $(seq 1 50); do sleep 3 & done; wait'
 sleep 1
 # (D2) run the REAL helper (artifact under rehearsal = this exact file)
-if ! sudo bash /home/gonus/acp-p1-files/acp25-p1-helper.sh hermes-acp-p1 2>&1 | tee "$R/helper-run1.txt"; then echo "FAIL: helper run1 nonzero"; exit 1; fi
+if ! sudo bash $HOME/acp-p1-files/acp25-p1-helper.sh acp-p1 2>&1 | tee "$R/helper-run1.txt"; then echo "FAIL: helper run1 nonzero"; exit 1; fi
 grep -q "HELPER-OK" "$R/helper-run1.txt" || { echo "FAIL: no HELPER-OK"; exit 1; }
 grep -q "RELOCATION-OK passes=" "$R/helper-run1.txt" || { echo "FAIL: no RELOCATION-OK"; exit 1; }
 # (D3) race evidence: passes>1 = probe caught the v1 snapshot gap and the
@@ -124,7 +124,7 @@ set -euo pipefail
 # nsenter -m + findmnt/mountinfo is unusable here — the container's /proc is
 # bound to its PID ns and has no /proc/self entry for a host-pid reader
 # (ENOENT; reproduced on the production container too, kernel-independent).
-P1PID=$(docker inspect -f '{{.State.Pid}}' hermes-acp-p1)
+P1PID=$(docker inspect -f '{{.State.Pid}}' acp-p1)
 test "$(sudo awk -v t=/sys/fs/cgroup/acp-delegate '$5==t' "/proc/$P1PID/mountinfo" | wc -l)" -eq 1
 sudo awk -v t=/sys/fs/cgroup/acp-delegate '$5==t {print $6}' "/proc/$P1PID/mountinfo" | grep -qw rw
 test "$(sudo awk '$5=="/sys/fs/cgroup"' "/proc/$P1PID/mountinfo" | wc -l)" -eq 1
@@ -135,7 +135,7 @@ echo MOUNT-ENDSTATE-OK
 [ "$(stat -c '%u' "$S/acp-delegate/cgroup.kill")" = "1000" ] || { echo "FAIL: delegate cgroup.kill not uid 1000"; exit 1; }
 echo CHOWN-RECURSIVE-OK
 # (E3) THE flip: same container, no restart
-docker exec -i -u 1000 hermes-acp-p1 sh -c 'cd /acp-seam/hermes-plugin/antigravity-acp && /opt/hermes/.venv/bin/python -' <<'PY' > "$R/delegated-root-post.txt"
+docker exec -i -u 1000 acp-p1 sh -c 'cd /acp-seam/hermes-plugin/antigravity-acp && /opt/hermes/.venv/bin/python -' <<'PY' > "$R/delegated-root-post.txt"
 import importlib.util as u
 s = u.spec_from_file_location("cgc", "cgroup_containment.py")
 m = u.module_from_spec(s); s.loader.exec_module(m)
@@ -143,8 +143,8 @@ print(m.delegated_root())
 PY
 grep -qx '/sys/fs/cgroup/acp-delegate' "$R/delegated-root-post.txt" || { echo "FAIL: delegated_root() did not flip:"; cat "$R/delegated-root-post.txt"; exit 1; }
 echo GATE-FLIP-NO-RESTART-OK
-P1PID1=$(docker inspect -f '{{.State.Pid}}' hermes-acp-p1)
-P1START1=$(docker inspect -f '{{.State.StartedAt}}' hermes-acp-p1)
+P1PID1=$(docker inspect -f '{{.State.Pid}}' acp-p1)
+P1START1=$(docker inspect -f '{{.State.StartedAt}}' acp-p1)
 if [ "$P1PID1" = "$P1PID0" ] && [ "$P1START1" = "$P1START0" ]; then echo "IDENTITY-STABLE-OK after flip (pid=$P1PID1 started=$P1START1)"; else echo "FAIL: container instance changed across flip ($P1PID0/$P1START0 -> $P1PID1/$P1START1)"; exit 1; fi
 ```
 
@@ -164,9 +164,9 @@ GATE_B_BLOCK_G
 
 ```bash
 set -euo pipefail
-if ! sudo bash /home/gonus/acp-p1-files/acp25-p1-helper.sh hermes-acp-p1 2>&1 | tee "$R/helper-run2.txt"; then echo "FAIL: helper re-run nonzero"; exit 1; fi
+if ! sudo bash $HOME/acp-p1-files/acp25-p1-helper.sh acp-p1 2>&1 | tee "$R/helper-run2.txt"; then echo "FAIL: helper re-run nonzero"; exit 1; fi
 grep -q "HELPER-OK" "$R/helper-run2.txt" || { echo "FAIL: re-run no HELPER-OK"; exit 1; }
-P1PID=$(docker inspect -f '{{.State.Pid}}' hermes-acp-p1)
+P1PID=$(docker inspect -f '{{.State.Pid}}' acp-p1)
 # v5: host-side mountinfo (see Block E1 note — nsenter /proc/self is ENOENT here)
 test "$(sudo awk -v t=/sys/fs/cgroup/acp-delegate '$5==t' "/proc/$P1PID/mountinfo" | wc -l)" -eq 1 || { echo "FAIL: mount stacking after re-run"; exit 1; }
 echo IDEMPOTENT-RERUN-OK
@@ -176,12 +176,12 @@ echo IDEMPOTENT-RERUN-OK
 
 ```bash
 set -euo pipefail
-if ! sudo bash /home/gonus/acp-p1-files/acp25-p1-rollback.sh hermes-acp-p1 rehearsal 2>&1 | tee "$R/rollback-run.txt"; then echo "FAIL: rollback nonzero — LOUD rollback-incomplete state; investigate the failed umount before retry"; exit 1; fi
+if ! sudo bash $HOME/acp-p1-files/acp25-p1-rollback.sh acp-p1 rehearsal 2>&1 | tee "$R/rollback-run.txt"; then echo "FAIL: rollback nonzero — LOUD rollback-incomplete state; investigate the failed umount before retry"; exit 1; fi
 grep -q "UNMOUNT-VERIFIED-OK" "$R/rollback-run.txt" || { echo "FAIL: no UNMOUNT-VERIFIED-OK"; exit 1; }
 grep -q "ROLLBACK-OK" "$R/rollback-run.txt" || { echo "FAIL: no ROLLBACK-OK"; exit 1; }
 if [ -d "$S/acp-delegate" ]; then echo "FAIL: delegate dir survived rollback"; exit 1; fi
 echo DELEGATE-DIR-GONE-OK
-docker exec -i -u 1000 hermes-acp-p1 sh -c 'cd /acp-seam/hermes-plugin/antigravity-acp && /opt/hermes/.venv/bin/python -' <<'PY' > "$R/delegated-root-rolledback.txt"
+docker exec -i -u 1000 acp-p1 sh -c 'cd /acp-seam/hermes-plugin/antigravity-acp && /opt/hermes/.venv/bin/python -' <<'PY' > "$R/delegated-root-rolledback.txt"
 import importlib.util as u
 s = u.spec_from_file_location("cgc", "cgroup_containment.py")
 m = u.module_from_spec(s); s.loader.exec_module(m)
@@ -197,8 +197,8 @@ curl -sS --max-time 300 -H "Authorization: Bearer $KEY" -H 'Content-Type: applic
 A=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['choices'][0]['message']['content'])" "$R/request-rolledback.json")
 [ "$A" = 42 ] || { echo "FAIL: post-rollback answer=$A"; exit 1; }
 echo POST-ROLLBACK-SERVICE-OK
-P1PID2=$(docker inspect -f '{{.State.Pid}}' hermes-acp-p1)
-P1START2=$(docker inspect -f '{{.State.StartedAt}}' hermes-acp-p1)
+P1PID2=$(docker inspect -f '{{.State.Pid}}' acp-p1)
+P1START2=$(docker inspect -f '{{.State.StartedAt}}' acp-p1)
 if [ "$P1PID2" = "$P1PID0" ] && [ "$P1START2" = "$P1START0" ]; then echo "IDENTITY-STABLE-OK after rollback (pid=$P1PID2 started=$P1START2)"; else echo "FAIL: container instance changed across rollback ($P1PID0/$P1START0 -> $P1PID2/$P1START2)"; exit 1; fi
 ```
 
@@ -206,11 +206,11 @@ if [ "$P1PID2" = "$P1PID0" ] && [ "$P1START2" = "$P1START0" ]; then echo "IDENTI
 
 ```bash
 set -euo pipefail
-if ! sudo bash /home/gonus/acp-p1-files/acp25-p1-helper.sh hermes-acp-p1 2>&1 | tee "$R/helper-run3.txt"; then echo "FAIL: re-delegate nonzero"; exit 1; fi
+if ! sudo bash $HOME/acp-p1-files/acp25-p1-helper.sh acp-p1 2>&1 | tee "$R/helper-run3.txt"; then echo "FAIL: re-delegate nonzero"; exit 1; fi
 grep -q "HELPER-OK" "$R/helper-run3.txt" || { echo "FAIL: re-delegate no HELPER-OK"; exit 1; }
 echo RE-DELEGATION-OK
-P1PID3=$(docker inspect -f '{{.State.Pid}}' hermes-acp-p1)
-P1START3=$(docker inspect -f '{{.State.StartedAt}}' hermes-acp-p1)
+P1PID3=$(docker inspect -f '{{.State.Pid}}' acp-p1)
+P1START3=$(docker inspect -f '{{.State.StartedAt}}' acp-p1)
 if [ "$P1PID3" = "$P1PID0" ] && [ "$P1START3" = "$P1START0" ]; then echo "IDENTITY-STABLE-OK before stop (pid=$P1PID3 started=$P1START3)"; else echo "FAIL: container instance changed before stop ($P1PID0/$P1START0 -> $P1PID3/$P1START3)"; exit 1; fi
 GATE_B_STOP_SEMANTICS
 ```

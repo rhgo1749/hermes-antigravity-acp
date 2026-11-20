@@ -115,4 +115,4 @@ lease alone must never ACK.
    primitive stronger than process groups.  Do NOT expand into the
    warm-pool global-cap refactor here.
 2. Redeploy the audited mux build (drift closure) — separate approval.
-3. Independent re-review of this evidence via WebGPT task.
+3. Independent re-review of this evidence via an external LLM reviewer.
