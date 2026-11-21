@@ -168,6 +168,17 @@ HERMES_TOP_LEVEL_SNAPSHOT = frozenset({
     "hermes_state_worker_compression", "hermes_state_worker_context", "hermes_state_worker_lifecycle", "hermes_state_write",
     "hermes_time",
     "hermes_yaml", "mcp_serve", "mini_swe_runner", "model_tools",
+    # v0.23.3 storage/session reorganisation additions, stamped at the
+    # 2026-11-21 baseline promotion.  Each was reviewed by its module
+    # docstring scope: session-store lineage/retention/rescue plumbing,
+    # persistence assembly and keys, process identity of lock/lease holders,
+    # SQLite support, and storage error classification/user copy.  None
+    # carries a credential surface.  The snapshot is superset-only
+    # (namespaces - snapshot), so floor-era names above stay listed.
+    "lineage_adoption", "persistence", "persistence_assembly",
+    "process_identity", "session_keys", "session_rescue",
+    "session_retention", "session_rules", "sqlite_support",
+    "storage_errors", "storage_limits", "storage_user_copy",
     "plugins", "pm", "providers", "registration_lifecycle",
     "run_agent", "tests", "tools", "toolset_distributions",
     "toolsets", "trajectory_compressor", "tui_gateway", "utils",
