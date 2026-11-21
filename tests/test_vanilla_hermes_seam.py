@@ -110,6 +110,44 @@ def _assert_genuine_core_provenance(symbol: str, upstream_path: Path | None) -> 
         )
 
 
+def _state_provenance_symbol(upstream_path: Path | None) -> str:
+    """Pick the Core-era name of the state module the compression import
+    chain pulls in during genuine dispatch.
+
+    ``hermes_state_pidns`` shipped through v0.23.1 (and the v0.21.6 floor);
+    the v0.23.3 storage reorganisation replaced it with ``process_identity``
+    (imported at module top level by ``agent.conversation_compression``).
+    Pin whichever is a tracked top-level file of the tested checkout; if
+    neither is, fail closed naming the stale pin rather than silently
+    dropping the second provenance witness.
+    """
+    candidates = ("process_identity", "hermes_state_pidns")
+    if upstream_path is not None:
+        for name in candidates:
+            tracked = subprocess.run(
+                ["git", "-C", str(upstream_path), "ls-files",
+                 "--error-unmatch", f"{name}.py"],
+                capture_output=True,
+            )
+            if tracked.returncode == 0:
+                return name
+        pytest.fail(
+            "provenance pin stale: neither "
+            + " nor ".join(f"`{n}.py`" for n in candidates)
+            + f" is a tracked file of the tested Core checkout {upstream_path}",
+            pytrace=False,
+        )
+    for name in candidates:
+        if name in sys.modules:
+            return name
+    pytest.fail(
+        "provenance pin stale: without a checkout binding none of "
+        + " / ".join(candidates)
+        + " was imported by the dispatch",
+        pytrace=False,
+    )
+
+
 def test_vanilla_upstream_create_client_seam_builds_standalone_client(monkeypatch, tmp_path) -> None:
     module, profile = _load_real_plugin(monkeypatch, tmp_path)
     assert providers is not None
@@ -150,10 +188,12 @@ def test_vanilla_upstream_create_client_seam_builds_standalone_client(monkeypatc
     # Genuine Core dispatch with zero ``sys.modules`` substitution.  On this
     # path ``agent.agent_runtime_helpers`` reaches the shared logger through a
     # lazy ``run_agent`` import inside ``create_openai_client`` itself, and
-    # its compression import pulls in ``hermes_state_pidns``.  Both are
-    # tracked files of the tested official checkout, and their file
-    # provenance is asserted immediately after dispatch — before anything
-    # else can touch ``sys.modules`` — never by module type.
+    # its compression import pulls in the era's Core state module
+    # (``hermes_state_pidns`` through v0.23.1, ``process_identity`` from
+    # v0.23.3; see ``_state_provenance_symbol``).  Both are tracked files of
+    # the tested official checkout, and their file provenance is asserted
+    # immediately after dispatch — before anything else can touch
+    # ``sys.modules`` — never by module type.
     from agent.agent_runtime_helpers import create_openai_client
 
     run_agent_before = sys.modules.get("run_agent")
@@ -179,7 +219,7 @@ def test_vanilla_upstream_create_client_seam_builds_standalone_client(monkeypatc
             "absent after: create_openai_client never genuinely imported it"
         )
     _assert_genuine_core_provenance("run_agent", upstream_path)
-    _assert_genuine_core_provenance("hermes_state_pidns", upstream_path)
+    _assert_genuine_core_provenance(_state_provenance_symbol(upstream_path), upstream_path)
 
     assert client.__class__.__name__ == "AntigravityACPClient"
     assert client.__class__.__module__.endswith(".client")
