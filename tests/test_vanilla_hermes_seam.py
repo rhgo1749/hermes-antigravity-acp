@@ -117,35 +117,37 @@ def _state_provenance_symbol(upstream_path: Path | None) -> str:
     ``hermes_state_pidns`` shipped through v0.23.1 (and the v0.21.6 floor);
     the v0.23.3 storage reorganisation replaced it with ``process_identity``
     (imported at module top level by ``agent.conversation_compression``).
-    Pin whichever is a tracked top-level file of the tested checkout; if
-    neither is, fail closed naming the stale pin rather than silently
-    dropping the second provenance witness.
+    Require exactly one candidate to be unambiguous — tracked in the tested
+    checkout, or (without a checkout binding) present in ``sys.modules`` —
+    then let the caller's provenance assertion prove genuine import from
+    the tested checkout.  Zero candidates names a stale pin; two candidates
+    (a transitional checkout carrying both eras, or both modules in memory)
+    is ambiguous and fails closed.  A fixed preference order is forbidden:
+    tracked presence alone does not prove which module the dispatch
+    imported, and validating the wrong witness would be a false pass.
     """
     candidates = ("process_identity", "hermes_state_pidns")
     if upstream_path is not None:
-        for name in candidates:
-            tracked = subprocess.run(
+        unambiguous = [
+            name for name in candidates
+            if subprocess.run(
                 ["git", "-C", str(upstream_path), "ls-files",
                  "--error-unmatch", f"{name}.py"],
                 capture_output=True,
-            )
-            if tracked.returncode == 0:
-                return name
+            ).returncode == 0
+        ]
+        scope = f"tracked in the tested Core checkout {upstream_path}"
+    else:
+        unambiguous = [name for name in candidates if name in sys.modules]
+        scope = "present in sys.modules without a checkout binding"
+    if len(unambiguous) != 1:
         pytest.fail(
-            "provenance pin stale: neither "
-            + " nor ".join(f"`{n}.py`" for n in candidates)
-            + f" is a tracked file of the tested Core checkout {upstream_path}",
+            "provenance pin stale or ambiguous: expected exactly one of "
+            + " / ".join(candidates)
+            + f" to be {scope}, found {unambiguous or 'none'}",
             pytrace=False,
         )
-    for name in candidates:
-        if name in sys.modules:
-            return name
-    pytest.fail(
-        "provenance pin stale: without a checkout binding none of "
-        + " / ".join(candidates)
-        + " was imported by the dispatch",
-        pytrace=False,
-    )
+    return unambiguous[0]
 
 
 def test_vanilla_upstream_create_client_seam_builds_standalone_client(monkeypatch, tmp_path) -> None:
@@ -246,3 +248,43 @@ def test_core_provenance_oracle_rejects_substituted_core_modules(monkeypatch) ->
         monkeypatch.setitem(sys.modules, symbol, substitute)
         with pytest.raises(AssertionError, match="hand-built"):
             _assert_genuine_core_provenance(symbol, None)
+
+
+@pytest.mark.parametrize(
+    "tracked",
+    [(), ("process_identity",), ("hermes_state_pidns",),
+     ("process_identity", "hermes_state_pidns")],
+)
+def test_state_provenance_symbol_requires_exactly_one_tracked(tmp_path, tracked) -> None:
+    """Zero tracked candidates is a stale pin; two (a transitional checkout
+    carrying both eras) is ambiguous.  Both must fail closed — never a
+    preference-ordered pick that could validate the wrong witness."""
+    repo = tmp_path / "core"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    for name in tracked:
+        (repo / f"{name}.py").write_text("", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", f"{name}.py"], check=True)
+    if len(tracked) == 1:
+        assert _state_provenance_symbol(repo) == tracked[0]
+    else:
+        with pytest.raises(pytest.fail.Exception, match="exactly one"):
+            _state_provenance_symbol(repo)
+
+
+@pytest.mark.parametrize(
+    "present",
+    [(), ("process_identity",), ("hermes_state_pidns",),
+     ("process_identity", "hermes_state_pidns")],
+)
+def test_state_provenance_symbol_requires_exactly_one_in_modules(monkeypatch, present) -> None:
+    """Same unambiguous-witness rule for the no-checkout-binding fallback."""
+    for name in ("process_identity", "hermes_state_pidns"):
+        monkeypatch.delitem(sys.modules, name, raising=False)
+    for name in present:
+        monkeypatch.setitem(sys.modules, name, ModuleType(name))
+    if len(present) == 1:
+        assert _state_provenance_symbol(None) == present[0]
+    else:
+        with pytest.raises(pytest.fail.Exception, match="exactly one"):
+            _state_provenance_symbol(None)
