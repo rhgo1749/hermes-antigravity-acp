@@ -32,7 +32,7 @@ through Hermes' own approval-gated terminal and file tools.
 | Hermes version | `plugin.yaml` declares `requires_hermes: ">=0.21.6"` — a CI-proven floor re-run on every change (`catalog-floor-gate`); the latest upstream Hermes release is `v0.23.1`. |
 | OS support | **Ubuntu 24.04 x86_64** is the only OS with real-binary, dedicated-OS-UID clean-room execution evidence (GitHub-hosted CI; see [OS support and verification tiers](#os-support-and-verification-tiers)). **Windows x64 and Windows arm64** have real-binary hosted-CI execution evidence (actual installer + provider registration + unauthenticated ACP `initialize` on `windows-2022`/`windows-11-arm` runners) — one tier below clean-room, still executed. **Linux aarch64 and macOS arm64** are registry-pinned with publisher digests and have executed native hosted-CI lifecycle evidence (Actions run [43198795406](https://github.com/rhgo1749/hermes-antigravity-acp/actions/runs/43198795406) at `8c054be1eaa4230a87b4e5f9f23a56e3fe74ae09`: native-arch assert, publisher-pinned download + SHA-256, install → status → verify, unauthenticated ACP `initialize`, uninstall → confirmed absence) — promoted from pinned-only, still below the clean-room tier, with no authentication or model-inference coverage. Provider registration and selection/client-factory were additionally executed in Phase B run [43321929587](https://github.com/rhgo1749/hermes-antigravity-acp/actions/runs/43321929587) at `93db79996c56f6c1455b25ec29fea54bbc86c558`; these remain hosted evidence, not dedicated-UID isolation or approval of a later release SHA. |
 | Public plugin catalog | **Not registered yet.** `hermes plugins install antigravity-acp-provider` does not resolve today (upstream `plugin-catalog/` contains no entry for this provider as of 2026-11-12). The catalog submission PR ([NousResearch/hermes-agent#153182](https://github.com/NousResearch/hermes-agent/pull/153182)) is open and pending upstream review; registration is not approved or merged as of this writing. The only currently reproducible install path is the standalone installer below. |
-| Official server binary | Pinned `1.4.4`, fetched **only during an explicit install command** over HTTPS from `dl.google.com`; the publisher-pinned SHA-256 digest is verified **before** the archive is opened, extracted, or installed. No self-update; no redistribution. |
+| Official server binary | Pinned `1.5.2`, fetched **only during an explicit install command** over HTTPS from `dl.google.com`; the publisher-pinned SHA-256 digest is verified **before** the archive is opened, extracted, or installed. No self-update; no redistribution. |
 | Authentication & first model call | Credential-free CI does not validate authentication or real inference. A supervised one-prompt canary produced a real response on an earlier client version; the current release has not been verified end-to-end in that same way. This observation does not establish terms compliance for other uses. |
 | `/quota` | Unavailable / unsupported: the official server reports no billed request tokens. Since v0.7.9, `completion.usage` is populated **only** when the server itself supplies a valid per-turn usage payload — the official server currently never does, so completions carry `completion.usage=None` and Hermes uses its designed estimation fallback (`/usage` reports token records as unavailable rather than fabricated numbers). The adapter previously synthesized a prompt/completion split from `usage_update` frames; that fabrication was removed (issue #6). Durable session totals accumulate only source-verified per-call consumption deltas (see `docs/acp-usage-telemetry.md`), with `antigravity_usage_telemetry.status="unavailable"` for per-call fields; no quota command ships in the plugin. Usage, context occupancy, and billed tokens are different things — see `docs/acp-usage-telemetry.md`. |
 
@@ -435,7 +435,7 @@ binary's own file behavior is unobserved (Quick Start boundary).
 ## OS support and verification tiers
 
 `antigravity_acp/registry.py` pins Google's official ACP server (currently
-`1.4.4`) with first-party publisher SHA-256 digests for five platform
+`1.5.2`) with first-party publisher SHA-256 digests for five platform
 targets. A pinned digest is a provenance guarantee, not an execution
 guarantee, so this repository labels every platform with an explicit
 verification tier:
@@ -461,16 +461,17 @@ verification tier:
   attempts are never retro-promoted. The exact
   executed/not-executed boundary, per-platform matrix, hosted Actions run
   citation, and sanitized fingerprints are in
-  `docs/official-server-1.4.4-clean-room-e2e-2026-11-07.md`.
-  The pinned server `1.4.4` digests continue to be re-checked every CI run
-  against the first-party feed digests recorded in `tests/test_registry.py`,
-  and install-mechanics coverage continues to run against a credential-free
-  fake ACP server: that credential-free `fake-acp` registry/regression job
+  `docs/official-server-1.4.4-clean-room-e2e-2026-11-07.md`. That executed
+  clean-room evidence is version-scoped to the then-pinned `1.4.4` server;
+  it does not establish a hosted clean-room pass for `1.5.2`.
+  CI checks the `1.5.2` pins against the publisher digests recorded in
+  `tests/test_registry.py` and exercises installation mechanics with a
+  fake server: that credential-free `fake-acp` registry/regression job
   performs no live feed fetch, no authentication, and no real-binary
   execution. Real-binary execution in CI belongs to the dedicated-UID
   `acp-clean-room` job described above and to the platform install lanes
   (the Windows jobs and the macOS arm64 / Linux aarch64 lifecycle lanes) —
-  each fetches the official 1.4.4 binary under the reviewed publisher pin
+  each fetches the official pinned binary under the reviewed publisher pin
   and runs only credential-free unauthenticated `initialize` probes, never
   an authentication frame or a model prompt. An earlier initialize-only
   operational observation is not a substitute for dedicated-UID CI evidence.

@@ -353,7 +353,7 @@ def test_official_server_acquisition_stays_pinned_to_google_cdn() -> None:
     for url in urls:
         assert url.startswith("https://dl.google.com/"), url
     registry = _load_script(ROOT / "antigravity_acp" / "registry.py", "pds_registry")
-    assert registry.VERSION == "1.4.4"
+    assert registry.VERSION == "1.5.2"
 
 
 def test_public_tree_audit_flags_extra_provider_files_and_personal_tokens(tmp_path) -> None:

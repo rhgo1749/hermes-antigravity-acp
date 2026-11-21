@@ -159,7 +159,7 @@ jobs:
     # This GitHub-hosted
     # ubuntu-24.04 VM is the clean room. A dedicated OS UID created with
     # useradd executes the whole credential-free real-binary chain (fetch
-    # official ACP 1.4.4 -> exact publisher SHA-256 pin -> standalone install
+    # pinned official ACP -> exact publisher SHA-256 pin -> standalone install
     # -> status/verify -> real unauthenticated initialize -> Hermes provider
     # selection/model-discovery entry -> uninstall/reinstall -> fail-closed
     # diagnostics) with an empty disposable HOME and HERMES_HOME.
@@ -184,7 +184,7 @@ jobs:
       CLEAN_ROOM_HOME: /home/acpcr94
       CLEAN_ROOM_HERMES_HOME: /home/acpcr94/hermes-home
       CLEAN_ROOM_UPSTREAM: /home/acpcr94/upstream-hermes
-      ACP_EXPECTED_SHA256: baf31b7a97602dee359cf2a43f72b6e11c6bf354be874987d80660cd3526bb6a
+      ACP_EXPECTED_SHA256: 99dd8612450805011619d7b8447ce374c289e00549d8557f36790e1dd6256852
       HERMES_CORE_REF: a9ff9799e273f525b82718cdc69fdec71b1dca5a
       CLEAN_ROOM_EVIDENCE_FILE: /tmp/clean-room-evidence.jsonl
     steps:
@@ -202,11 +202,11 @@ jobs:
           from antigravity_acp.registry import VERSION, resolve_distribution
           dist = resolve_distribution("linux", "x86_64")
           assert platform.machine() == "x86_64", "clean room requires an x86_64 runner"
-          assert VERSION == "1.4.4", f"registry version drifted: {VERSION}"
+          assert VERSION == "1.5.2", f"registry version drifted: {VERSION}"
           expected = os.environ["ACP_EXPECTED_SHA256"]
           message = "registry pin no longer equals the reviewed digest"
           assert dist.sha256 == expected, message
-          print("preflight: reviewed ACP 1.4.4 publisher pin active")
+          print("preflight: reviewed ACP 1.5.2 publisher pin active")
           PY
       - name: Provide pinned uv to the clean-room UID
         run: |

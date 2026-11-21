@@ -385,7 +385,7 @@ def test_cli_verifies_with_embedded_pins_without_repo_registry(tmp_path, monkeyp
     import zipfile
 
     login = load_login()
-    # Setup official binary under prefix for the embedded publisher pin (1.4.4)
+    # Setup official binary under prefix for the embedded publisher pin version
     version = login._PUBLISHER_VERSION
     version_dir = tmp_path / ".local" / "opt" / "antigravity-acp" / version
     version_dir.mkdir(parents=True)

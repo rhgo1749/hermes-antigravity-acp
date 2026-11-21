@@ -193,7 +193,7 @@ def test_readme_status_table_states_floor_os_catalog_and_quota() -> None:
     assert "current release has not been verified end-to-end" in status
     assert '"/quota"' in status or "`/quota`" in status
     assert "completion.usage=None" in status
-    assert "1.4.4" in status
+    assert "1.5.2" in status
     assert "dl.google.com" in status
 
 

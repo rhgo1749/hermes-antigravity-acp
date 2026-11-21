@@ -12,8 +12,9 @@ install, verify, real unauthenticated initialize, Hermes provider
 selection, uninstall/reinstall, fail-closed diagnostics). This suite keeps
 that record honest and machine-checkable WITHOUT network access:
 
-- every archive digest quoted in the record must equal the CURRENT registry
-  pin (the record cannot drift from the pinned supply chain);
+- the sole quoted archive digest must equal the historical Linux x86_64
+  1.4.4 pin, and the matrix must retain its five recorded feed-match results;
+  current registry pins are checked separately by tests/test_registry.py;
 - the executed/NOT-VERIFIED status tokens must keep their exact wording so
   no reader (or downstream doc) can silently promote a gated class or the
   superseded container era;
@@ -43,7 +44,11 @@ ROOT = Path(__file__).resolve().parents[1]
 EVIDENCE_DOC = ROOT / "docs" / "official-server-1.4.4-clean-room-e2e-2026-11-07.md"
 
 sys.path.insert(0, str(ROOT))
-from antigravity_acp.registry import VERSION, resolve_distribution  # noqa: E402
+
+# Historical publisher pin for the sole binary executed in this record.
+RECORDED_LINUX_X86_64_PIN = (
+    "baf31b7a97602dee359cf2a43f72b6e11c6bf354be874987d80660cd3526bb6a"
+)
 
 
 def _load(name: str, rel: str):
@@ -82,26 +87,14 @@ def test_evidence_record_names_official_hermes_core_commit(doc: str) -> None:
     ), "the exact uv.lock digest must be recorded"
 
 
-def test_evidence_digests_equal_current_registry_pins(doc: str) -> None:
-    assert f"`{VERSION}`" in doc or f"{VERSION} binary" in doc
-    linux = resolve_distribution("linux", "x86_64")
-    assert linux.sha256 in doc, "the record must quote the CURRENT linux/x86_64 publisher pin in full"
-    for label, system, machine in (
-        ("Linux aarch64", "linux", "aarch64"),
-        ("macOS arm64", "darwin", "arm64"),
-        ("Windows x64", "windows", "amd64"),
-        ("Windows arm64", "windows", "arm64"),
-    ):
-        dist = resolve_distribution(system, machine)
+def test_evidence_retains_historical_linux_digest_and_feed_match_results(doc: str) -> None:
+    assert "`1.4.4`" in doc or "1.4.4 binary" in doc
+    assert RECORDED_LINUX_X86_64_PIN in doc, (
+        "the record must quote the 1.4.4 linux/x86_64 publisher pin in full"
+    )
+    for label in ("Linux x86_64", "Linux aarch64", "macOS arm64", "Windows x64", "Windows arm64"):
         row = _table_row(doc, label)
-        assert "MATCH" in row, f"{label} must record its feed-vs-registry pin check"
-        # The matrix references the same feed the registry pins came from;
-        # the full digests live in registry.py (single source of truth).
-        assert dist.sha256 != ""  # pin exists at all
-    assert "baf31b7a97602dee359cf2a43f72b6e11c6bf354be874987d80660cd3526bb6a" in doc
-    assert resolve_distribution("linux", "x86_64").sha256 == (
-        "baf31b7a97602dee359cf2a43f72b6e11c6bf354be874987d80660cd3526bb6a"
-    ), "this test itself must rotate with the registry pin"
+        assert "| MATCH (2026-11-07) |" in row, f"{label} must retain its recorded feed match"
 
 
 def test_status_tokens_keep_exact_meaning(doc: str) -> None:

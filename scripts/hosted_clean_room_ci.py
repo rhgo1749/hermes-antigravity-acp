@@ -2,7 +2,7 @@
 """historical reference rework: hosted fresh-UID clean-room driver (GitHub Actions).
 
 This driver executes the credential-free real-binary clean-room chain for
-the official Google ACP 1.4.4 server inside a GitHub-hosted ``ubuntu-24.04``
+the official Google ACP 1.5.2 server inside a GitHub-hosted ``ubuntu-24.04``
 runner VM, and it MUST run as a dedicated non-privileged OS UID created by
 the workflow with ``useradd`` — never as root and never as the runner user.
 The venue criteria (historical reference isolation ruling) are enforced here and
@@ -45,11 +45,11 @@ sys.path.insert(0, str(SCRIPTS))
 import audit_public_tree as audit  # noqa: E402
 import install_acp  # noqa: E402  (reuse of the historical reference redaction contract)
 
-EXPECTED_ACP_VERSION = "1.4.4"
+EXPECTED_ACP_VERSION = "1.5.2"
 EXPECTED_AGENT_INFO = {
     "name": "antigravity-acp",
     "title": "Google Antigravity",
-    "version": "1.4.4",
+    "version": "1.5.2",
 }
 EXPECTED_AUTH_METHOD_IDS = [
     "agent-platform",

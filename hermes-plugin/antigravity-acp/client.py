@@ -2198,8 +2198,7 @@ _USAGE_SCOPE_UNVERIFIED = "unverified_server_semantics"
 #     ``agentInfo.version == "1.4.0"`` (stage-3 canary frames).
 #   * ``agy_acp_server.par`` 1.4.4 ``server.py`` — re-verified 2026-11-11 from
 #     the installed par; its credential-free ``initialize`` self-reports
-#     ``agentInfo.version == "1.4.4"``, enforced by ``EXPECTED_AGENT_INFO`` in
-#     ``scripts/hosted_clean_room_ci.py`` and recorded in
+#     ``agentInfo.version == "1.4.4"``, as recorded in the historical report
 #     ``docs/official-server-1.4.4-clean-room-e2e-2026-11-07.md``.
 # These pins are OBSERVED IDENTITY triples, not trustworthy version
 # comparisons: any deviation (absent, unknown, changed, malformed
@@ -2210,11 +2209,8 @@ _VERIFIED_CONSUMPTION_IDENTITIES = frozenset(
     {
         # 1.4.0: observed identity in the stage-3 canary frames.
         ("antigravity-acp", "Google Antigravity", "1.4.0"),
-        # 1.4.4: identity verified credential-free against the official
-        # binary by the hosted clean room (`EXPECTED_AGENT_INFO` in
-        # scripts/hosted_clean_room_ci.py; per-call delta semantics source-
-        # verified in the 1.4.4 PAR). The server reports its own binary
-        # version here, so every verified release must be pinned explicitly.
+        # 1.4.4: historical hosted initialize verified identity; source audit
+        # of the 1.4.4 PAR verified per-call delta semantics separately.
         ("antigravity-acp", "Google Antigravity", "1.4.4"),
     }
 )

@@ -58,7 +58,8 @@ driver = _load("hosted_clean_room_ci_contract", DRIVER_PATH)
 audit = _load("audit_hosted_contract", ROOT / "scripts" / "audit_public_tree.py")
 install_acp = _load("install_acp_hosted_contract", ROOT / "scripts" / "install_acp.py")
 
-ACP_PIN = "baf31b7a97602dee359cf2a43f72b6e11c6bf354be874987d80660cd3526bb6a"
+ACP_PIN = "99dd8612450805011619d7b8447ce374c289e00549d8557f36790e1dd6256852"
+HISTORICAL_ACP_PIN = "baf31b7a97602dee359cf2a43f72b6e11c6bf354be874987d80660cd3526bb6a"
 HERMES_COMMIT = "a9ff9799e273f525b82718cdc69fdec71b1dca5a"
 
 # Fake credential-shaped material assembled at runtime so this committed
@@ -336,7 +337,7 @@ def test_hosted_section_records_the_ruling_and_venue(doc: str) -> None:
 
     assert "ubuntu-24.04" in section
     assert "useradd" in section
-    assert ACP_PIN in section
+    assert HISTORICAL_ACP_PIN in section
     assert "NOT EXECUTED" in section  # prior container/Docker eras stay
     assert "HOSTED-AUTHENTICATED-SESSION: NOT RUN" in section
     assert "HOSTED-REAL-INFERENCE: NOT RUN / NO-GO" in section

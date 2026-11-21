@@ -3,13 +3,13 @@ import re
 from antigravity_acp.registry import VERSION, resolve_distribution
 
 # Publisher digests published by Google's first-party ACP update feed:
-# https://dl.google.com/agy-extensions/releases/acp/feed/v1/next/1.4.3/acp_next.json
+# https://dl.google.com/agy-extensions/releases/acp/feed/v1/next/1.5.0/acp_next.json
 GOOGLE_FEED_PINS = {
-    ("Linux", "x86_64"): "baf31b7a97602dee359cf2a43f72b6e11c6bf354be874987d80660cd3526bb6a",
-    ("Linux", "aarch64"): "b0273227c07cfa1ea5c1d9ff869b64c5b2b39b98862081fcd4c597ec316e0c57",
-    ("Darwin", "arm64"): "a3cf324046396380fcd8c055a4a4c83ac4ea74a38ea883ccbfce5ca1e9927ae9",
-    ("Windows", "amd64"): "4b68e5936a3d7a60b520aa1ee9479c8be58c43e015f026dc41e7ad17ec54d427",
-    ("Windows", "arm64"): "655835b095e160d726ee894a10e56960a9a81b03503edbd348079336163b28de",
+    ("Linux", "x86_64"): "99dd8612450805011619d7b8447ce374c289e00549d8557f36790e1dd6256852",
+    ("Linux", "aarch64"): "e729e05ef54ef0763e48900032466b47fa7c9939cde257f93ba49410ab577acb",
+    ("Darwin", "arm64"): "123a16d5c40a8ac99e20f01a62b68dd860fd96b1c528dfb8eaa37ca8733d4845",
+    ("Windows", "amd64"): "5cbadd4f4df698572473d8890fc26ec2dc1724501f06e3a963941daec2bd21d6",
+    ("Windows", "arm64"): "8a4b2ea8df2ffefae33309348752e9119d21a6d36090c0eb48631c2e8f5781ab",
 }
 
 

@@ -51,10 +51,11 @@ each with its own drop counter:
    (`server_consumption_semantics: "verified"`). Pinned identities:
    `("antigravity-acp", "Google Antigravity", "1.4.0")` (stage-3 canary
    frames) and `("antigravity-acp", "Google Antigravity", "1.4.4")`
-   (credential-free `initialize` against the official binary, enforced by
-   `EXPECTED_AGENT_INFO` in `scripts/hosted_clean_room_ci.py`). The server
-   reports its own binary version, so each verified release must be pinned
-   explicitly; spec-compliant or unknown servers are never summed.
+   (source audit and [historical initialize evidence](official-server-1.4.4-clean-room-e2e-2026-11-07.md)).
+   The server reports its own binary version, so each verified release must be pinned
+   explicitly; spec-compliant or unknown servers are never summed. The default
+   1.5.2 install is not on this list: `initialize` verifies server identity,
+   not per-call accounting semantics. Its unverified deltas are not summed.
 2. **Prompt-turn window** — frames are counted only between sending
    `session/prompt` and receiving its response. This is event-order
    correlation against the adapter's own request, NOT value equality: two

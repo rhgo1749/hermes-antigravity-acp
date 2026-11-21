@@ -41,7 +41,7 @@ python3 scripts/install_acp.py install
 What this does, in order:
 
 1. Resolves the pinned distribution for your platform from
-   `antigravity_acp/registry.py` (currently server `1.4.4`) and downloads the
+   `antigravity_acp/registry.py` (currently server `1.5.2`) and downloads the
    archive over HTTPS from `dl.google.com`.
 2. Verifies the archive against the first-party publisher SHA-256 pin **before
    the archive is opened, extracted, or installed**, and before any existing

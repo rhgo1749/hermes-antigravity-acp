@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import os
+import re
 import shutil
 import stat
 import sys
@@ -86,7 +87,54 @@ def _launcher_variants(target: Path, default_args: tuple[str, ...]) -> tuple[str
     return content, legacy
 
 
-def _write_launcher(path: Path, target: Path, default_args: tuple[str, ...]) -> None:
+def _prior_official_launcher_targets(
+    prefix: Path,
+    runtime_prefix: Path | None,
+    version_dir: Path,
+    executable_name: str,
+) -> tuple[Path, ...]:
+    """Exact launch targets this installer would have written for other
+    official versions that are actually installed under the selected prefix.
+
+    Only real version directories count (never symlinks, never staging
+    directories, never the version being installed), and each candidate is
+    reconstructed with that directory's own executable layout, mapped through
+    the same selected runtime-prefix as the current install. The result is
+    used solely for byte-exact launcher ownership comparison: nothing here is
+    executed, read into a shell, or authenticated.
+    """
+    targets: list[Path] = []
+    if prefix.is_symlink() or not prefix.is_dir():
+        return ()
+    try:
+        children = sorted(prefix.iterdir(), key=lambda path: path.name)
+    except OSError:
+        return ()
+    for child in children:
+        if child == version_dir or re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", child.name) is None:
+            continue
+        if child.is_symlink() or not child.is_dir():
+            continue
+        try:
+            prior_executable = _find_executable(child, executable_name)
+            if prior_executable.resolve(strict=True) != prior_executable:
+                continue
+        except (OSError, RuntimeError):
+            continue
+        relative = prior_executable.relative_to(child)
+        if runtime_prefix is not None:
+            targets.append(runtime_prefix.expanduser() / child.name / relative)
+        else:
+            targets.append(prefix / child.name / relative)
+    return tuple(targets)
+
+
+def _write_launcher(
+    path: Path,
+    target: Path,
+    default_args: tuple[str, ...],
+    prior_targets: tuple[Path, ...] = (),
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     content, legacy = _launcher_variants(target, default_args)
     if path.is_symlink():
@@ -96,10 +144,20 @@ def _write_launcher(path: Path, target: Path, default_args: tuple[str, ...]) -> 
             existing = path.read_text(encoding="utf-8")
         except (OSError, UnicodeError) as exc:
             raise RuntimeError("Refusing to replace an unreadable official ACP launcher") from exc
-        if existing not in {content, legacy}:
-            raise RuntimeError("Refusing to replace an unmanaged official ACP launcher")
         if existing == content:
             return
+        if existing not in {content, legacy}:
+            # Version migration: a launcher this installer generated for a
+            # previously installed official version (exact bytes, either the
+            # marked or legacy unmarked variant, targeting a version
+            # directory that really exists under the selected prefix) is
+            # ours and may be repointed. Anything else stays refused.
+            owned_prior = any(
+                existing in _launcher_variants(prior, default_args)
+                for prior in prior_targets
+            )
+            if not owned_prior:
+                raise RuntimeError("Refusing to replace an unmanaged official ACP launcher")
     with tempfile.NamedTemporaryFile(
         mode="w", encoding="utf-8", prefix=".antigravity-acp-launcher-",
         dir=path.parent, delete=False,
@@ -200,7 +258,17 @@ def install(
         executable = _find_executable(version_dir, dist.executable)
 
     _ensure_runtime_executables(version_dir, executable)
-    _write_launcher(launcher, launch_target(executable), dist.args)
+    # The archive backing this install has already been SHA-256-verified
+    # above (downloaded-and-verified, or retained-and-reverified) before this
+    # line ever repoints a launcher.
+    _write_launcher(
+        launcher,
+        launch_target(executable),
+        dist.args,
+        prior_targets=_prior_official_launcher_targets(
+            prefix, runtime_prefix, version_dir, dist.executable
+        ),
+    )
     return {"version_dir": version_dir, "executable": executable, "launcher": launcher}
 
 
