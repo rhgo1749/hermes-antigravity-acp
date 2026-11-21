@@ -88,9 +88,9 @@ and marked as not observed here — never guessed.
 
 | File | Contents | Protections |
 |---|---|---|
-| `~/.hermes/cache/antigravity-acp-sessions.json` | Session-continuation checkpoints (opaque session/frontier hashes) and additive `usage_totals` per explicit Hermes session id | 0600, atomic replace, 24 h TTL, bounded entries; override `HERMES_ANTIGRAVITY_ACP_STATE_FILE` / `HERMES_ANTIGRAVITY_ACP_STATE_TTL_SECONDS` / `HERMES_ANTIGRAVITY_ACP_STATE_MAX_ENTRIES` |
+| `~/.hermes/cache/antigravity-acp-sessions.json` | Session-continuation checkpoints (native ACP session ID stored locally as-is for resume, plus context/request/response fingerprints) and additive `usage_totals` keyed by session identity. Usage telemetry hashes the native ID; the checkpoint does not. | 0600, atomic replace, 24 h TTL, bounded entries; override `HERMES_ANTIGRAVITY_ACP_STATE_FILE` / `HERMES_ANTIGRAVITY_ACP_STATE_TTL_SECONDS` / `HERMES_ANTIGRAVITY_ACP_STATE_MAX_ENTRIES` |
 | `~/.hermes/cache/antigravity-acp-native-limits.json` | Profile-neutral learned trajectory-limit observations | 0600, atomic replace, 7-day TTL; override `HERMES_ANTIGRAVITY_ACP_LIMIT_STATE_FILE` / `HERMES_ANTIGRAVITY_ACP_LIMIT_TTL_SECONDS` |
-| Provider tree + `install-provenance.json` | The canonical 7-file plugin set plus ownership metadata | Ownership refusal protects foreign/catalog trees (`docs/quick-start.md`) |
+| Provider tree + `install-provenance.json` | The canonical managed plugin file set (`scripts/deploy_hermes_profiles.py`) plus ownership metadata | Ownership refusal protects foreign/catalog trees (`docs/quick-start.md`) |
 | `~/.local/opt/antigravity-acp/<version>/` | Google's versioned server files as distributed | Managed by the installer; uninstall removes only these plus the managed launcher |
 
 Google's own sign-in/session state lives wherever Google's runtime stores it

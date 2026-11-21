@@ -135,10 +135,8 @@ def test_readme_quick_start_lists_currently_reproducible_commands() -> None:
     ):
         assert command in quick, command
     # Hermes selection and the credential-free boundary are stated in place.
-    assert "Antigravity ACP (official)" in quick
-    assert "current release has not been verified end-to-end" in " ".join(quick.split()) or (
-        "current release has not been validated end-to-end" in " ".join(quick.split())
-    )
+    assert "**Antigravity ACP**" in quick
+    assert "no published end-to-end authentication or inference result" in " ".join(quick.split())
     # The documented clean-room evidence must remain discoverable.
     assert "hosted clean-room" in " ".join(quick.split())
     assert "docs/official-server-1.4.4-clean-room-e2e-2026-11-07.md" in quick
@@ -161,19 +159,18 @@ def test_documented_installer_verbs_are_the_real_parser_choices() -> None:
     assert unknown == set(), f"docs advertise non-existent installer verbs: {unknown}"
 
 
-def test_quick_start_never_presents_the_catalog_route_as_available() -> None:
+def test_standalone_and_catalog_install_routes_are_distinct() -> None:
     readme = _read("README.md")
     quick = _section(readme, "## 5-minute Quick Start")
-    assert "hermes plugins install" not in quick, (
-        "the catalog command is not available today and must not appear as a "
-        "Quick Start step (publication gate)"
-    )
-    # The catalog path section states the gate and the re-checked absence.
+    assert "hermes plugins install" not in quick, "the Quick Start is the standalone route"
     install_paths = _section(readme, "## Installation paths")
-    assert "NOT available until catalog publication" in install_paths
-    assert "hermes plugins install antigravity-acp-provider" in install_paths
-    assert "no catalog entry to install from" in install_paths
-    assert "does not resolve today" in readme
+    catalog = install_paths.split("**Catalog path (Linux)", 1)[1]
+    assert catalog.index("hermes plugins install antigravity-acp-provider") < catalog.index(
+        "python3 scripts/install_official.py"
+    )
+    assert "This step installs no Google binary" in catalog
+    assert "entry's exact `sha` (not `main`)" in catalog
+    assert "Do not use `scripts/install_acp.py install` for this step" in catalog
 
 
 # ---------------------------------------------------------------------------
@@ -187,10 +184,11 @@ def test_readme_status_table_states_floor_os_catalog_and_quota() -> None:
     status = _section(readme, "## Status at a glance")
     assert ">=0.21.6" in status
     assert "Ubuntu 24.04 x86_64" in status
-    assert "pinned-only" in status
-    assert "Not registered yet" in status
+    assert "native hosted-CI lifecycle evidence" in status
+    assert "Listed for Linux" in status
+    assert "plugin-catalog/antigravity-acp-provider.yaml" in status
     assert "Credential-free CI does not validate authentication or real inference" in status
-    assert "current release has not been verified end-to-end" in status
+    assert "no published end-to-end authentication or inference result" in status
     assert '"/quota"' in status or "`/quota`" in status
     assert "completion.usage=None" in status
     assert "1.5.2" in status
@@ -222,7 +220,7 @@ def test_quota_unavailable_and_usage_distinction_stated() -> None:
     assert "context-occupancy counters" in _collapsed("docs/troubleshooting.md").lower()
 
 
-def test_catalog_absence_and_registry_link_are_current() -> None:
+def test_public_registry_link_uses_current_path() -> None:
     readme = _read("README.md")
     terms = _read("docs/terms-and-licensing.md")
     # The registry entry moved out of a nested registry/ directory; the stale
@@ -285,8 +283,9 @@ def test_quick_start_doc_covers_full_lifecycle_and_scoping() -> None:
         "SHA-256",
     ):
         assert fragment in doc, fragment
-    assert "Not available until catalog publication" in doc
-    assert "Not verified end-to-end on the current release" in doc
+    assert "Available separately on Linux" in doc
+    assert "provider and matching ACP server are installed in two steps" in doc
+    assert "No published end-to-end authentication or inference result" in doc
 
 
 # ---------------------------------------------------------------------------

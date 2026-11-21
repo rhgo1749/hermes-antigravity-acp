@@ -106,10 +106,10 @@ prove install/verify/unauthenticated-handshake mechanics only. See
   https://github.com/agentclientprotocol/registry/tree/main/antigravity-acp
   (location re-checked 2026-11-08); this repository consumes the registry's
   published version/platform mapping, it is not the registry entry's owner.
-- **Hermes plugin catalog:** submission-candidate design lives in
-  `docs/plugin-catalog-entry.draft.yaml`; the catalog entry itself (and any
-  external submission) requires separate approval. No catalog registration
-  exists today.
+- **Hermes plugin catalog:** the [official entry](https://github.com/NousResearch/hermes-agent/blob/main/plugin-catalog/antigravity-acp-provider.yaml)
+  lists provider `0.7.12` for Linux as of 2026-11-21. Provider admission is
+  not a distribution of Google's binary or permission to use an auth route.
+  Updating the pin requires a separate upstream review.
 
 ## 6. Change management
 

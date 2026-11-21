@@ -107,14 +107,13 @@ success or inference. Windows selection/factory remains unverified because
 the real-Core probe assumes POSIX UID/launcher semantics. macOS and Linux
 ARM now have real-Core registration/factory evidence, but not dedicated-UID
 isolation. No lane claims live-account validation or authenticated inference.
-The mandatory Hermes release lanes are the stable official baseline
-**v0.23.1** (source commit `3b421578588243f920886e6fe79a6faa87ea026e`, official unsigned annotated tag
-`v0.23.1`, Docker Hub image index digest `sha256:276d44685c65c0cb2a25f190b63c65c8906f9dc76486fb1c05ae71b5826bda08` — provenance metadata only,
-not evidence CI ran the official image; no hosted v0.23.1 PASS is claimed) and
-the minimum `v0.21.6` strict seam; the latest-`main` seam is a separate
-advisory diagnostic that may fail without blocking and is not compatibility
-evidence (2026-11-16 policy, [hermes-compatibility.md](hermes-compatibility.md)).
-The native probe's reviewed Core commit pin is preserved.
+The mandatory Hermes release lanes use the stable official Core baseline
+(`v0.23.3`, as pinned in [hermes-core-baseline.json](../release/hermes-core-baseline.json))
+and the minimum `v0.21.6` strict seam. Latest upstream `main` is a separate
+advisory diagnostic; it is not evidence for the stable baseline. The pin's
+Docker image digest records provenance, not execution of that image. See
+[the compatibility policy](hermes-compatibility.md#baseline-policy--stable-v0233-current-2026-11-21).
+The native probes keep their separately reviewed Core pin.
 
 ## Tests, cost and the subsequent main-push change
 

@@ -1,13 +1,13 @@
-# Submission candidate for NousResearch/hermes-agent `plugin-catalog/`.
-# The actual catalog submission is a separately approved task; do not open it
-# from this file's presence. Field design follows the current catalog schema
+# Draft pin update for the existing NousResearch/hermes-agent catalog entry.
+# Start from the live upstream entry when preparing a pin update; do not
+# submit this template as-is. Field design follows the current catalog schema
 # (plugin-catalog/README.md rules 2, 6, 14) as observed on upstream main
 # 95ab0500524fd56b2642916cd06db9b75646d7f2.
 #
 # sha MUST be replaced with the full 40-hex commit SHA of the merged main
 # commit chosen at submission time (rule 2: exact SHA pins are mandatory).
 name: antigravity-acp-provider
-title: Antigravity ACP (official)
+title: Hermes Antigravity ACP
 repo: https://github.com/rhgo1749/hermes-antigravity-acp
 sha: "<40-HEX-AT-SUBMISSION>"
 subdir: hermes-plugin/antigravity-acp

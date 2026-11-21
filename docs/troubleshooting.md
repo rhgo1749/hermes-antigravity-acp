@@ -90,8 +90,8 @@ with an authentication-required error; model listing does not appear.
   subscription OAuth through this harness is a documented Terms breach —
   see `docs/terms-and-licensing.md`.
 - Credential-free CI does not validate real authentication or inference.
-  A supervised canary used an older client; current-release end-to-end
-  validation is still outstanding.
+  A supervised canary used an older client; there is no published
+  end-to-end authentication or inference result for this candidate.
   There is no supported noninteractive credential injection path here, and
   fabricating or extracting tokens is out of the question by design.
 

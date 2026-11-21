@@ -1,17 +1,16 @@
 # Standalone Quick Start: full lifecycle
 
 Companion to the README "5-minute Quick Start". This page is the
-complete, operator-followable lifecycle for the **currently reproducible**
-install route: the credential-free standalone installer from a checkout of
-this repository. The Quick Start route is what the hosted
+complete lifecycle for the **credential-free standalone installer** from a
+checkout of this repository. The Quick Start route is what the hosted
 clean-room executes as a dedicated OS UID on `ubuntu-24.04`
 (`docs/official-server-1.4.4-clean-room-e2e-2026-11-07.md`), so an operator
 with no prior documentation can reproduce it end to end.
 
-The public Hermes plugin catalog does **not** carry this provider yet —
-`hermes plugins install antigravity-acp-provider` does not resolve today.
-Catalog registration is pending. Nothing
-here assumes a personal mux, an account router, or a Hermes Core patch.
+For the separate [catalog route](../README.md#installation-paths-standalone-or-catalog),
+Hermes installs the provider and the matching checkout's server-only installer
+installs the ACP binary. The steps below use the standalone route instead.
+Neither route requires a personal mux, account router, or Hermes Core patch.
 
 ## Prerequisites
 
@@ -19,9 +18,10 @@ here assumes a personal mux, an account router, or a Hermes Core patch.
   upstream release is checked in the README status table).
 - `python3` and a checkout of this repository.
 - Outbound HTTPS to `dl.google.com` during the explicit install step only.
-- A system in the executed tier (Ubuntu 24.04 x86_64) or a registry-pinned
-  tier (Linux aarch64, macOS arm64, Windows x64/arm64 — pinned-only, see the
-  README verification tiers).
+- One of the five registry-pinned targets with executed evidence: Linux
+  x86_64 (Ubuntu 24.04 dedicated-UID clean room), Linux aarch64, macOS arm64,
+  or Windows x64/arm64 (native hosted CI; see
+  [verification tiers](../README.md#os-support-and-verification-tiers)).
 - No Docker, no sudo, no fixed container names, no account multiplexer, and
   no private profile infrastructure is required or assumed.
 
@@ -30,8 +30,8 @@ here assumes a personal mux, an account router, or a Hermes Core patch.
 On Windows, after obtaining this repository, double-click `install-windows.cmd`.
 It uses the Python installed with Hermes when available, then falls back to the
 Windows Python launcher. It installs the pinned server and provider without
-signing in. This is a checkout-based shortcut, not a Hermes Catalog install;
-Windows execution remains unverified until tested on a Windows machine.
+signing in. This is a checkout-based shortcut, not a Hermes catalog install.
+Both Windows architectures have credential-free native hosted-CI evidence.
 
 From a terminal on Linux or macOS, run:
 ```bash
@@ -114,7 +114,7 @@ Catalog Rule 9 private-import warnings and the informational provider
 
 ## 4. Select the provider in Hermes
 
-Start or reload Hermes and select **Antigravity ACP (official)** from the
+Start or reload Hermes and select **Antigravity ACP** from the
 provider/model selector. If the provider does not appear, see
 `docs/troubleshooting.md` (loader/discovery class).
 
@@ -193,8 +193,8 @@ by themselves).
 
 | Item | Status today |
 |---|---|
-| Public catalog install (`hermes plugins install ...`) | Not available until catalog publication |
-| Live authentication / first model call | Not verified end-to-end on the current release |
+| Public catalog install (`hermes plugins install ...`) | Available separately on Linux; the provider and matching ACP server are installed in two steps |
+| Live authentication / first model call | No published end-to-end authentication or inference result for this candidate |
 | `/quota` visibility | Unavailable / unsupported — no vendor-sanctioned surface |
 | Account selection | None in this route; optional MUX selects configured accounts and is subject to vendor terms |
 | Optional MUX | Preview; not part of this route |

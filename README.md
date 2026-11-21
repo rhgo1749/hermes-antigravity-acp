@@ -25,15 +25,15 @@ session launch and native file-mutation or command permission frames are
 answered with the server's own reject option, so shell and file work runs
 through Hermes' own approval-gated terminal and file tools.
 
-## Status at a glance (evidence-backed, checked 2026-11-13)
+## Status at a glance (evidence-backed, checked 2026-11-21)
 
 | Topic | Current status |
 |---|---|
 | Hermes version | `plugin.yaml` declares `requires_hermes: ">=0.21.6"` — a CI-proven floor re-run on every change (`catalog-floor-gate`); the latest upstream Hermes release is `v0.23.3`. |
 | OS support | **Ubuntu 24.04 x86_64** is the only OS with real-binary, dedicated-OS-UID clean-room execution evidence (GitHub-hosted CI; see [OS support and verification tiers](#os-support-and-verification-tiers)). **Windows x64 and Windows arm64** have real-binary hosted-CI execution evidence (actual installer + provider registration + unauthenticated ACP `initialize` on `windows-2022`/`windows-11-arm` runners) — one tier below clean-room, still executed. **Linux aarch64 and macOS arm64** are registry-pinned with publisher digests and have executed native hosted-CI lifecycle evidence (Actions run [43198795406](https://github.com/rhgo1749/hermes-antigravity-acp/actions/runs/43198795406) at `8c054be1eaa4230a87b4e5f9f23a56e3fe74ae09`: native-arch assert, publisher-pinned download + SHA-256, install → status → verify, unauthenticated ACP `initialize`, uninstall → confirmed absence) — promoted from pinned-only, still below the clean-room tier, with no authentication or model-inference coverage. Provider registration and selection/client-factory were additionally executed in Phase B run [43321929587](https://github.com/rhgo1749/hermes-antigravity-acp/actions/runs/43321929587) at `93db79996c56f6c1455b25ec29fea54bbc86c558`; these remain hosted evidence, not dedicated-UID isolation or approval of a later release SHA. |
-| Public plugin catalog | **Not registered yet.** `hermes plugins install antigravity-acp-provider` does not resolve today (upstream `plugin-catalog/` contains no entry for this provider as of 2026-11-12). The catalog submission PR ([NousResearch/hermes-agent#153182](https://github.com/NousResearch/hermes-agent/pull/153182)) is open and pending upstream review; registration is not approved or merged as of this writing. The only currently reproducible install path is the standalone installer below. |
+| Public plugin catalog | **Listed for Linux at `0.7.12`** ([official entry](https://github.com/NousResearch/hermes-agent/blob/main/plugin-catalog/antigravity-acp-provider.yaml), [admission PR](https://github.com/NousResearch/hermes-agent/pull/153182)). The catalog installs the provider only; install the matching official server separately. Publishing a repository release does not change the catalog pin. |
 | Official server binary | Pinned `1.5.2`, fetched **only during an explicit install command** over HTTPS from `dl.google.com`; the publisher-pinned SHA-256 digest is verified **before** the archive is opened, extracted, or installed. No self-update; no redistribution. |
-| Authentication & first model call | Credential-free CI does not validate authentication or real inference. A supervised one-prompt canary produced a real response on an earlier client version; the current release has not been verified end-to-end in that same way. This observation does not establish terms compliance for other uses. |
+| Authentication & first model call | Credential-free CI does not validate authentication or real inference. A supervised one-prompt canary produced a real response on an earlier client version; there is no published end-to-end authentication or inference result for this candidate. This observation does not establish terms compliance for other uses. |
 | `/quota` | Unavailable / unsupported: the official server reports no billed request tokens. Since v0.7.9, `completion.usage` is populated **only** when the server itself supplies a valid per-turn usage payload — the official server currently never does, so completions carry `completion.usage=None` and Hermes uses its designed estimation fallback (`/usage` reports token records as unavailable rather than fabricated numbers). The adapter previously synthesized a prompt/completion split from `usage_update` frames; that fabrication was removed (issue #6). Durable session totals accumulate only source-verified per-call consumption deltas (see `docs/acp-usage-telemetry.md`), with `antigravity_usage_telemetry.status="unavailable"` for per-call fields; no quota command ships in the plugin. Usage, context occupancy, and billed tokens are different things — see `docs/acp-usage-telemetry.md`. |
 
 ## Delegated children: ACP affinity fix (v0.7.9)
@@ -96,7 +96,7 @@ python3 scripts/install_acp.py status    # read-only presence report
 python3 scripts/install_acp.py verify    # unauthenticated initialize probe (vendor-child boundary below)
 ```
 
-Start (or reload) Hermes and select **Antigravity ACP (official)** from
+Start (or reload) Hermes and select **Antigravity ACP** from
 Hermes' provider/model selector.
 
 Optional official admission check with your installed Hermes CLI:
@@ -105,8 +105,9 @@ Optional official admission check with your installed Hermes CLI:
 hermes plugins validate hermes-plugin/antigravity-acp --install-deps
 ```
 
-The CI floor gate runs the same validation at Hermes `v0.21.6` and upstream
-`main`; the documented Catalog Rule 9 warnings are enumerated in
+The required CI lanes run the same validation at the Hermes floor `v0.21.6`
+and stable baseline `v0.23.3`; upstream `main` is advisory. Catalog Rule 9
+warnings are documented in
 `docs/hermes-compatibility.md`.
 
 **What the Quick Start proves — and what it does not.** This is exactly the
@@ -128,15 +129,14 @@ while answering the handshake is not observable from this repository — it is
 neither claimed nor excluded here; see the vendor attribution in
 `docs/data-and-permissions.md`. None of these steps is evidence of **auth
 success**, **real-server model discovery**, or **real model inference**. An
-earlier supervised canary produced a model response, but the current release
-has not been validated end-to-end with authentication and real inference
+earlier supervised canary produced a model response. There is no published
+end-to-end authentication or inference result for this candidate
 (see [OS support and verification tiers](#os-support-and-verification-tiers)
 and `docs/clean-env-e2e-smoke.md`).
 
 **Authentication and the first model call are deliberately outside this Quick
 Start.** Google's Antigravity Terms prohibit routing your individual
-Antigravity login/OAuth through third-party software. The current release has
-not had an equivalent authenticated live canary. Use only
+Antigravity login/OAuth through third-party software. Use only
 an authentication route the terms that apply to you permit
 (Google's FAQ names Gemini Enterprise or Google AI Studio API keys for
 third-party coding agents), and complete sign-in only inside Google's official
@@ -223,14 +223,14 @@ one account/environment → official Google ACP server → Hermes provider.
   Account rotation may be restricted by the vendor's terms; do not use it to
   evade quotas.
 
-## Installation paths: standalone today, catalog when available
+## Installation paths: standalone or catalog
 
 The paths are separate and composable. The provider is plain Hermes plugin
 code; Google's official ACP server is an **external native binary dependency**
 that no path ever downloads or self-updates during `plugin.yaml` loading or
 plugin import — server installation is always an explicit command.
 
-**Standalone combined installer — the currently reproducible path.** From a
+**Standalone combined installer — server and provider in one command.** From a
 checkout of this repository, `scripts/install_acp.py
 install|update|status|verify|delete` installs the pinned official server and
 projects the provider code into
@@ -238,9 +238,10 @@ projects the provider code into
 `~/.hermes/plugins/model-providers/antigravity-acp/`). Every projected tree
 carries an `install-provenance.json` ownership marker; a directory that is
 catalog-managed, installed via `hermes plugins install`, or otherwise
-unverifiable is refused **before the first write** (ambiguous ownership fails
-closed — including a plain `cp -r` copy of this repository, whose tree
-proves nothing). Installs predating the marker are recognized through legacy
+unverifiable is refused before any provider files are replaced (including a
+plain `cp -r` copy with no verifiable ownership). The combined installer
+installs the server before attempting the provider projection; a provider
+refusal does not undo a completed server install. Installs predating the marker are recognized through legacy
 `par.txt`/`launch_config.json` artifacts or a full canonical managed-file set
 byte-identical to a verified pre-marker release. `delete` removes only
 standalone-owned projections plus the pinned server; the empty-`HERMES_HOME`
@@ -264,22 +265,25 @@ vendor-child boundary as the Quick Start;
 `--uninstall` deletes only that versioned directory and the managed launcher
 and refuses untouched any unmanaged launcher file.
 
-**Catalog provider path — designed, NOT available until catalog publication.** The
-submission candidate is recorded in `docs/plugin-catalog-entry.draft.yaml`;
-the catalog submission to the official repository is a separate, separately approved
-task and nothing in this repository opens it. Once an entry exists,
-`hermes plugins install antigravity-acp-provider` would install
-`hermes-plugin/antigravity-acp/` at the catalog's reviewed exact commit and
-record that provenance outside the plugin tree
-(`plugins/.install-metadata.json` plus the `.hermes-catalog.json` sidecar);
-the catalog would then own those bytes (change them only through
-`hermes plugins update`/`hermes plugins remove`, and the catalog SHA pin only
-through the official upstream catalog PR). The catalog path installs no Google
-binary — the server-only or combined installer above still completes the
-dependency. The lifecycle mechanics of this composition are already covered
-by credential-free contract tests (`tests/test_clean_env_e2e_smoke.py`), but
-**until the catalog entry is merged there is no catalog entry to install from** — do not
-document or script it as available.
+**Catalog path (Linux) — install the provider and server separately.**
+
+1. Run `hermes plugins install antigravity-acp-provider`. Hermes installs the
+   complete provider from `hermes-plugin/antigravity-acp/` at the catalog's
+   reviewed SHA. This step installs no Google binary.
+2. Check the [official catalog entry](https://github.com/NousResearch/hermes-agent/blob/main/plugin-catalog/antigravity-acp-provider.yaml)
+   and check out this repository at that entry's exact `sha` (not `main`).
+   From that checkout, run `python3 scripts/install_official.py` to install
+   the matching server and launcher. For example, the catalog's `0.7.12`
+   entry pins ACP server `1.4.4`; the standalone `0.8.0` candidate pins
+   `1.5.2`. Do not use `scripts/install_acp.py install` for this step: it
+   also attempts to manage provider files owned by the catalog.
+
+Both steps are needed on a fresh system. Hermes owns the catalog-installed
+provider files (`plugins/.install-metadata.json` plus the
+`.hermes-catalog.json` sidecar); use `hermes plugins update` and
+`hermes plugins remove` to manage them. A catalog pin update requires a
+separately reviewed upstream PR. `tests/test_clean_env_e2e_smoke.py` covers
+composition without credentials.
 
 **Publisher digest pinning.** Every downloaded server archive is verified
 against a publisher-pinned SHA-256 digest **before it is opened, extracted, or
@@ -446,7 +450,7 @@ verification tier:
   real-binary lifecycle
   `download/pin → official server install → status → verify →
   unauthenticated ACP initialize → uninstall → reinstall → verify` against
-  the official Google-distributed 1.4.4 binary with `env -i` and an empty
+  the pinned, official Google-distributed binary with `env -i` and an empty
   disposable `HOME`/`HERMES_HOME`, alongside an official unmodified Hermes
   checkout installed with `uv sync --frozen`; the archive digest is
   verified against the first-party feed pin before extraction. Hermes
@@ -461,9 +465,11 @@ verification tier:
   attempts are never retro-promoted. The exact
   executed/not-executed boundary, per-platform matrix, hosted Actions run
   citation, and sanitized fingerprints are in
-  `docs/official-server-1.4.4-clean-room-e2e-2026-11-07.md`. That executed
-  clean-room evidence is version-scoped to the then-pinned `1.4.4` server;
-  it does not establish a hosted clean-room pass for `1.5.2`.
+  `docs/official-server-1.4.4-clean-room-e2e-2026-11-07.md` for the
+  historical `1.4.4` run. The `1.5.2` clean-room lifecycle also passed in
+  [run 44912004325](https://github.com/rhgo1749/hermes-antigravity-acp/actions/runs/44912004325)
+  at `93b75fc329099945e7b7fc1b606d09d66dfdaea4`, with all five native
+  platform jobs green. Those results apply only to that tested SHA.
   CI checks the `1.5.2` pins against the publisher digests recorded in
   `tests/test_registry.py` and exercises installation mechanics with a
   fake server: that credential-free `fake-acp` registry/regression job
@@ -584,7 +590,7 @@ job adds real-binary class-2 (initialize) evidence on Linux x86_64 only
 2026-11-07 private-container attempt is a historical observation that
 remains NOT EXECUTED as clean-room acceptance evidence. CI itself does not
 validate authentication or inference; the earlier supervised canary used an
-older client and does not prove end-to-end behavior for the current release. See
+older client and is not a published end-to-end result for this candidate. See
 `docs/clean-env-e2e-smoke.md` for the machine-readable evidence record and
 the standing NO-GO boundary.
 
@@ -722,7 +728,7 @@ account deployment state.
 - Not a replacement implementation of Antigravity.
 - Not a redistribution of Google's proprietary ACP binary.
 - Not a claim that every authentication method advertised by the official binary is permitted in every third-party client.
-- Not (yet) a catalog-installable plugin: the upstream Hermes plugin catalog contains no entry for this provider; that submission is a separate pending task.
+- Not a self-updating catalog plugin: the catalog owns the provider pin, and the Google server is always installed explicitly.
 
 ## Optional repository exposure audit
 
