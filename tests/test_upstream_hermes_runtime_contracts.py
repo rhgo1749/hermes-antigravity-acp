@@ -224,8 +224,9 @@ for line in sys.stdin:
     params = message.get("params") or {}
     request_id = message.get("id")
     if method == "initialize":
-        # Issue #6 AC4-3: self-report the source-verified 1.4.x identity so
-        # this lane exercises the verified consumption-accumulation path.
+        # Issue #6 AC4-3: self-report an identity whose consumption verdict
+        # the test seeds (see record_semantics_evidence) so this lane
+        # exercises the verified consumption-accumulation path.
         emit({"jsonrpc": "2.0", "id": request_id, "result": {
             "protocolVersion": 1,
             "agentInfo": {
@@ -649,6 +650,13 @@ def test_public_session_context_persists_model_deltas_and_rejects_bad_frames(
         str(tmp_path / "acp-public-session-limits.json"),
     )
     client_module = _load_client(monkeypatch, tmp_path)
+    # Dynamic canary: seed the earned consumption verdict for the identity
+    # this fake self-reports (verdict derivation lives in
+    # tests/test_dynamic_usage_semantics_canary.py).
+    for _ in range(5):
+        client_module.conversation_registry.record_semantics_evidence(
+            "antigravity-acp|Google Antigravity|1.4.0", ok=True
+        )
     client = client_module.AntigravityACPClient(
         command=sys.executable,
         args=[str(_write_usage_update_server(tmp_path))],

@@ -22,6 +22,24 @@ AC4-1). The separate `antigravity_usage_telemetry` attribute still uses
 `status="unavailable"` and null `request_usage` buckets; those fields do not
 describe the separate `completion.usage` value.
 
+## Growth-consistency gate on `session/prompt` result usage
+
+Server-reported `inputTokens` feeds Hermes Core's compression preflight
+(`should_defer_preflight_to_real_usage`), so an inflated report triggers
+premature compaction. The server binary is opaque (a 714MB ELF; static audit
+is impossible), so every reported turn-usage value must correlate with the
+adapter's own local transcript estimate (`native_tokens`) before it is
+forwarded. Per affinity key the adapter keeps the last trusted
+`(reported, local)` pair; a turn passes only when the reported growth stays
+within `max(8x, local growth + 64K)` of the local growth (negative growth is
+tolerated within the same slack for context rotation). A rejected turn is
+dropped (`dropped_inflated_turn_usage`), the identity's canary verdict is
+demoted, and `completion.usage` becomes `None` for that turn — Core falls back
+to its local estimate instead of a number this adapter cannot vouch for. The
+2026-11-23 incident (1.07M reported against a ~31K transcript on 1.5.2,
+forcing two premature compressions) is the regression case this gate replays
+in `tests/test_dynamic_usage_semantics_canary.py`.
+
 ## Issue #6: no fabricated split in `completion.usage`
 
 Earlier builds (v0.7.4–v0.7.8) synthesized `completion.usage` from
@@ -45,17 +63,24 @@ Observed frames feed two honest surfaces instead:
 Accumulation (turn sum and durable totals) is gated on three conditions,
 each with its own drop counter:
 
-1. **Verified server semantics** — the `initialize` result's `agentInfo`
-   `(name, title, version)` must match a source-verified identity whose
-   per-call delta semantics were confirmed against server source
-   (`server_consumption_semantics: "verified"`). Pinned identities:
-   `("antigravity-acp", "Google Antigravity", "1.4.0")` (stage-3 canary
-   frames) and `("antigravity-acp", "Google Antigravity", "1.4.4")`
-   (source audit and [historical initialize evidence](official-server-1.4.4-clean-room-e2e-2026-11-07.md)).
-   The server reports its own binary version, so each verified release must be pinned
-   explicitly; spec-compliant or unknown servers are never summed. The default
-   1.5.2 install is not on this list: `initialize` verifies server identity,
-   not per-call accounting semantics. Its unverified deltas are not summed.
+1. **Behaviorally-verified server semantics** — the `initialize` result's
+   `agentInfo` `(name, title, version)` identifies the server, and the
+   consumption verdict for that identity is EARNED at runtime, never pinned to
+   a version string (`server_consumption_semantics: "verified"` only once
+   earned). An identity starts `unverified` and is promoted to
+   `behaviorally_verified` after `SEMANTICS_PROMOTE_AFTER` (5) consecutive
+   prompt turns whose reported `inputTokens` growth stays consistent with the
+   adapter's own local transcript-token estimate (see the growth gate below);
+   a single divergent turn demotes it back and the streak restarts. Verdicts
+   persist in the durable store (`usage_semantics_verdicts`, LRU-capped) and
+   survive restarts. The version-pinned frozenset this replaced went stale on
+   the day 1.5.2 shipped (2026-11-21) and silently starved accumulation while
+   an inflated `prompt_result.usage` reached compression unguarded
+   (2026-11-23 incident: 1.07M reported against a ~31K transcript); spec- or
+   source-audits of older releases (1.4.0 stage-3 canary frames, 1.4.4
+   [clean-room e2e](official-server-1.4.4-clean-room-e2e-2026-11-07.md))
+   remain historical evidence, but no longer grant the verdict. Unknown or
+   unearned servers are never summed.
 2. **Prompt-turn window** — frames are counted only between sending
    `session/prompt` and receiving its response. This is event-order
    correlation against the adapter's own request, NOT value equality: two
@@ -117,10 +142,10 @@ the context window. The response keeps the existing latest-valid observation
 under `context_occupancy`, with
 `source="acp.session/update:usage_update"` and `is_billing_usage=false`.
 The `scope` label states the reading's MEANING, which depends on the server's
-semantics: `per_model_call_consumption_delta` only for a source-verified
+semantics: `per_model_call_consumption_delta` only for a behaviorally-verified
 identity; `unverified_server_semantics` for everything else (the value is
 retained as an opaque observation whose meaning this adapter has not
-verified).
+earned).
 Only numeric, finite, nonnegative `used`/`size` values are retained for this
 response field; booleans, strings, negative values, NaN, and infinities are
 invalid. A frame carrying any present-but-invalid field is rejected as a whole
@@ -230,15 +255,18 @@ candidate rejected before `add_usage_delta` increments exactly one reason
 counter: `dropped_invalid` (whole-frame validity failure — a present-but
 invalid `used` or `size`, or missing activity stats; identical to the
 occupancy and turn-sum validity contract),
-`dropped_semantics_unverified` (server identity not in the source-verified
-set), `dropped_outside_prompt_turn` (frame observed outside the adapter's own
+`dropped_semantics_unverified` (server identity has not yet earned the
+behavioral verdict), `dropped_outside_prompt_turn` (frame observed outside the adapter's own
 in-flight `session/prompt` window — model-switch re-reports, session-init
 placeholders, late-drained frames), `dropped_zero` (zero-value placeholder),
 `dropped_no_session_identity` (no explicit Hermes session ID at capture time),
 or `dropped_no_native_session` (no native session ID to correlate). Frames
 that are not candidates are never counted. The counters live additively in
 the same state document beside `usage_totals` and never gate the response
-path. A store with `frames_seen > 0` but no totals for a session proves the
+path. Separately, `dropped_inflated_turn_usage` counts `session/prompt`
+result usages rejected by the growth-consistency gate above (a different
+surface from the `usage_update` candidate counters). A store with
+`frames_seen > 0` but no totals for a session proves the
 drop happened after frame delivery; `frames_seen == 0` while the adapter is
 known to serve that session proves the adapter build itself predates the
 capture code (profile fleet drift — redeploy with

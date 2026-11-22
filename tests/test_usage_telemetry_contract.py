@@ -161,7 +161,7 @@ def test_usage_update_deltas_accumulate_for_explicit_hermes_session(monkeypatch,
         "prompt": "prompt text secret",
         "command": "private-command",
         "path": "/private/workspace",
-        # Issue #6 gates: accumulation requires a source-verified server
+        # Issue #6 gates: accumulation requires a behaviorally-verified server
         # identity and an in-flight prompt turn (see _capture_usage_delta).
         client._SERVER_CONSUMPTION_SEMANTICS_KEY: client._USAGE_SEMANTICS_VERIFIED,
         client._PROMPT_TURN_ACTIVE_KEY: True,

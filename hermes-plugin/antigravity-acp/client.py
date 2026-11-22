@@ -43,7 +43,11 @@ from types import SimpleNamespace
 from urllib.parse import quote
 from typing import Any, NoReturn, Sequence
 
-from .conversation_state import ACPConversationState, conversation_registry
+from .conversation_state import (
+    ACPConversationState,
+    _SEMANTICS_VERDICT_VERIFIED,
+    conversation_registry,
+)
 from .hermes_compat import (
     apply_subprocess_home_env,
     build_hermes_subprocess_env,
@@ -2190,58 +2194,146 @@ _CONTEXT_OCCUPANCY_SOURCE = "acp.session/update:usage_update"
 _USAGE_DELTA_SCOPE = "per_model_call_consumption_delta"
 _USAGE_SCOPE_UNVERIFIED = "unverified_server_semantics"
 
-# Server identities whose ``usage_update.used`` semantics are SOURCE-VERIFIED
-# as per-model-call consumption deltas (NOT the ACP v1 occupancy snapshot):
-#   * ``agy_acp_server.par`` 1.4.0 ``server.py`` (``_maybe_send_usage_update``,
-#     ``_extract_tokens_used``) — verified 2026-11-02 (antigravity-acp-harness
-#     issue #68 evidence); its ``initialize`` self-reports
-#     ``agentInfo.version == "1.4.0"`` (stage-3 canary frames).
-#   * ``agy_acp_server.par`` 1.4.4 ``server.py`` — re-verified 2026-11-11 from
-#     the installed par; its credential-free ``initialize`` self-reports
-#     ``agentInfo.version == "1.4.4"``, as recorded in the historical report
-#     ``docs/official-server-1.4.4-clean-room-e2e-2026-11-07.md``.
-# These pins are OBSERVED IDENTITY triples, not trustworthy version
-# comparisons: any deviation (absent, unknown, changed, malformed
-# ``agentInfo``) disables consumption accumulation instead of guessing
-# (issue #6 AC4-3).  Residual risk: a future server that keeps one of these
-# exact triples while changing the semantics would pass the gate.
-_VERIFIED_CONSUMPTION_IDENTITIES = frozenset(
-    {
-        # 1.4.0: observed identity in the stage-3 canary frames.
-        ("antigravity-acp", "Google Antigravity", "1.4.0"),
-        # 1.4.4: historical hosted initialize verified identity; source audit
-        # of the 1.4.4 PAR verified per-call delta semantics separately.
-        ("antigravity-acp", "Google Antigravity", "1.4.4"),
-    }
-)
+# Consumption-semantics verdicts are DYNAMIC, not version-pinned.  The retired
+# frozenset of ``agentInfo`` triples (1.4.0/1.4.4) went stale the day 1.5.2
+# shipped: every ``usage_update`` frame was dropped as ``semantics_unverified``
+# while inflated ``inputTokens`` still reached the compression gate
+# unchallenged (2026-11-23 incident: a ~31K transcript reported as ~1.07M, two
+# premature compactions, lost guard feedback).  A version list can never cover
+# the next release; a verdict earned at runtime can.  See
+# ``_usage_semantics_for_identity`` and ``_reported_usage_growth_consistent``.
 _USAGE_SEMANTICS_VERIFIED = "verified"
 _USAGE_SEMANTICS_UNVERIFIED = "unverified"
 _USAGE_SEMANTICS_ATTR = "_antigravity_usage_semantics"
+_SERVER_IDENTITY_ATTR = "_antigravity_server_identity"
 _SERVER_CONSUMPTION_SEMANTICS_KEY = "server_consumption_semantics"
+_SERVER_IDENTITY_KEY = "server_identity"
 _PROMPT_TURN_ACTIVE_KEY = "prompt_turn_active"
 
 
-def _usage_semantics_from_initialize(result: Any) -> str:
-    """Pin the observed server identity from the ``initialize`` result.
+def _server_identity_from_initialize(result: Any) -> str:
+    """Extract the ``name|title|version`` identity from the ``initialize`` result.
 
-    Returns ``verified`` only when ``agentInfo`` is a well-formed object whose
-    exact ``(name, title, version)`` triple matches a source-verified
-    per-call-delta server.  Anything else — absent, non-string, unknown, or
-    changed identity — is ``unverified``; the adapter never guesses semantics.
+    An empty string means ``agentInfo`` is absent, malformed, or incomplete —
+    fail closed: an unknown identity never accumulates and never earns a
+    verdict.
     """
     if not isinstance(result, dict):
-        return _USAGE_SEMANTICS_UNVERIFIED
+        return ""
     agent_info = result.get("agentInfo")
     if not isinstance(agent_info, dict):
-        return _USAGE_SEMANTICS_UNVERIFIED
+        return ""
     fields = tuple(agent_info.get(field) for field in ("name", "title", "version"))
     if not all(isinstance(field, str) and field for field in fields):
+        return ""
+    return "|".join(str(field) for field in fields)
+
+
+def _usage_semantics_for_identity(identity_key: str) -> str:
+    """Dynamic consumption-semantics verdict for a connected server identity.
+
+    Verdicts are earned at runtime: each growth-consistent turn of a
+    conversation folds evidence into the durable store via
+    ``conversation_registry.record_semantics_evidence``; identities that stay
+    consistent across enough tested turns become behaviorally verified, and
+    any order-of-magnitude divergence demotes them back to unverified.
+    Unknown or never-tested identities are unverified — the adapter never
+    guesses semantics from a version string.
+    """
+    if not identity_key:
         return _USAGE_SEMANTICS_UNVERIFIED
-    return (
-        _USAGE_SEMANTICS_VERIFIED
-        if fields in _VERIFIED_CONSUMPTION_IDENTITIES
-        else _USAGE_SEMANTICS_UNVERIFIED
+    if conversation_registry.semantics_verdict(identity_key) == _SEMANTICS_VERDICT_VERIFIED:
+        return _USAGE_SEMANTICS_VERIFIED
+    return _USAGE_SEMANTICS_UNVERIFIED
+
+
+_USAGE_GROWTH_FACTOR = 8
+_USAGE_GROWTH_SLACK_TOKENS = 64_000
+_TURN_USAGE_BASELINE_LOCK = threading.Lock()
+# affinity_key -> (last accepted reported inputTokens, native_tokens estimate
+# at that moment).  Process-local on purpose: a restart merely leaves the
+# first turn after it untested; the shared verdicts live in the durable store.
+_TURN_USAGE_BASELINES: dict[str, tuple[int, int]] = {}
+
+
+def _reported_usage_growth_consistent(
+    *,
+    prev_reported: int,
+    reported: int,
+    prev_local: int,
+    local: int,
+) -> tuple[bool, int, int]:
+    """Compare one turn's server-reported input-token growth with local growth.
+
+    The server's per-turn ``inputTokens`` must track the transcript the
+    adapter actually grew (the ``native_tokens`` estimate).  A server that
+    folds hidden state (subagent caches, internal accumulators, re-sent
+    bookkeeping) into the number diverges by orders of magnitude: the
+    2026-11-23 incident reported a ~3.2K local turn as ~499K growth (156x)
+    and fired the Core compression gate twice early.
+
+    Tolerance is deliberately generous (``8x`` plus a flat ``64K`` slack):
+    the server legitimately adds per-turn records the local estimate never
+    sees, and this gate exists to reject order-of-magnitude divergence, not
+    to police bookkeeping noise.  Returns ``(ok, reported_growth, expected_growth)``.
+    """
+    expected = local - prev_local
+    actual = reported - prev_reported
+    tolerance = max(
+        _USAGE_GROWTH_FACTOR * (abs(expected) + 1),
+        _USAGE_GROWTH_SLACK_TOKENS,
     )
+    return abs(actual - expected) <= tolerance, actual, expected
+
+
+def _guard_reported_turn_usage(
+    *,
+    affinity_key: str,
+    server_identity: str,
+    turn_usage: Any,
+    native_tokens: int,
+) -> Any:
+    """Reject server-reported turn usage that diverges from local growth.
+
+    Always-on safety gate for the Core compression trigger: it protects every
+    server identity (verified or not) regardless of version.  A rejected turn
+    yields ``None`` so Hermes falls back to its own token estimate instead of
+    compacting against an inflated number; the last trusted baseline is kept,
+    so a permanently inflated server keeps getting rejected.  Consistent
+    turns feed the identity's dynamic semantics verdict.
+    """
+    reported = int(getattr(turn_usage, "prompt_tokens", 0) or 0)
+    identity = str(server_identity or "")
+    with _TURN_USAGE_BASELINE_LOCK:
+        baseline = _TURN_USAGE_BASELINES.get(affinity_key)
+        if baseline is None:
+            # First turn of this conversation: no growth to correlate yet.
+            _TURN_USAGE_BASELINES[affinity_key] = (reported, native_tokens)
+            return turn_usage
+    ok, actual, expected = _reported_usage_growth_consistent(
+        prev_reported=baseline[0],
+        reported=reported,
+        prev_local=baseline[1],
+        local=native_tokens,
+    )
+    if ok:
+        with _TURN_USAGE_BASELINE_LOCK:
+            _TURN_USAGE_BASELINES[affinity_key] = (reported, native_tokens)
+        if identity:
+            conversation_registry.record_semantics_evidence(identity, ok=True)
+        return turn_usage
+    if identity:
+        conversation_registry.record_semantics_evidence(identity, ok=False)
+    conversation_registry.note_usage_frame("dropped_inflated_turn_usage")
+    logger.warning(
+        "Antigravity ACP reported inputTokens rejected: server growth %d vs "
+        "local estimate growth %d (identity=%s); Core falls back to its own "
+        "token estimate for compression this turn.",
+        actual,
+        expected,
+        identity or "unknown",
+    )
+    return None
 
 
 def _nonnegative_json_number(value: Any) -> bool:
@@ -2296,7 +2388,8 @@ def _capture_usage_delta(
         conversation_registry.note_usage_frame("dropped_zero")
         return
     # Issue #6 AC4-3: accumulate only for a server identity whose per-call
-    # delta semantics are source-verified (see _VERIFIED_CONSUMPTION_IDENTITIES).
+    # delta semantics carry a behaviorally-earned verdict (dynamic canary;
+    # see _usage_semantics_for_identity).
     if activity_stats.get(_SERVER_CONSUMPTION_SEMANTICS_KEY) != _USAGE_SEMANTICS_VERIFIED:
         conversation_registry.note_usage_frame("dropped_semantics_unverified")
         return
@@ -2368,8 +2461,9 @@ def _capture_context_occupancy(
         }
     merged.update({field: update[field] for field in present})
     # The reading's MEANING depends on the server's semantics.  Only a
-    # source-verified identity gets the per-call-consumption-delta label;
-    # for anything else the meaning is honestly unverified (issue #6 review).
+    # behaviorally-verified identity gets the per-call-consumption-delta
+    # label; for anything else the meaning is honestly unverified
+    # (issue #6 review).
     verified = (
         activity_stats.get(_SERVER_CONSUMPTION_SEMANTICS_KEY)
         == _USAGE_SEMANTICS_VERIFIED
@@ -2503,7 +2597,8 @@ def _build_usage_telemetry(
         "size is the context window"
         if semantics_verified
         else (
-            "this server's usage_update.used semantics are not source-verified; "
+            "this server's usage_update.used semantics have not earned the "
+            "behavioral verdict; "
             "the reading is retained as an opaque observation, not billing "
             "usage, consumption deltas, or context occupancy"
         )
@@ -4770,6 +4865,24 @@ class AntigravityACPClient:
                     effective_model=str(session_result.get("effective_model") or ""),
                 )
                 conversation_registry.put(affinity_key, state)
+
+                # Dynamic canary gate: the compression trigger must never see
+                # a server-reported inputTokens whose growth diverges from the
+                # transcript this adapter actually grew.  Runs for EVERY
+                # identity and version; a rejected turn falls back to Core's
+                # own token estimate instead of compacting against an
+                # inflated number (2026-11-23 incident: 31K transcript
+                # reported as 1.07M, two premature compactions).
+                reported_turn_usage = session_result.get("turn_usage")
+                if reported_turn_usage is not None:
+                    session_result["turn_usage"] = _guard_reported_turn_usage(
+                        affinity_key=affinity_key,
+                        server_identity=str(
+                            session_result.get("server_identity") or ""
+                        ),
+                        turn_usage=reported_turn_usage,
+                        native_tokens=native_tokens,
+                    )
     
             native_reasoning_details = _native_tool_reasoning_details(native_activity)
             message = SimpleNamespace(
@@ -5075,6 +5188,7 @@ class AntigravityACPClient:
                     getattr(proc, _USAGE_SEMANTICS_ATTR, _USAGE_SEMANTICS_UNVERIFIED)
                     or _USAGE_SEMANTICS_UNVERIFIED
                 ),
+                _SERVER_IDENTITY_KEY: str(getattr(proc, _SERVER_IDENTITY_ATTR, "") or ""),
             }
         )
 
@@ -5363,13 +5477,17 @@ class AntigravityACPClient:
                         "request_key": _TRACE_REQUEST_KEY.get() or "unknown",
                     },
                 )
-                # Pin the server's consumption semantics for the lifetime of
-                # this stdio connection (issue #6 AC4-3); warm reuse of the
-                # same process keeps the pinned identity.
+                # Pin the server identity and its DYNAMIC consumption
+                # semantics verdict for the lifetime of this stdio connection
+                # (issue #6 AC4-3 successor: verdicts are earned at runtime by
+                # the growth-consistency gate, never granted by a version
+                # pin); warm reuse of the same process keeps the pinned pair.
+                _server_identity = _server_identity_from_initialize(initialize_result)
+                setattr(proc, _SERVER_IDENTITY_ATTR, _server_identity)
                 setattr(
                     proc,
                     _USAGE_SEMANTICS_ATTR,
-                    _usage_semantics_from_initialize(initialize_result),
+                    _usage_semantics_for_identity(_server_identity),
                 )
                 # The activity_stats seed above ran before this handshake on a
                 # fresh connection; refresh it with the pinned identity.
@@ -5377,6 +5495,7 @@ class AntigravityACPClient:
                     getattr(proc, _USAGE_SEMANTICS_ATTR)
                     or _USAGE_SEMANTICS_UNVERIFIED
                 )
+                activity_stats[_SERVER_IDENTITY_KEY] = _server_identity
             # Hermes model-provider mode always disables the native
             # run_command built-in at launch; shell work belongs to Hermes'
             # approval-gated terminal tool through the <tool_call> bridge.
@@ -6169,8 +6288,14 @@ class AntigravityACPClient:
                 # per-call consumption frames are reported ONLY as explicitly
                 # scoped provider telemetry below, never as measured
                 # input/output.
+                # The self-reported server identity rides along so the caller
+                # (which owns the local transcript estimate) can run the
+                # dynamic growth-consistency gate on this usage.
                 session_result["turn_usage"] = _turn_usage_from_prompt_result(
                     prompt_result
+                )
+                session_result["server_identity"] = str(
+                    activity_stats.get(_SERVER_IDENTITY_KEY) or ""
                 )
                 session_result["server_consumption_semantics"] = str(
                     activity_stats.get(_SERVER_CONSUMPTION_SEMANTICS_KEY)

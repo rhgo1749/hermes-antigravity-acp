@@ -113,7 +113,8 @@ for line in sys.stdin:
     if method == "initialize":
         result = {"protocolVersion": 1}
         if mode.endswith("-verified"):
-            # The observed official 1.4.x identity triple (issue #6 AC4-3 pin).
+            # Self-reported identity; the dynamic canary verdict is seeded by
+            # the test itself (see the record_semantics_evidence calls).
             result["agentInfo"] = {
                 "name": "antigravity-acp",
                 "title": "Google Antigravity",
@@ -271,13 +272,22 @@ def test_usage_update_is_non_billing_context_occupancy(monkeypatch, tmp_path, no
 def test_verified_identity_accumulates_consumption_without_synthetic_split(
     monkeypatch, tmp_path, no_slash_env
 ) -> None:
-    """Issue #6 AC4-1/AC4-3: a source-verified identity accumulates observed
-    consumption sums, but completion.usage stays None without the server's own
-    per-turn breakdown — the fabricated prompt/completion split is gone."""
+    """Issue #6 AC4-1/AC4-3: a behaviorally-verified identity accumulates
+    observed consumption sums, but completion.usage stays None without the
+    server's own per-turn breakdown — the fabricated prompt/completion split
+    is gone."""
     client = _load_client(
         monkeypatch, args=_fake_server(tmp_path, "usage-update-verified"), cwd=str(tmp_path)
     )
     client_module = sys.modules["antigravity_acp_130.client"]
+    # Dynamic canary: the consumption-semantics verdict is earned at runtime,
+    # not granted by a version pin.  Seed the store as if this identity had
+    # already passed five growth-consistent turns (verdict derivation itself
+    # is covered in tests/test_dynamic_usage_semantics_canary.py).
+    for _ in range(5):
+        client_module.conversation_registry.record_semantics_evidence(
+            "antigravity-acp|Google Antigravity|1.4.0", ok=True
+        )
     monkeypatch.setattr(
         client_module, "get_runtime_session_env",
         lambda: ("hermes-session-verified", ""),
@@ -322,6 +332,12 @@ def test_verified_session_sequence_counts_only_real_consumption(
         cwd=str(tmp_path),
     )
     client_module = sys.modules["antigravity_acp_130.client"]
+    # Dynamic canary: seed the earned verdict (see the note in
+    # test_verified_identity_accumulates_consumption_without_synthetic_split).
+    for _ in range(5):
+        client_module.conversation_registry.record_semantics_evidence(
+            "antigravity-acp|Google Antigravity|1.4.0", ok=True
+        )
     monkeypatch.setattr(
         client_module, "get_runtime_session_env",
         lambda: ("hermes-session-seq", ""),

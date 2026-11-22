@@ -36,7 +36,8 @@ _STATE_VERSION = 1
 _DEFAULT_TTL_SECONDS = 24 * 60 * 60
 _DEFAULT_MAX_ENTRIES = 512
 _USAGE_TOTALS_SCHEMA = "antigravity-acp-usage-totals-v1"
-# Issue #33 R2: additive marker identifying the source-verified per-call-delta
+# Issue #33 R2: additive marker identifying the behaviorally-verified
+# per-call-delta
 # accumulation semantics.  Stamped on entries whose ENTIRE accumulated total
 # was produced under this contract (fresh entries, or entries already
 # carrying the marker).  A legacy entry that later receives a delta keeps the
@@ -59,7 +60,23 @@ _USAGE_FRAME_COUNTER_KEYS = (
     "dropped_semantics_unverified",
     "dropped_outside_prompt_turn",
     "dropped_zero",
+    # Dynamic canary: server-reported inputTokens diverged from local growth
+    # by an order of magnitude; the turn's usage was rejected before it could
+    # reach the Core compression gate.
+    "dropped_inflated_turn_usage",
 )
+
+# Dynamic consumption-semantics verdicts (replaces the retired hardcoded
+# version whitelist).  Keyed by the ``name|title|version`` identity an ACP
+# server self-reports at ``initialize``; a verdict is EARNED at runtime by the
+# per-turn growth-consistency gate in client.py, never granted by a version
+# string.  Promotion requires ``SEMANTICS_PROMOTE_AFTER`` consecutive
+# consistent tested turns; any inconsistency demotes immediately.
+_SEMANTICS_VERDICTS_SCHEMA = "antigravity-acp-usage-semantics-verdicts-v1"
+_SEMANTICS_VERDICT_VERIFIED = "behaviorally_verified"
+_SEMANTICS_VERDICT_UNVERIFIED = "unverified"
+SEMANTICS_PROMOTE_AFTER = 5
+_SEMANTICS_MAX_IDENTITIES = 64
 
 
 @dataclass(frozen=True)
@@ -225,6 +242,13 @@ class ConversationStateRegistry:
                 and not isinstance(value, bool)
                 and value >= 0
             }
+        raw_verdicts = payload.get("usage_semantics_verdicts")
+        if isinstance(raw_verdicts, dict):
+            decoded["usage_semantics_verdicts"] = {
+                key: value
+                for key, value in raw_verdicts.items()
+                if isinstance(key, str) and key and isinstance(value, dict)
+            }
         return decoded
 
     @staticmethod
@@ -292,6 +316,10 @@ class ConversationStateRegistry:
         counters = existing.get("usage_drop_counters")
         if isinstance(counters, dict) and counters:
             payload["usage_drop_counters"] = counters
+        # Same rule for dynamic semantics verdicts earned by record_semantics_evidence.
+        verdicts = existing.get("usage_semantics_verdicts")
+        if isinstance(verdicts, dict) and verdicts:
+            payload["usage_semantics_verdicts"] = verdicts
         ConversationStateRegistry._write_payload(path, payload)
 
     @staticmethod
@@ -448,6 +476,125 @@ class ConversationStateRegistry:
                     "response continues without the diagnostic counter: %s",
                     exc,
                 )
+
+    def semantics_verdict(self, identity_key: str) -> str:
+        """Read one identity's consumption-semantics verdict (fail closed)."""
+        if not identity_key:
+            return _SEMANTICS_VERDICT_UNVERIFIED
+        path = _state_path()
+        with self._lock:
+            try:
+                with _cross_process_lock(path):
+                    payload = self._read_payload(path)
+            except OSError:
+                return _SEMANTICS_VERDICT_UNVERIFIED
+        verdicts = payload.get("usage_semantics_verdicts")
+        if not isinstance(verdicts, dict):
+            return _SEMANTICS_VERDICT_UNVERIFIED
+        entry = verdicts.get(identity_key)
+        if (
+            isinstance(entry, dict)
+            and entry.get("schema") == _SEMANTICS_VERDICTS_SCHEMA
+            and entry.get("verdict") == _SEMANTICS_VERDICT_VERIFIED
+        ):
+            return _SEMANTICS_VERDICT_VERIFIED
+        return _SEMANTICS_VERDICT_UNVERIFIED
+
+    def record_semantics_evidence(self, identity_key: str, *, ok: bool) -> dict[str, Any]:
+        """Fold one growth-consistency observation into an identity's verdict.
+
+        Promotion: ``SEMANTICS_PROMOTE_AFTER`` consecutive consistent tested
+        turns.  Demotion: any inconsistent turn resets the consecutive streak
+        and revokes a prior promotion (a server may re-earn verification after
+        a fix).  Entries are bounded (least-recently-seen evicted); a write
+        failure never breaks the response path.
+        """
+        identity_key = str(identity_key or "").strip()
+        if not identity_key:
+            return {}
+        path = _state_path()
+        updated: dict[str, Any] = {}
+        with self._lock:
+            try:
+                with _cross_process_lock(path):
+                    payload = self._read_payload(path)
+                    raw_verdicts = payload.get("usage_semantics_verdicts")
+                    verdicts = dict(raw_verdicts) if isinstance(raw_verdicts, dict) else {}
+                    previous = verdicts.get(identity_key)
+                    now = time.time()
+                    if (
+                        isinstance(previous, dict)
+                        and previous.get("schema") == _SEMANTICS_VERDICTS_SCHEMA
+                        and isinstance(previous.get("consistent_turns"), int)
+                        and not isinstance(previous.get("consistent_turns"), bool)
+                        and previous["consistent_turns"] >= 0
+                        and isinstance(previous.get("rejected_turns"), int)
+                        and not isinstance(previous.get("rejected_turns"), bool)
+                        and previous["rejected_turns"] >= 0
+                        and self._valid_usage_number(previous.get("first_seen"))
+                    ):
+                        consistent = previous["consistent_turns"]
+                        rejected = previous["rejected_turns"]
+                        first_seen = previous["first_seen"]
+                        prior_verdict = str(previous.get("verdict") or "")
+                    else:
+                        consistent = 0
+                        rejected = 0
+                        first_seen = now
+                        prior_verdict = _SEMANTICS_VERDICT_UNVERIFIED
+                    if ok:
+                        consistent += 1
+                        verdict = (
+                            _SEMANTICS_VERDICT_VERIFIED
+                            if consistent >= SEMANTICS_PROMOTE_AFTER
+                            else _SEMANTICS_VERDICT_UNVERIFIED
+                        )
+                    else:
+                        consistent = 0
+                        rejected += 1
+                        verdict = _SEMANTICS_VERDICT_UNVERIFIED
+                    updated = {
+                        "schema": _SEMANTICS_VERDICTS_SCHEMA,
+                        "verdict": verdict,
+                        "consistent_turns": consistent,
+                        "rejected_turns": rejected,
+                        "first_seen": first_seen,
+                        "last_seen": now,
+                        "provenance": "behavioral_growth_correlation",
+                    }
+                    verdicts[identity_key] = updated
+                    if len(verdicts) > _SEMANTICS_MAX_IDENTITIES:
+                        oldest = sorted(
+                            verdicts.items(),
+                            key=lambda item: (
+                                float(item[1]["last_seen"])
+                                if isinstance(item[1], dict)
+                                and self._valid_usage_number(item[1].get("last_seen"))
+                                else 0.0
+                            ),
+                        )
+                        for key, _ in oldest[: len(verdicts) - _SEMANTICS_MAX_IDENTITIES]:
+                            if key != identity_key:
+                                verdicts.pop(key, None)
+                    payload["usage_semantics_verdicts"] = verdicts
+                    self._write_payload(path, payload)
+            except OSError as exc:
+                logger.warning(
+                    "Antigravity ACP semantics verdict checkpoint write failed; "
+                    "response continues without the verdict update: %s",
+                    exc,
+                )
+                return updated or {}
+        if updated.get("verdict") != prior_verdict:
+            logger.info(
+                "Antigravity ACP consumption-semantics verdict for server "
+                "identity changed: %s -> %s (consistent_turns=%d, rejected_turns=%d)",
+                identity_key,
+                updated.get("verdict"),
+                updated.get("consistent_turns", 0),
+                updated.get("rejected_turns", 0),
+            )
+        return updated
 
     def _ensure_loaded(self, path: Path, path_key: str) -> dict[str, ACPConversationState]:
         states = self._memory.setdefault(path_key, {})
