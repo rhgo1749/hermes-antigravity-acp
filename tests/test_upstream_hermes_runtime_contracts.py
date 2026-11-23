@@ -150,6 +150,9 @@ def test_credential_free_fake_acp_initialize_session_under_real_policy_filtering
     monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
     monkeypatch.setenv("HERMES_ANTIGRAVITY_ACP_STATE_FILE", str(tmp_path / "acp-state.json"))
     monkeypatch.setenv(
+        "HERMES_ANTIGRAVITY_ACP_SEMANTICS_FILE", str(tmp_path / "acp-semantics.json")
+    )
+    monkeypatch.setenv(
         "HERMES_ANTIGRAVITY_ACP_LIMIT_STATE_FILE", str(tmp_path / "acp-limits.json")
     )
     client_module = _load_client(monkeypatch, tmp_path)
@@ -645,6 +648,10 @@ def test_public_session_context_persists_model_deltas_and_rejects_bad_frames(
     monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
     state_path = tmp_path / "acp-public-session-context.json"
     monkeypatch.setenv("HERMES_ANTIGRAVITY_ACP_STATE_FILE", str(state_path))
+    monkeypatch.setenv(
+        "HERMES_ANTIGRAVITY_ACP_SEMANTICS_FILE",
+        str(tmp_path / "acp-public-session-semantics.json"),
+    )
     monkeypatch.setenv(
         "HERMES_ANTIGRAVITY_ACP_LIMIT_STATE_FILE",
         str(tmp_path / "acp-public-session-limits.json"),

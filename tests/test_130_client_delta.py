@@ -29,6 +29,9 @@ def _load_client(monkeypatch, *, args: list[str], cwd: str, retries: int = 0):
         "HERMES_ANTIGRAVITY_ACP_STATE_FILE", str(Path(cwd) / "acp-state.json")
     )
     monkeypatch.setenv(
+        "HERMES_ANTIGRAVITY_ACP_SEMANTICS_FILE", str(Path(cwd) / "acp-semantics.json")
+    )
+    monkeypatch.setenv(
         "HERMES_ANTIGRAVITY_ACP_LIMIT_STATE_FILE", str(Path(cwd) / "acp-limits.json")
     )
     registered: list = []

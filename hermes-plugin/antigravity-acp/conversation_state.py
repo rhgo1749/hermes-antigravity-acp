@@ -72,7 +72,13 @@ _USAGE_FRAME_COUNTER_KEYS = (
 # per-turn growth-consistency gate in client.py, never granted by a version
 # string.  Promotion requires ``SEMANTICS_PROMOTE_AFTER`` consecutive
 # consistent tested turns; any inconsistency demotes immediately.
+# The verdict describes the SERVER's behavior, not this home's, so it lives in
+# a machine-wide store shared by every profile home under the same Hermes root
+# (see ``_semantics_store_path``): one home earns the verdict, every profile
+# starts verified.  The per-turn safety gate in client.py stays per-process
+# regardless — sharing verdicts never shares or delegates safety decisions.
 _SEMANTICS_VERDICTS_SCHEMA = "antigravity-acp-usage-semantics-verdicts-v1"
+_SEMANTICS_STORE_VERSION = 1
 _SEMANTICS_VERDICT_VERIFIED = "behaviorally_verified"
 _SEMANTICS_VERDICT_UNVERIFIED = "unverified"
 SEMANTICS_PROMOTE_AFTER = 5
@@ -114,6 +120,34 @@ def _state_path() -> Path:
     if override := os.environ.get("HERMES_ANTIGRAVITY_ACP_STATE_FILE", "").strip():
         return Path(override).expanduser()
     return get_hermes_home() / "cache" / "antigravity-acp-sessions.json"
+
+
+def _semantics_store_path() -> Path:
+    """Machine-wide verdict store shared by every profile home.
+
+    A consumption-semantics verdict describes the SERVER's behavior (identity
+    ``name|title|version``), not this home's, so one home's earned evidence
+    must serve every profile under the same Hermes root instead of each home
+    re-paying the promotion warm-up for the same server.  Resolution:
+
+    - ``HERMES_ANTIGRAVITY_ACP_SEMANTICS_FILE`` overrides the full path.
+    - ``<root>/profiles/<name>`` homes resolve to ``<root>/shared/...``.
+    - A plain ``<root>`` home resolves to ``<root>/shared/...`` too, so the
+      main home and its profiles land on the SAME file in both the
+      ``~/.hermes`` and the deployed ``<root>/profiles/<name>`` layouts.
+
+    The per-turn growth gate in client.py stays per-process: sharing verdicts
+    never delegates safety.
+    """
+    if override := os.environ.get("HERMES_ANTIGRAVITY_ACP_SEMANTICS_FILE", "").strip():
+        return Path(override).expanduser()
+    home = get_hermes_home()
+    try:
+        resolved = home.resolve()
+    except OSError:  # pragma: no cover - unreadable home during resolution
+        resolved = home
+    root = resolved.parent.parent if resolved.parent.name == "profiles" else resolved
+    return root / "shared" / "antigravity-acp-semantics.json"
 
 
 @contextlib.contextmanager
@@ -316,7 +350,9 @@ class ConversationStateRegistry:
         counters = existing.get("usage_drop_counters")
         if isinstance(counters, dict) and counters:
             payload["usage_drop_counters"] = counters
-        # Same rule for dynamic semantics verdicts earned by record_semantics_evidence.
+        # Legacy bridge: verdicts earned per-home before the shared-store move
+        # stay readable (frozen) until this identity's first shared-store
+        # record replaces them; a state save must not erase that evidence.
         verdicts = existing.get("usage_semantics_verdicts")
         if isinstance(verdicts, dict) and verdicts:
             payload["usage_semantics_verdicts"] = verdicts
@@ -477,21 +513,45 @@ class ConversationStateRegistry:
                     exc,
                 )
 
-    def semantics_verdict(self, identity_key: str) -> str:
-        """Read one identity's consumption-semantics verdict (fail closed)."""
-        if not identity_key:
-            return _SEMANTICS_VERDICT_UNVERIFIED
-        path = _state_path()
-        with self._lock:
-            try:
-                with _cross_process_lock(path):
-                    payload = self._read_payload(path)
-            except OSError:
-                return _SEMANTICS_VERDICT_UNVERIFIED
+    @staticmethod
+    def _read_shared_verdicts(path: Path) -> dict[str, Any]:
+        """Decode the machine-wide verdict payload (empty on any defect)."""
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return {}
+        if (
+            not isinstance(payload, dict)
+            or payload.get("version") != _SEMANTICS_STORE_VERSION
+        ):
+            return {}
+        raw = payload.get("usage_semantics_verdicts")
+        if not isinstance(raw, dict):
+            return {}
+        return {
+            key: value
+            for key, value in raw.items()
+            if isinstance(key, str) and key and isinstance(value, dict)
+        }
+
+    @staticmethod
+    def _legacy_verdict_entry(per_home_path: Path, identity_key: str) -> dict[str, Any] | None:
+        """One identity's verdict from the retired per-home location, if any.
+
+        Upgrade bridge only: verdicts earned in the per-home store before the
+        shared-store move serve until this identity's first shared-store
+        record replaces them.  No lock is taken here; the per-home file is
+        replaced atomically, so a lock-free read yields a whole snapshot.
+        """
+        payload = ConversationStateRegistry._read_payload(per_home_path)
         verdicts = payload.get("usage_semantics_verdicts")
         if not isinstance(verdicts, dict):
-            return _SEMANTICS_VERDICT_UNVERIFIED
+            return None
         entry = verdicts.get(identity_key)
+        return entry if isinstance(entry, dict) else None
+
+    @staticmethod
+    def _verdict_from_entry(entry: Any) -> str:
         if (
             isinstance(entry, dict)
             and entry.get("schema") == _SEMANTICS_VERDICTS_SCHEMA
@@ -499,6 +559,22 @@ class ConversationStateRegistry:
         ):
             return _SEMANTICS_VERDICT_VERIFIED
         return _SEMANTICS_VERDICT_UNVERIFIED
+
+    def semantics_verdict(self, identity_key: str) -> str:
+        """Read one identity's consumption-semantics verdict (fail closed)."""
+        if not identity_key:
+            return _SEMANTICS_VERDICT_UNVERIFIED
+        path = _semantics_store_path()
+        with self._lock:
+            try:
+                with _cross_process_lock(path):
+                    verdicts = self._read_shared_verdicts(path)
+            except OSError:
+                return _SEMANTICS_VERDICT_UNVERIFIED
+        entry = verdicts.get(identity_key)
+        if entry is None:
+            entry = self._legacy_verdict_entry(_state_path(), identity_key)
+        return self._verdict_from_entry(entry)
 
     def record_semantics_evidence(self, identity_key: str, *, ok: bool) -> dict[str, Any]:
         """Fold one growth-consistency observation into an identity's verdict.
@@ -512,15 +588,19 @@ class ConversationStateRegistry:
         identity_key = str(identity_key or "").strip()
         if not identity_key:
             return {}
-        path = _state_path()
+        path = _semantics_store_path()
         updated: dict[str, Any] = {}
         with self._lock:
             try:
                 with _cross_process_lock(path):
-                    payload = self._read_payload(path)
-                    raw_verdicts = payload.get("usage_semantics_verdicts")
-                    verdicts = dict(raw_verdicts) if isinstance(raw_verdicts, dict) else {}
+                    verdicts = self._read_shared_verdicts(path)
                     previous = verdicts.get(identity_key)
+                    if previous is None:
+                        # Upgrade bridge: continue the streak a per-home store
+                        # earned before the shared-store move.
+                        previous = self._legacy_verdict_entry(
+                            _state_path(), identity_key
+                        )
                     now = time.time()
                     if (
                         isinstance(previous, dict)
@@ -576,8 +656,13 @@ class ConversationStateRegistry:
                         for key, _ in oldest[: len(verdicts) - _SEMANTICS_MAX_IDENTITIES]:
                             if key != identity_key:
                                 verdicts.pop(key, None)
-                    payload["usage_semantics_verdicts"] = verdicts
-                    self._write_payload(path, payload)
+                    self._write_payload(
+                        path,
+                        {
+                            "version": _SEMANTICS_STORE_VERSION,
+                            "usage_semantics_verdicts": verdicts,
+                        },
+                    )
             except OSError as exc:
                 logger.warning(
                     "Antigravity ACP semantics verdict checkpoint write failed; "

@@ -72,8 +72,12 @@ each with its own drop counter:
    prompt turns whose reported `inputTokens` growth stays consistent with the
    adapter's own local transcript-token estimate (see the growth gate below);
    a single divergent turn demotes it back and the streak restarts. Verdicts
-   persist in the durable store (`usage_semantics_verdicts`, LRU-capped) and
-   survive restarts. The version-pinned frozenset this replaced went stale on
+   persist in a MACHINE-WIDE store (`<hermes-root>/shared/antigravity-acp-semantics.json`,
+   `usage_semantics_verdicts`, LRU-capped, `HERMES_ANTIGRAVITY_ACP_SEMANTICS_FILE`
+   override) and survive restarts: the verdict describes the server's
+   behavior, so one profile home earning it serves every profile under the
+   same root, and verdicts earned in the retired per-home location bridge in
+   until the identity's first shared-store record. The version-pinned frozenset this replaced went stale on
    the day 1.5.2 shipped (2026-11-21) and silently starved accumulation while
    an inflated `prompt_result.usage` reached compression unguarded
    (2026-11-23 incident: 1.07M reported against a ~31K transcript); spec- or

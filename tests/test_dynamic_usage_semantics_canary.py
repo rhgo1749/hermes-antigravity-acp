@@ -37,6 +37,10 @@ def _load_package(monkeypatch, tmp_path: Path):
         str(tmp_path / "antigravity-acp-canary-state.json"),
     )
     monkeypatch.setenv(
+        "HERMES_ANTIGRAVITY_ACP_SEMANTICS_FILE",
+        str(tmp_path / "antigravity-acp-canary-semantics.json"),
+    )
+    monkeypatch.setenv(
         "HERMES_ANTIGRAVITY_ACP_LIMIT_STATE_FILE",
         str(tmp_path / "antigravity-acp-canary-limits.json"),
     )
@@ -72,6 +76,13 @@ def _load_package(monkeypatch, tmp_path: Path):
 
 def _state_payload(tmp_path: Path) -> dict:
     path = tmp_path / "antigravity-acp-canary-state.json"
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _semantics_payload(tmp_path: Path) -> dict:
+    path = tmp_path / "antigravity-acp-canary-semantics.json"
     if not path.exists():
         return {}
     return json.loads(path.read_text(encoding="utf-8"))
@@ -191,7 +202,80 @@ def test_verdicts_persist_across_registry_instances_and_state_saves(
     registry.put("affinity-1", state)
     fresh = conversation_state.ConversationStateRegistry()
     assert fresh.semantics_verdict(FAKE_IDENTITY) == "behaviorally_verified"
-    payload = _state_payload(tmp_path)
+    payload = _semantics_payload(tmp_path)
+    assert payload["usage_semantics_verdicts"][FAKE_IDENTITY]["verdict"] == (
+        "behaviorally_verified"
+    )
+    # The verdict moved OUT of the per-home store: a state save there can no
+    # longer be the place verdicts live (shared-store move).
+    assert FAKE_IDENTITY not in (
+        _state_payload(tmp_path).get("usage_semantics_verdicts") or {}
+    )
+
+
+# --------------------------------------------------------------------------
+# Machine-wide shared verdict store
+
+
+def test_semantics_store_path_is_shared_across_profile_homes(
+    monkeypatch, tmp_path
+) -> None:
+    _, conversation_state = _load_package(monkeypatch, tmp_path)
+    monkeypatch.delenv("HERMES_ANTIGRAVITY_ACP_SEMANTICS_FILE", raising=False)
+    root = tmp_path / "hermes-root"
+    expected = root / "shared" / "antigravity-acp-semantics.json"
+    for home in (root, root / "profiles" / "alpha", root / "profiles" / "beta"):
+        monkeypatch.setattr(conversation_state, "get_hermes_home", lambda h=home: h)
+        assert conversation_state._semantics_store_path() == expected
+
+
+def test_verdict_earned_in_one_home_serves_another(monkeypatch, tmp_path) -> None:
+    _, conversation_state = _load_package(monkeypatch, tmp_path)
+    home_a = conversation_state._state_path()
+    registry_a = conversation_state.ConversationStateRegistry()
+    for _ in range(conversation_state.SEMANTICS_PROMOTE_AFTER):
+        registry_a.record_semantics_evidence(FAKE_IDENTITY, ok=True)
+    # A different per-home store (profile B) but the same machine-wide
+    # semantics file: the verdict must already be there, no second warm-up.
+    monkeypatch.setenv(
+        "HERMES_ANTIGRAVITY_ACP_STATE_FILE",
+        str(tmp_path / "other-profile" / "antigravity-acp-canary-state.json"),
+    )
+    assert home_a != conversation_state._state_path()
+    registry_b = conversation_state.ConversationStateRegistry()
+    assert registry_b.semantics_verdict(FAKE_IDENTITY) == "behaviorally_verified"
+
+
+def test_legacy_per_home_verdict_bridges_into_shared_store(
+    monkeypatch, tmp_path
+) -> None:
+    _, conversation_state = _load_package(monkeypatch, tmp_path)
+    registry = conversation_state.ConversationStateRegistry()
+    legacy_entry = {
+        "schema": conversation_state._SEMANTICS_VERDICTS_SCHEMA,
+        "verdict": "behaviorally_verified",
+        "consistent_turns": 7,
+        "rejected_turns": 0,
+        "first_seen": time.time() - 3600,
+        "last_seen": time.time() - 60,
+        "provenance": "behavioral_growth_correlation",
+    }
+    per_home = conversation_state._state_path()
+    registry._write_payload(
+        per_home,
+        {
+            "version": conversation_state._STATE_VERSION,
+            "states": {},
+            "usage_semantics_verdicts": {FAKE_IDENTITY: legacy_entry},
+        },
+    )
+    # Read path: the shared store is empty; the legacy verdict still serves.
+    assert registry.semantics_verdict(FAKE_IDENTITY) == "behaviorally_verified"
+    # Write path: the first shared-store record continues the legacy streak.
+    entry = registry.record_semantics_evidence(FAKE_IDENTITY, ok=True)
+    assert entry["consistent_turns"] == 8
+    assert entry["verdict"] == "behaviorally_verified"
+    payload = _semantics_payload(tmp_path)
     assert payload["usage_semantics_verdicts"][FAKE_IDENTITY]["verdict"] == (
         "behaviorally_verified"
     )
@@ -277,7 +361,7 @@ def test_guard_seeds_baseline_then_rejects_and_records_inflation(
     assert rejected is None
     payload = _state_payload(tmp_path)
     assert payload["usage_drop_counters"]["dropped_inflated_turn_usage"] == 1
-    entry = payload["usage_semantics_verdicts"][FAKE_IDENTITY]
+    entry = _semantics_payload(tmp_path)["usage_semantics_verdicts"][FAKE_IDENTITY]
     assert entry["verdict"] == "unverified"
     assert entry["rejected_turns"] == 1
 
@@ -319,3 +403,4 @@ def test_guard_without_identity_never_earns_verdicts(monkeypatch, tmp_path) -> N
     )
     payload = _state_payload(tmp_path)
     assert "usage_semantics_verdicts" not in payload
+    assert "usage_semantics_verdicts" not in _semantics_payload(tmp_path)
