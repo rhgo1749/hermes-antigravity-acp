@@ -694,6 +694,8 @@ class Conversation:
             self.owner_token = token
             if decision.kind == "resume_held":
                 gen = self.gen
+                if self.server is not None:
+                    self.server.clear_completed(preserve_parked=True)
                 for call in self.handed:
                     call.answer(*tool_answer(decision.tool_results.get(call.id, ""), self._seen_sys_msgs))
                 self.handed = []
@@ -807,7 +809,8 @@ class Conversation:
         server = ParkedMcpServer(mcp_tools(tools), lambda call: self._on_call(gen, call), deadline=self.call_deadline,
                                  on_deadline=lambda call: self._on_deadline(gen, call)).start()
         gate = PermissionGate(server.server_name, server.tool_names,
-                              on_foreign_tool_call=lambda _u: self.events.put((gen, "foreign", None)))
+                              on_foreign_tool_call=lambda _u: self.events.put((gen, "foreign", None)),
+                              on_our_tool_completed=server.mark_completed)
         try:
             session = new_session(conn, mcp_server=server.acp_mcp_server_config(), gate=gate, model=model,
                                   thinking=thinking)
@@ -839,6 +842,8 @@ class Conversation:
     def _start_prompt(self, gen: int, blocks: list[dict[str, Any]]) -> None:  # lock held
         session = self.session
         assert session is not None
+        if self.server is not None:
+            self.server.clear_completed()
         self.text, self.reasoning, self.usage = [], [], None
         self.last_activity = time.monotonic()
 
@@ -1006,6 +1011,8 @@ class Conversation:
                         continue
                     self.guard, self.guard_refusals = set(), 0
                     self.view = view_after(messages)
+                    if self.server is not None:
+                        self.server.clear_completed()
                 return {"text": "".join(self.text), "reasoning": "".join(self.reasoning), "tool_calls": [],
                         "finish_reason": payload.finish_reason, "usage": dict(self.usage) if self.usage else None}
             if kind == "guard-loop":
