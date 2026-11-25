@@ -84,6 +84,8 @@ PUBLIC_PROVIDER_FILES = frozenset(
         "parked/parked_mcp.py",
         "parked/permission.py",
         "parked/session.py",
+        # Turn-usage validity contract shared by BOTH engines (issue #87 drift).
+        "parked/usage_contract.py",
     }
 )
 PUBLIC_CLOSURE_FILES = frozenset(

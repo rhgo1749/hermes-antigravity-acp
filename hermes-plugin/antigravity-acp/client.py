@@ -78,6 +78,12 @@ from .bridge import (
     extract_tool_calls_from_text,
     render_tool_bridge_sections,
 )
+# Turn-usage validity contract: ONE owner for both engines (issue #87 drift).
+from .parked.usage_contract import (
+    estimate_tokens,
+    first_turn_report_plausible,
+    reported_usage_growth_consistent,
+)
 
 
 # Generic optional policy-overlay hook (historical reference rework-r2, rework-r4).
@@ -2247,43 +2253,13 @@ def _usage_semantics_for_identity(identity_key: str) -> str:
     return _USAGE_SEMANTICS_UNVERIFIED
 
 
-_USAGE_GROWTH_FACTOR = 8
-_USAGE_GROWTH_SLACK_TOKENS = 64_000
 _TURN_USAGE_BASELINE_LOCK = threading.Lock()
 # affinity_key -> (last accepted reported inputTokens, native_tokens estimate
 # at that moment).  Process-local on purpose: a restart merely leaves the
 # first turn after it untested; the shared verdicts live in the durable store.
+# The gate DECISIONS themselves are shared with the Parked-MCP engine in
+# ``parked/usage_contract.py`` — this engine keeps only the state plumbing.
 _TURN_USAGE_BASELINES: dict[str, tuple[int, int]] = {}
-
-
-def _reported_usage_growth_consistent(
-    *,
-    prev_reported: int,
-    reported: int,
-    prev_local: int,
-    local: int,
-) -> tuple[bool, int, int]:
-    """Compare one turn's server-reported input-token growth with local growth.
-
-    The server's per-turn ``inputTokens`` must track the transcript the
-    adapter actually grew (the ``native_tokens`` estimate).  A server that
-    folds hidden state (subagent caches, internal accumulators, re-sent
-    bookkeeping) into the number diverges by orders of magnitude: the
-    2026-11-23 incident reported a ~3.2K local turn as ~499K growth (156x)
-    and fired the Core compression gate twice early.
-
-    Tolerance is deliberately generous (``8x`` plus a flat ``64K`` slack):
-    the server legitimately adds per-turn records the local estimate never
-    sees, and this gate exists to reject order-of-magnitude divergence, not
-    to police bookkeeping noise.  Returns ``(ok, reported_growth, expected_growth)``.
-    """
-    expected = local - prev_local
-    actual = reported - prev_reported
-    tolerance = max(
-        _USAGE_GROWTH_FACTOR * (abs(expected) + 1),
-        _USAGE_GROWTH_SLACK_TOKENS,
-    )
-    return abs(actual - expected) <= tolerance, actual, expected
 
 
 def _guard_reported_turn_usage(
@@ -2304,56 +2280,59 @@ def _guard_reported_turn_usage(
     """
     reported = int(getattr(turn_usage, "prompt_tokens", 0) or 0)
     identity = str(server_identity or "")
+    # One critical section per turn: baseline lookup, gate decision, and
+    # re-seed are atomic, so two same-affinity requests can never both pass
+    # their own gate and clobber each other's baseline (a split lookup/seed
+    # let a caller seed from a stale first-turn view).  Evidence and logging
+    # stay outside the lock.
     with _TURN_USAGE_BASELINE_LOCK:
         baseline = _TURN_USAGE_BASELINES.get(affinity_key)
-    if baseline is None:
-        # First turn of this conversation: no growth to correlate, so gate the
-        # absolute report against the local transcript estimate with the same
-        # divergence tolerance (issue #87: a long first turn reported ~1.4M
-        # cumulative inputTokens against a ~110K transcript and fired Core
-        # compression twice).  A rejected first report seeds nothing, so turn
-        # two is gated on its own; an accepted one becomes the growth baseline.
-        if abs(reported - native_tokens) > max(
-            _USAGE_GROWTH_FACTOR * (native_tokens + 1),
-            _USAGE_GROWTH_SLACK_TOKENS,
-        ):
-            if identity:
-                conversation_registry.record_semantics_evidence(identity, ok=False)
-            conversation_registry.note_usage_frame("dropped_inflated_turn_usage")
-            logger.warning(
-                "Antigravity ACP first-turn inputTokens %d rejected: diverges from "
-                "local transcript estimate %d beyond tolerance; Core falls back to "
-                "its own token estimate for compression this turn.",
-                reported,
-                native_tokens,
+        if baseline is None:
+            # First turn of this conversation: no growth to correlate, so gate
+            # the absolute report against the local transcript estimate (issue
+            # #87: a long first turn reported ~1.4M cumulative inputTokens
+            # against a ~110K transcript and fired Core compression twice).  A
+            # rejected first report seeds nothing, so turn two is gated on its
+            # own; an accepted one becomes the growth baseline.
+            first_turn = True
+            accepted = first_turn_report_plausible(
+                reported=reported, local=native_tokens
             )
-            return None
-        with _TURN_USAGE_BASELINE_LOCK:
+            actual = expected = 0
+        else:
+            first_turn = False
+            accepted, actual, expected = reported_usage_growth_consistent(
+                prev_reported=baseline[0],
+                reported=reported,
+                prev_local=baseline[1],
+                local=native_tokens,
+            )
+        if accepted:
             _TURN_USAGE_BASELINES[affinity_key] = (reported, native_tokens)
-        return turn_usage
-    ok, actual, expected = _reported_usage_growth_consistent(
-        prev_reported=baseline[0],
-        reported=reported,
-        prev_local=baseline[1],
-        local=native_tokens,
-    )
-    if ok:
-        with _TURN_USAGE_BASELINE_LOCK:
-            _TURN_USAGE_BASELINES[affinity_key] = (reported, native_tokens)
-        if identity:
+    if accepted:
+        if not first_turn and identity:
             conversation_registry.record_semantics_evidence(identity, ok=True)
         return turn_usage
     if identity:
         conversation_registry.record_semantics_evidence(identity, ok=False)
     conversation_registry.note_usage_frame("dropped_inflated_turn_usage")
-    logger.warning(
-        "Antigravity ACP reported inputTokens rejected: server growth %d vs "
-        "local estimate growth %d (identity=%s); Core falls back to its own "
-        "token estimate for compression this turn.",
-        actual,
-        expected,
-        identity or "unknown",
-    )
+    if first_turn:
+        logger.warning(
+            "Antigravity ACP first-turn inputTokens %d rejected: diverges from "
+            "local transcript estimate %d beyond tolerance; Core falls back to "
+            "its own token estimate for compression this turn.",
+            reported,
+            native_tokens,
+        )
+    else:
+        logger.warning(
+            "Antigravity ACP reported inputTokens rejected: server growth %d vs "
+            "local estimate growth %d (identity=%s); Core falls back to its own "
+            "token estimate for compression this turn.",
+            actual,
+            expected,
+            identity or "unknown",
+        )
     return None
 
 
@@ -3722,28 +3701,9 @@ def _resume_session_missing(exc: BaseException) -> bool:
 _DEFAULT_NATIVE_TOKEN_LIMIT = 1_000_000
 _NATIVE_TOKEN_ROTATION_FRACTION = 0.9
 _MIN_INFERRED_NATIVE_LIMIT = 100_000
-_CJK_RANGES = (
-    (0x1100, 0x11FF), (0x2E80, 0x2FFF), (0x3040, 0x30FF), (0x3130, 0x318F),
-    (0x3400, 0x4DBF), (0x4E00, 0x9FFF), (0xAC00, 0xD7AF), (0xF900, 0xFAFF),
-    (0xFE30, 0xFE4F), (0xFF00, 0xFFDC), (0x20000, 0x3134F),
-)
 _LEARNED_NATIVE_LIMIT_RE = re.compile(
     r"token limit:\s*(\d+)|max_token_limit\s*\((\d+)\)", re.IGNORECASE
 )
-
-
-def _estimate_tokens(text: str) -> int:
-    """Conservative token estimate (CJK ~1 token/char, other ~1 token/3 chars)."""
-    if not text:
-        return 0
-    cjk = 0
-    for ch in text:
-        code = ord(ch)
-        for lo, hi in _CJK_RANGES:
-            if lo <= code <= hi:
-                cjk += 1
-                break
-    return cjk + (len(text) - cjk) // 3 + 1
 
 
 def _model_limit_key(model: str | None) -> str:
@@ -4448,11 +4408,11 @@ class AntigravityACPClient:
                     active_request=_active_user_text(request_messages),
                     unresolved_denied_request=denied_request,
                 )
-                delta_tokens = _estimate_tokens(delta_prompt)
+                delta_tokens = estimate_tokens(delta_prompt)
                 projected = (
                     prior_state.native_tokens
                     + delta_tokens
-                    + _estimate_tokens(full_prompt_text)
+                    + estimate_tokens(full_prompt_text)
                     // 20  # slack for response growth
                 )
                 if projected >= _rotation_threshold(model):
@@ -4851,11 +4811,11 @@ class AntigravityACPClient:
             if affinity_key and session_id:
                 resumed = bool(session_result.get("resumed"))
                 if resumed:
-                    native_tokens = prior_native_tokens + _estimate_tokens(prompt_text)
+                    native_tokens = prior_native_tokens + estimate_tokens(prompt_text)
                 else:
-                    native_tokens = _estimate_tokens(full_prompt_text)
+                    native_tokens = estimate_tokens(full_prompt_text)
                 native_tokens = min(
-                    native_tokens + _estimate_tokens(cleaned_text),
+                    native_tokens + estimate_tokens(cleaned_text),
                     _native_token_limit(model),
                 )
                 denied_request_fingerprint = ""

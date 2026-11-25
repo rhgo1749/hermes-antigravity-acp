@@ -95,6 +95,8 @@ REQUIRED = (
     "parked/parked_mcp.py",
     "parked/permission.py",
     "parked/session.py",
+    # Turn-usage validity contract shared by BOTH engines (issue #87 drift).
+    "parked/usage_contract.py",
 )
 # Provider-tree byte sets this installer verifiably shipped before the
 # provenance marker existed (sha256 of each managed file at that release).
