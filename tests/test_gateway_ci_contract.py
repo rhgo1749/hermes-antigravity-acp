@@ -16,8 +16,8 @@ SHA = "a" * 40
 
 
 def good_outputs():
-    return {"attested_sha": SHA, "gateway_core": "caafe5389ae585ef77387a962aee05b1bcf17029", "gateway_result": "success", "gateway_record": json.dumps({
-        "schema_version": 2, "candidate_sha": SHA, "hermes_commit": "caafe5389ae585ef77387a962aee05b1bcf17029", "status": "PASS", "boundary_refusal_reasons": [],
+    return {"attested_sha": SHA, "gateway_core": "8fc0374447313e276f6b9a2764bfc750190c966a", "gateway_result": "success", "gateway_record": json.dumps({
+        "schema_version": 2, "candidate_sha": SHA, "hermes_commit": "8fc0374447313e276f6b9a2764bfc750190c966a", "status": "PASS", "boundary_refusal_reasons": [],
         "owned_child_count": 2, "live_owned_children_after_exit": 0, "candidate_source_dirty": False,
                 "provider_origin": {"status": "PASS", "candidate_sha": SHA, "tree_sha256": "3" * 64,
                                     "home_sha256": "4" * 64, "frozen_copies": 0, "errors": []},
