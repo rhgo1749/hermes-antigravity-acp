@@ -16,8 +16,8 @@ Contract:
 - use synthetic ids (``fake-model-a``, ``fake-model-b-high``, …) instead;
 - a real name is allowed ONLY inside a ``(live: …)`` annotation span, in a
   comment/docstring, or in an allowlisted historical fixture below (exact
-  path + reason + named approver + expiry; expired or no-longer-needed
-  entries fail the suite).
+  path + factual reason; entries that are no longer needed fail the
+  suite).  Approval history lives in GitHub, not in fixture code.
 
 Scanner guarantees and limits (external reviews of PR #89 rounds 1-2 folded
 in; limits are deliberate — no arbitrary expression evaluation):
@@ -40,7 +40,6 @@ from __future__ import annotations
 
 import ast
 import re
-from datetime import date
 from pathlib import Path
 
 TESTS_DIR = Path(__file__).resolve().parent
@@ -61,14 +60,14 @@ REAL_MODEL_ID = re.compile(
 _LIVE_ANNOTATION = re.compile(r"\(live:[^)]*\)")
 
 # Exact relative paths legitimately required to carry real vendor ids, each
-# with reason, named approver, and expiry.  New exceptions need operator
-# sign-off; expired or no-longer-needed entries fail the suite below.
+# with the factual reason.  Adding, changing, or removing an exception is a
+# maintainer decision recorded in the PR/commit that does it.
 ALLOWLIST: dict[str, str] = {
     # Historical fixture pinning the model ids actually observed in the
     # official ACP 1.4.0 server's responses; synthetic ids would test nothing.
     "test_140_client_delta.py": (
         "historical fixture pinning ids observed in the official ACP 1.4.0 "
-        "server (approved rhgo1749, 2026-11-25; expires 2027-11-25)"
+        "server's responses; synthetic ids would test nothing"
     ),
 }
 
@@ -214,41 +213,6 @@ def test_fake_lane_fixtures_use_synthetic_model_ids() -> None:
         "current-catalog claims (AGENTS.md, class of 2026-11-20):\n"
         + "\n".join(offenders)
     )
-
-
-_EXPIRY_RE = re.compile(r"expires (\d{4}-\d{2}-\d{2})")
-# Structured metadata: a NAMED approver (non-empty token), an approval date,
-# and an expiry date, in one anchored form.  Round-3 review N7: a bare
-# "approved " substring check let ``approved ; expires …`` through.
-_METADATA_RE = re.compile(
-    r"\(approved (?P<approver>[A-Za-z0-9][A-Za-z0-9_.-]+), "
-    r"(?P<approved>\d{4}-\d{2}-\d{2}); expires (?P<expires>\d{4}-\d{2}-\d{2})\)"
-)
-
-
-def test_allowlist_exceptions_are_documented_and_unexpired() -> None:
-    """Every exception carries a real reason, a NAMED approver, and a
-    not-yet-passed expiry."""
-    today = date.today()
-    for path, reason in ALLOWLIST.items():
-        assert len(reason.split("(approved")[0].strip()) >= 10, (
-            f"{path}: exception reason is too thin to audit"
-        )
-        match = _METADATA_RE.search(reason)
-        assert match, (
-            f"{path}: exception must carry "
-            "'(approved <name>, YYYY-MM-DD; expires YYYY-MM-DD)'"
-        )
-        # Round-4 review N12: BOTH dates must be real calendar dates, not
-        # just date-shaped strings.
-        try:
-            date.fromisoformat(match.group("approved"))
-        except ValueError as exc:
-            raise AssertionError(f"{path}: invalid approval date: {exc}") from exc
-        assert date.fromisoformat(match.group("expires")) >= today, (
-            f"{path}: exception expired on {match.group('expires')} — renew "
-            "with operator sign-off or fix the fixture"
-        )
 
 
 def test_allowlist_exceptions_are_still_needed() -> None:

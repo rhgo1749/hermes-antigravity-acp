@@ -41,6 +41,15 @@ Runtime launcher resolution checks environment overrides in strict precedence or
 | `HERMES_ANTIGRAVITY_ACP_MCP_THINKING_LEVEL` | Thinking level override | One of `low`, `medium`, `high`, `xhigh`; overrides Hermes `reasoning_effort` |
 | `HERMES_ANTIGRAVITY_ACP_MCP_DISCOVERY_TTL_SECONDS` | Live model-discovery cache TTL | Bounds the `session/new` model-surface probe cache |
 
+## Shared Turn-Usage Contract Module
+
+`hermes-plugin/antigravity-acp/parked/usage_contract.py` lives under `parked/` for a bootstrap reason only (the design_c test lane loads this subpackage standalone as `antigravity_acp_mcp` and must not import from the parent package), but it is **shared contract, not parked-private policy**: it is the single owner of the turn-usage validity rules (tolerance constants, first-turn absolute gate, growth-consistency gate, token estimator) that BOTH engines enforce — Parked-MCP via `parked/conversation.py` and Replay via the parent `client.py`, which imports it as `.parked.usage_contract`.
+
+Maintenance consequences:
+
+- When syncing `parked/` with upstream Parked-MCP sources (the `hermes-plugin/antigravity-acp-mcp` lineage, issues #81/#82/#83), `usage_contract.py` and both engines' imports of it must be **preserved**; dropping or forking it re-creates the drift class of issue #87 (the Replay engine shipped without the first-turn gate because the contract lived only in the parked engine).
+- Neither engine may redefine these constants or reimplement these decisions locally; `tests/test_usage_contract_single_owner.py` fails the build when one does.
+
 ## Security and Isolation Boundaries
 
 Design C keeps tool execution strictly inside Hermes while treating the ACP child process and its stdio streams as untrusted boundaries.
