@@ -18,9 +18,9 @@ independent review and Phase C Gateway CI.
 ## Policy (existing path classifier reused)
 
 Fast means auto-discovered fake-ACP tests/static/hygiene, the mandatory stable
-official Core v0.23.3 strict seam and minimum supported Core v0.21.6 strict
+official Core v0.23.4 strict seam and minimum supported Core v0.21.6 strict
 seam, plus `CI gate`. Per the 2026-11-16 baseline policy (stable promoted to
-v0.23.3 on 2026-11-21)
+v0.23.3 on 2026-11-21 and to v0.23.4 on 2026-11-25)
 ([hermes-compatibility.md](hermes-compatibility.md#baseline-policy--stable-v0233-current-2026-11-21)),
 the latest-`main` strict seam is a separate advisory diagnostic: it runs and
 reports, may fail without blocking, and is not compatibility evidence.
@@ -69,9 +69,9 @@ behavior stays unchanged. Dispatch returns full scope before push parsing.
 ## Preserved contracts
 
 The stable required `CI gate` graph/strict flags/missing-or-skipped denial,
-stable-v0.23.3/minimum Core strict checks (latest-`main` moved to the separate
+stable-v0.23.4/minimum Core strict checks (latest-`main` moved to the separate
 non-blocking advisory diagnostic under the 2026-11-16 baseline policy, stable
-lane promoted to v0.23.3 on 2026-11-21; the
+lane promoted to v0.23.3 on 2026-11-21 and to v0.23.4 on 2026-11-25; the
 historical runs recorded above were executed under the former mandatory-latest
 rule), pytest discovery, publisher SHA-256,
 Windows x64/ARM64 installers, #31 cancellation/tree regressions, macOS support,
