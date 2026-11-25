@@ -2,6 +2,7 @@
 
 The picker must show ONLY the signed-in account's live ``session/new`` rows; the static fallback list is
 intentionally empty (a wrong id costs a -32602 and a silent fallback turn — the gemini-4-* incident).
+Fixtures use synthetic model ids per AGENTS.md; real catalog names never appear as fixture values.
 """
 
 from __future__ import annotations
@@ -60,6 +61,12 @@ def _profile(monkeypatch, behaviour: dict):
     return profile
 
 
+def _events(log_path: Path):
+    if not log_path.exists():
+        return []
+    return [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
 def test_static_fallback_is_empty():
     # The picker floor incident: an unverified static list must never return.
     source = (PLUGIN_DIR / "_plugin_entry.py").read_text(encoding="utf-8")
@@ -68,15 +75,27 @@ def test_static_fallback_is_empty():
 
 def test_discovery_returns_live_server_rows(monkeypatch):
     profile = _profile(monkeypatch, {"available_models": [
-        {"modelId": "gemini-3.8-flash", "name": "Gemini 3.8 Flash"},
-        {"modelId": "duplicated", "name": "duplicated"},
+        {"modelId": "fake-model-a", "name": "Fake Model A"},
+        {"modelId": "fake-model-b-high", "name": "fake-model-b-high"},
         {"modelId": ""},
-        {"modelId": "duplicated"},
+        {"modelId": "fake-model-b-high"},
     ]})
     rows = profile.discover_models()
-    assert [r["id"] for r in rows] == ["gemini-3.8-flash", "duplicated"]
-    assert rows[0]["label"] == "Gemini 3.8 Flash" and "label" not in rows[1]
-    assert profile.fetch_models() == ["gemini-3.8-flash", "duplicated"]
+    assert [r["id"] for r in rows] == ["fake-model-a", "fake-model-b-high"]
+    assert rows[0]["label"] == "Fake Model A" and "label" not in rows[1]
+    assert profile.fetch_models() == ["fake-model-a", "fake-model-b-high"]
+
+
+def test_discovery_skips_malformed_rows(monkeypatch):
+    """A server row that is not an object (or carries a non-string id) is skipped, never crashes the picker."""
+    profile = _profile(monkeypatch, {"available_models": [
+        "just-a-string", None, 42,
+        {"modelId": {"nested": "object"}},          # non-scalar id: never str()-ified into the picker
+        {"modelId": "fake-model-ok"},
+    ]})
+    rows = profile.discover_models()
+    ids = [r["id"] for r in rows]
+    assert ids == ["fake-model-ok"]  # only a real string id survives; str()-ified junk is never offered
 
 
 def test_discovery_fails_closed_without_models(monkeypatch):
@@ -92,8 +111,46 @@ def test_discovery_fails_closed_on_dead_command(monkeypatch):
     assert profile.fetch_models() is None
 
 
-def test_fresh_cache_answers_without_a_second_spawn(monkeypatch):
-    profile = _profile(monkeypatch, {"available_models": [{"modelId": "m-one"}]})
+def test_fresh_cache_answers_without_a_second_spawn(monkeypatch, tmp_path):
+    log_path = tmp_path / "fake.log"
+    profile = _profile(monkeypatch, {"available_models": [{"modelId": "fake-model-one"}], "log": str(log_path)})
     first = profile.discover_models()
+    second = profile.discover_models()
+    assert second == first
+    assert sum(1 for e in _events(log_path) if e.get("ev") == "new") == 1  # served from cache
+
+
+def test_launcher_change_invalidates_the_cache(monkeypatch):
+    profile = _profile(monkeypatch, {"available_models": [{"modelId": "fake-model-one"}]})
+    first = profile.discover_models()
+    assert first is not None
+    # Repointing the launcher must re-probe, not serve the old launcher's surface.
     monkeypatch.setattr(profile, "process_command", "/nonexistent/would-fail")
-    assert profile.discover_models() == first  # served from cache, no respawn
+    assert profile.discover_models() is None
+
+
+def test_discovery_closes_the_probe_session(monkeypatch, tmp_path):
+    """The session/new used for discovery is closed per ACP v1 before the child is reaped."""
+    log_path = tmp_path / "fake.log"
+    profile = _profile(monkeypatch, {"available_models": [{"modelId": "fake-model-one"}],
+                                     "session_close": True, "log": str(log_path)})
+    assert profile.discover_models() is not None
+    events = _events(log_path)
+    assert any(e.get("ev") == "new" for e in events)
+    assert any(e.get("ev") == "close_session" for e in events)
+
+
+def test_ttl_override_is_sane(monkeypatch):
+    module = _load_entry(monkeypatch)
+    monkeypatch.delenv("HERMES_ANTIGRAVITY_ACP_MCP_DISCOVERY_TTL_SECONDS", raising=False)
+    assert module._discovery_ttl() == module._DISCOVERY_TTL_DEFAULT_SECONDS
+    monkeypatch.setenv("HERMES_ANTIGRAVITY_ACP_MCP_DISCOVERY_TTL_SECONDS", "not-a-number")
+    assert module._discovery_ttl() == module._DISCOVERY_TTL_DEFAULT_SECONDS
+    monkeypatch.setenv("HERMES_ANTIGRAVITY_ACP_MCP_DISCOVERY_TTL_SECONDS", "-5")
+    assert module._discovery_ttl() == module._DISCOVERY_TTL_DEFAULT_SECONDS
+    monkeypatch.setenv("HERMES_ANTIGRAVITY_ACP_MCP_DISCOVERY_TTL_SECONDS", "nan")
+    assert module._discovery_ttl() == module._DISCOVERY_TTL_DEFAULT_SECONDS
+    monkeypatch.setenv("HERMES_ANTIGRAVITY_ACP_MCP_DISCOVERY_TTL_SECONDS", "999999999")
+    assert module._discovery_ttl() == module._DISCOVERY_TTL_MAX_SECONDS
+    monkeypatch.setenv("HERMES_ANTIGRAVITY_ACP_MCP_DISCOVERY_TTL_SECONDS", "30")
+    assert module._discovery_ttl() == 30.0

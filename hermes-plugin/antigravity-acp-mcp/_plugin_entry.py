@@ -11,7 +11,20 @@ from providers.base import ProviderProfile
 
 from .client import _configured_command, _default_official_command
 
-_DISCOVERY_TTL_SECONDS = float(os.environ.get("HERMES_ANTIGRAVITY_ACP_MCP_DISCOVERY_TTL_SECONDS", "600"))
+_DISCOVERY_TTL_DEFAULT_SECONDS = 600.0
+_DISCOVERY_TTL_MAX_SECONDS = 86400.0
+
+
+def _discovery_ttl() -> float:
+    """Operator TTL override, read per call; garbage/negative/NaN fall back to the default, never crash."""
+    raw = os.environ.get("HERMES_ANTIGRAVITY_ACP_MCP_DISCOVERY_TTL_SECONDS", "")
+    try:
+        ttl = float(raw) if raw else _DISCOVERY_TTL_DEFAULT_SECONDS
+    except ValueError:
+        return _DISCOVERY_TTL_DEFAULT_SECONDS
+    if not ttl >= 0.0:  # False for negatives AND NaN
+        return _DISCOVERY_TTL_DEFAULT_SECONDS
+    return min(ttl, _DISCOVERY_TTL_MAX_SECONDS)
 
 
 class AntigravityAcpMcpProfile(ProviderProfile):
@@ -31,40 +44,49 @@ class AntigravityAcpMcpProfile(ProviderProfile):
 
         Mirrors the standalone antigravity-acp profile's contract: server rows only, ``None`` on any
         failure (the picker then shows ``fallback_models``, which is intentionally empty — an
-        unverified model is never offered). A fresh cached listing answers without spawning the server.
+        unverified model is never offered). A fresh cached listing answers without spawning the server;
+        the cache is keyed by the resolved launcher, so repointing the launcher invalidates it.
         """
+        launcher = (_configured_command() or self.process_command, tuple(self.process_args))
         cached = getattr(self, "_models_cache", None)
-        if cached is not None and time.monotonic() < cached[0]:
+        if cached is not None and cached[2] == launcher and time.monotonic() < cached[0]:
             return list(cached[1])
         try:
             from .acp_connection import AcpConnection
 
-            conn = AcpConnection(_configured_command() or self.process_command, list(self.process_args),
-                                 os.path.expanduser("~"))
+            conn = AcpConnection(launcher[0], list(launcher[1]), os.path.expanduser("~"))
             conn.start()
             try:
                 conn.initialize(timeout=60.0)
                 sess = conn.request("session/new", {"cwd": conn.cwd, "mcpServers": []}, timeout=90.0)
+                sid = str(sess.get("sessionId") or "") if isinstance(sess, dict) else ""
+                if sid:
+                    conn.close_session(sid)  # ACP v1 courtesy before the process teardown
             finally:
                 conn.close()
         except Exception:  # noqa: BLE001 - discovery failure must fail closed, never fake a picker
             return None
-        models = sess.get("models") or {}
+        models = sess.get("models") if isinstance(sess, dict) else None
+        entries = models.get("availableModels") if isinstance(models, dict) else None
         rows: list[dict[str, Any]] = []
         seen: set[str] = set()
-        for entry in models.get("availableModels") or []:
-            model_id = str((entry or {}).get("modelId") or "").strip()
+        for entry in entries if isinstance(entries, list) else []:
+            if not isinstance(entry, dict):
+                continue
+            raw_id = entry.get("modelId")
+            model_id = raw_id.strip() if isinstance(raw_id, str) else ""
             if not model_id or model_id in seen:
                 continue
             seen.add(model_id)
             row: dict[str, Any] = {"id": model_id}
-            label = str((entry or {}).get("name") or "").strip()
+            raw_name = entry.get("name")
+            label = raw_name.strip() if isinstance(raw_name, str) else ""
             if label and label != model_id:
                 row["label"] = label
             rows.append(row)
         if not rows:
             return None
-        self._models_cache = (time.monotonic() + _DISCOVERY_TTL_SECONDS, list(rows))
+        self._models_cache = (time.monotonic() + _discovery_ttl(), list(rows), launcher)
         return rows
 
     def fetch_models(self, *, api_key: str | None = None, base_url: str | None = None,
