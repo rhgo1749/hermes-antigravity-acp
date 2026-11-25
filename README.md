@@ -615,6 +615,21 @@ Since plugin 0.9.0 one plugin package carries both engines:
 | `antigravity-acp` | Parked-MCP (default) | `hermes-plugin/antigravity-acp/parked/` | Public identity and the only profile a default install creates; aliases `antigravity-cli`, `agy`, `antigravity`, `agy-acp`, `antigravity-official-acp`, plus compatibility aliases `antigravity-acp-mcp`, `agy-mcp` so pre-0.9.0 `model.provider: antigravity-acp-mcp` settings keep resolving without a separately-created provider; marker `base_url` `acp://antigravity` |
 | `antigravity-acp-replay` | Replay | parent package flat modules (`client.py` et al.) | The pre-0.9.0 default engine; registers only when the installer-written `launch_config.json` declares `extra_providers: ["antigravity-acp-replay"]` (explicit install-time creation); not deprecated and not removed |
 
+**Upgrade note (breaking, intentional):** a default install now creates only
+`antigravity-acp`. Existing configs that select `antigravity-acp-mcp` or
+`agy-mcp` keep resolving unchanged (they are aliases on the default profile).
+Existing configs that select `antigravity-acp-replay` stop resolving after an
+upgrade unless the installed plugin tree gains the explicit declaration:
+
+```json
+{"extra_providers": ["antigravity-acp-replay"]}
+```
+
+written to `<hermes-home>/plugins/model-providers/antigravity-acp/launch_config.json`
+(then restart the Hermes process so the provider layer re-imports). Provider
+creation is explicit-declaration-only by design; there is no automatic
+migration scan.
+
 The Parked-MCP engine parks Hermes tool calls behind a per-session loopback
 Streamable-HTTP MCP endpoint instead of letting the ACP server run native
 tools; it was authored by Nanako0129 (MIT-licensed) as the opt-in sibling
