@@ -349,7 +349,7 @@ def test_guard_seeds_baseline_then_rejects_and_records_inflation(
         turn_usage=first,
         native_tokens=90_000,
     )
-    assert kept is first  # first turn: no growth to correlate, baseline seeded
+    assert kept is first  # first turn: within absolute tolerance, baseline seeded
 
     inflated = SimpleNamespace(prompt_tokens=599_000)
     rejected = client._guard_reported_turn_usage(
@@ -376,6 +376,44 @@ def test_guard_seeds_baseline_then_rejects_and_records_inflation(
     )
     assert kept is consistent
     assert registry.semantics_verdict(FAKE_IDENTITY) == "unverified"
+
+
+def test_guard_rejects_inflated_first_turn_without_seeding_baseline(
+    monkeypatch, tmp_path
+) -> None:
+    """Issue #87 replay: a long first turn must not pass through unconditionally.
+
+    Fresh session, one long ACP turn: the server folds every internal model
+    call into ``inputTokens`` (~1.4M cumulative cache reads) while the real
+    transcript is ~110K.  The growth gate has no baseline on turn one, so the
+    absolute level itself must be gated against the local estimate — exactly
+    what the parked engine (``_gate_turn_consumption``) already does.
+    """
+    client, _ = _load_package(monkeypatch, tmp_path)
+    affinity = "affinity-firstturn"
+
+    inflated = SimpleNamespace(prompt_tokens=1_405_762)
+    rejected = client._guard_reported_turn_usage(
+        affinity_key=affinity,
+        server_identity=FAKE_IDENTITY,
+        turn_usage=inflated,
+        native_tokens=110_141,
+    )
+    assert rejected is None
+    # A rejected first report seeds nothing: turn two is gated on its own.
+    assert affinity not in client._TURN_USAGE_BASELINES
+    payload = _state_payload(tmp_path)
+    assert payload["usage_drop_counters"]["dropped_inflated_turn_usage"] == 1
+
+    sane = SimpleNamespace(prompt_tokens=115_000)
+    kept = client._guard_reported_turn_usage(
+        affinity_key=affinity,
+        server_identity=FAKE_IDENTITY,
+        turn_usage=sane,
+        native_tokens=112_000,
+    )
+    assert kept is sane
+    assert client._TURN_USAGE_BASELINES[affinity] == (115_000, 112_000)
 
 
 def test_guard_without_identity_never_earns_verdicts(monkeypatch, tmp_path) -> None:

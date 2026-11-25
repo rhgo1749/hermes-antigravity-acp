@@ -2306,10 +2306,31 @@ def _guard_reported_turn_usage(
     identity = str(server_identity or "")
     with _TURN_USAGE_BASELINE_LOCK:
         baseline = _TURN_USAGE_BASELINES.get(affinity_key)
-        if baseline is None:
-            # First turn of this conversation: no growth to correlate yet.
+    if baseline is None:
+        # First turn of this conversation: no growth to correlate, so gate the
+        # absolute report against the local transcript estimate with the same
+        # divergence tolerance (issue #87: a long first turn reported ~1.4M
+        # cumulative inputTokens against a ~110K transcript and fired Core
+        # compression twice).  A rejected first report seeds nothing, so turn
+        # two is gated on its own; an accepted one becomes the growth baseline.
+        if abs(reported - native_tokens) > max(
+            _USAGE_GROWTH_FACTOR * (native_tokens + 1),
+            _USAGE_GROWTH_SLACK_TOKENS,
+        ):
+            if identity:
+                conversation_registry.record_semantics_evidence(identity, ok=False)
+            conversation_registry.note_usage_frame("dropped_inflated_turn_usage")
+            logger.warning(
+                "Antigravity ACP first-turn inputTokens %d rejected: diverges from "
+                "local transcript estimate %d beyond tolerance; Core falls back to "
+                "its own token estimate for compression this turn.",
+                reported,
+                native_tokens,
+            )
+            return None
+        with _TURN_USAGE_BASELINE_LOCK:
             _TURN_USAGE_BASELINES[affinity_key] = (reported, native_tokens)
-            return turn_usage
+        return turn_usage
     ok, actual, expected = _reported_usage_growth_consistent(
         prev_reported=baseline[0],
         reported=reported,
