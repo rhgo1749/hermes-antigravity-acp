@@ -22,6 +22,12 @@ from gateway_process_policy import (BASELINE_ENV, PRUNE_BODY, git_probe_context_
                                     shutdown_command_verified)
 from provider_origin import ProviderOrigin
 
+# Engine-aware factory/client sources: since 0.9.0 the default Parked-MCP engine ships from
+# parked/ while the Replay engine keeps the top-level modules. Order is irrelevant;
+# ProviderOrigin.accepts() rejects non-matching paths without recording an error.
+_FACTORY_SOURCES = ("parked/_plugin_entry.py", "__init__.py")
+_CLIENT_SOURCES = ("parked/client.py", "client.py")
+
 
 def _proc_start_time(pid: int) -> str:
     return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[22 - 3]
@@ -297,14 +303,22 @@ def main() -> None:
         provider_origin.observe(frame, event, arg)
         # Observe the ORIGINAL factory, including executor threads. No Core callable is replaced.
         # Core intentionally uses os._exit after its graceful drain, so atexit alone is insufficient.
-        if (event == "return" and frame.f_code.co_name == "create_client"
-                and provider_origin.accepts_frame(frame, "__init__.py") and arg is not None):
-            factory_hashes.add(hashlib.sha256((plugin / "__init__.py").read_bytes()).hexdigest())
-            finish()
-        elif (event == "return" and frame.f_code.co_name == "cancel"
-              and provider_origin.accepts_frame(frame, "client.py")):
-            client_cancel_calls += 1
-            finish()
+        # Since 0.9.0 the default (Parked-MCP) factory lives in parked/_plugin_entry.py and the
+        # Replay factory in the top-level __init__.py; accepts_frame() binds whichever file the
+        # frame actually executed to the installed candidate bytes, so provenance is identical.
+        if (event == "return" and frame.f_code.co_name == "create_client" and arg is not None):
+            for relative in _FACTORY_SOURCES:
+                if provider_origin.accepts_frame(frame, relative):
+                    factory_hashes.add(
+                        hashlib.sha256((plugin / relative).read_bytes()).hexdigest())
+                    finish()
+                    break
+        elif event == "return" and frame.f_code.co_name == "cancel":
+            for relative in _CLIENT_SOURCES:
+                if provider_origin.accepts_frame(frame, relative):
+                    client_cancel_calls += 1
+                    finish()
+                    break
         elif (event == "return" and frame.f_code.co_name == "__init__"
               and frame.f_globals.get("__name__") == "subprocess"):
             try:
