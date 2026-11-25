@@ -123,31 +123,43 @@ def scan_source(source: str) -> list[tuple[int, str]]:
     return findings
 
 
-def _self_test_ranges(tree: ast.AST) -> list[tuple[int, int]]:
-    """(first, last) linenos of test_scanner_* function bodies."""
-    ranges = []
+def _self_test_body_lines(tree: ast.AST) -> set[int]:
+    """Linenos INSIDE test_scanner_* function BODIES only.
+
+    Round-3 review N9: line-RANGE exemptions also covered the signature,
+    so a real id in a default argument (``def test_scanner_x(p="gpt-4")``)
+    escaped.  Body statements' nodes only — decorators, defaults, and
+    annotations are not exempt.
+    """
+    lines: set[int] = set()
     for node in ast.walk(tree):
         if (
             isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
             and node.name.startswith(_SELF_TEST_PREFIX)
         ):
-            end = max(getattr(child, "lineno", node.lineno) for child in ast.walk(node))
-            ranges.append((node.lineno, end))
-    return ranges
+            for stmt in node.body:
+                for child in ast.walk(stmt):
+                    lineno = getattr(child, "lineno", None)
+                    if lineno is not None:
+                        lines.add(lineno)
+    return lines
 
 
-def scan_file(path: Path) -> list[str]:
+def _is_self_test_file(path: Path) -> bool:
+    """Exact path match — round-3 review N8: a basename match let ANY
+    nested file named like the scanner claim the exemption."""
+    return path.resolve() == (TESTS_DIR / SELF_TEST_FILE).resolve()
+
+
+def scan_file(path: Path, root: Path | None = None) -> list[str]:
     source = path.read_text(encoding="utf-8")
     findings = scan_source(source)
-    if path.name == SELF_TEST_FILE:
-        ranges = _self_test_ranges(ast.parse(source))
-        findings = [
-            (lineno, hit)
-            for lineno, hit in findings
-            if not any(start <= lineno <= end for start, end in ranges)
-        ]
+    if _is_self_test_file(path):
+        body_lines = _self_test_body_lines(ast.parse(source))
+        findings = [(lineno, hit) for lineno, hit in findings if lineno not in body_lines]
+    rel = path.relative_to(root) if root is not None else path.relative_to(TESTS_DIR)
     return [
-        f"{path.relative_to(TESTS_DIR)}:{lineno}: real vendor model id {hit!r} "
+        f"{rel}:{lineno}: real vendor model id {hit!r} "
         f"in a fixture string — use a synthetic id (fake-model-a, "
         f"fake-model-b-high, …) or annotate a real observation with '(live: …)'"
         for lineno, hit in findings
@@ -161,7 +173,7 @@ def scan_tree(root: Path) -> list[str]:
             continue
         if str(path.relative_to(root)) in ALLOWLIST:
             continue
-        offenders.extend(scan_file(path))
+        offenders.extend(scan_file(path, root))
     return offenders
 
 
@@ -176,18 +188,31 @@ def test_fake_lane_fixtures_use_synthetic_model_ids() -> None:
 
 
 _EXPIRY_RE = re.compile(r"expires (\d{4}-\d{2}-\d{2})")
+# Structured metadata: a NAMED approver (non-empty token), an approval date,
+# and an expiry date, in one anchored form.  Round-3 review N7: a bare
+# "approved " substring check let ``approved ; expires …`` through.
+_METADATA_RE = re.compile(
+    r"\(approved (?P<approver>[A-Za-z0-9][A-Za-z0-9_.-]+), "
+    r"(?P<approved>\d{4}-\d{2}-\d{2}); expires (?P<expires>\d{4}-\d{2}-\d{2})\)"
+)
 
 
 def test_allowlist_exceptions_are_documented_and_unexpired() -> None:
-    """Every exception carries a named approver and a not-yet-passed expiry."""
+    """Every exception carries a real reason, a NAMED approver, and a
+    not-yet-passed expiry."""
     today = date.today()
     for path, reason in ALLOWLIST.items():
-        assert "approved " in reason, f"{path}: exception lacks a named human approver"
-        match = _EXPIRY_RE.search(reason)
-        assert match, f"{path}: exception lacks 'expires YYYY-MM-DD'"
-        assert date.fromisoformat(match.group(1)) >= today, (
-            f"{path}: exception expired on {match.group(1)} — renew with "
-            "operator sign-off or fix the fixture"
+        assert len(reason.split("(approved")[0].strip()) >= 10, (
+            f"{path}: exception reason is too thin to audit"
+        )
+        match = _METADATA_RE.search(reason)
+        assert match, (
+            f"{path}: exception must carry "
+            "'(approved <name>, YYYY-MM-DD; expires YYYY-MM-DD)'"
+        )
+        assert date.fromisoformat(match.group("expires")) >= today, (
+            f"{path}: exception expired on {match.group('expires')} — renew "
+            "with operator sign-off or fix the fixture"
         )
 
 
@@ -263,22 +288,40 @@ def test_scanner_passes_synthetic_ids() -> None:
     assert scan_source('a="fake-model-a"; b="fake-model-b-high"; c="model-9"') == []
 
 
-def test_scanner_self_test_exemption_is_function_scoped_not_file_wide() -> None:
-    """A real id in this file OUTSIDE test_scanner_* is still an offender."""
-    source = (
-        "def test_scanner_ok() -> None:\n"
-        '    probe = "gemini-3-pro"  # in-scope, exempt\n'
-        "UNRELATED_FIXTURE_MODEL = \"gemini-4-argon\"  # out of scope\n"
+def test_scanner_self_test_exemption_is_body_scoped_exact_path() -> None:
+    """The self-test exemption is exact-path and function-BODY scoped.
+
+    Exercises the real scan_file/scan_tree paths (round-3 review: a test
+    that merely duplicates the filtering proves nothing):
+    - this file's own in-body self-test literals are exempt (scan of the
+      real file yields no findings from inside test_scanner_* bodies);
+    - a real id in a test_scanner_* DEFAULT ARGUMENT is still flagged (N9);
+    - a nested file that merely SHARES this file's basename and defines
+      test_scanner_* functions gets no exemption (N8).
+    """
+    # (a) the real file scans clean apart from documented allowlisted shapes
+    assert scan_file(TESTS_DIR / SELF_TEST_FILE) == []
+
+    # (b) default-argument id is NOT exempt (signature is not body)
+    default_src = 'def test_scanner_r3(probe="gemini-3-pro") -> None:\n    return None\n'
+    tree = ast.parse(default_src)
+    findings = scan_source(default_src)
+    body_lines = _self_test_body_lines(tree)
+    kept = [(lineno, hit) for lineno, hit in findings if lineno in body_lines]
+    assert findings == [(1, "gemini-3")] and kept == [], (
+        "default-argument ids must be flagged, body literals exempt"
     )
-    tree = ast.parse(source)
-    ranges = _self_test_ranges(tree)
-    findings = scan_source(source)
-    filtered = [
-        (lineno, hit)
-        for lineno, hit in findings
-        if not any(start <= lineno <= end for start, end in ranges)
-    ]
-    assert filtered == [(3, "gemini-4")], (
-        "self-test exemption leaked file-wide — outside-scope fixture ids "
-        "must remain flagged"
+
+    # (c) nested same-basename impostor gets no exemption
+    import shutil
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        impostor = root / "sub" / SELF_TEST_FILE
+        impostor.parent.mkdir()
+        shutil.copyfile(TESTS_DIR / SELF_TEST_FILE, impostor)
+        offenders = scan_tree(root)
+    assert any("gemini-3" in line or "gemini-4" in line for line in offenders), (
+        "a nested file with the scanner's basename claimed the exemption (N8)"
     )

@@ -304,31 +304,50 @@ def test_parked_gate_growth_delegates_and_adopts_verdict(
     assert baseline == ((reported, 90_000) if verdict else (100_000, 90_000))
 
 
-def test_parked_gate_delegates_estimator_to_shared_transcript_tokens(
+def test_parked_gate_delegates_estimator_on_both_gate_paths(
     monkeypatch, tmp_path
 ) -> None:
-    """The gate's ``local`` yardstick must BE the shared estimator's output.
+    """The gate's ``local`` yardstick must BE the shared estimator's output
+    on BOTH the first-turn and the growth path.
 
     Round-2 review mutant: the gate inlined ``sum(len(m["content"]) // 3 + 1
     for m in messages)`` while keeping the import — identical on ASCII,
-    divergent on CJK/tool-calls.  The estimator spy returns a sentinel no
-    inline yardstick could produce; the decision spy must receive it.
+    divergent on CJK/tool-calls.  Round-3 review mutant N6: the inline copy
+    placed AFTER the first-turn branch, so a first-turn-only sentinel test
+    passed while the growth path lost the yardstick.  The estimator spy
+    returns a sentinel no inline yardstick could produce; BOTH decision
+    spies must receive it.
     """
     _client, _contract, conversation = _load_package(monkeypatch, tmp_path)
     monkeypatch.setattr(conversation, "transcript_tokens", lambda messages: 4_242)
-    seen = []
 
-    def spy_first(*, reported, local):
-        seen.append((reported, local))
-        return True
-
-    monkeypatch.setattr(conversation, "first_turn_report_plausible", spy_first)
+    # First-turn path.
+    first_seen = []
+    monkeypatch.setattr(
+        conversation, "first_turn_report_plausible",
+        lambda **kw: first_seen.append((kw["reported"], kw["local"])) or True,
+    )
     kept, baseline = _parked_gate(conversation, None, 4_242, _messages(30))
-    assert seen == [(4_242, 4_242)], (
-        "parked gate did not route its local estimate through the shared "
-        "transcript_tokens (inline yardstick re-fork)"
+    assert first_seen == [(4_242, 4_242)], (
+        "parked first-turn path did not route its local estimate through the "
+        "shared transcript_tokens (inline yardstick re-fork)"
     )
     assert kept is not None and baseline == (4_242, 4_242)
+
+    # Growth path (N6: inline copy after the first-turn branch).
+    growth_seen = []
+
+    def spy_growth(**kw):
+        growth_seen.append((kw["prev_reported"], kw["reported"], kw["prev_local"], kw["local"]))
+        return True, 1, 1
+
+    monkeypatch.setattr(conversation, "reported_usage_growth_consistent", spy_growth)
+    kept, baseline = _parked_gate(conversation, (100_000, 90_000), 105_000, _messages(30))
+    assert growth_seen == [(100_000, 105_000, 90_000, 4_242)], (
+        "parked growth path did not route its local estimate through the "
+        "shared transcript_tokens (N6 growth-only inline yardstick)"
+    )
+    assert kept is not None and baseline == (105_000, 4_242)
 
 
 def test_replay_guard_adopts_native_tokens_as_local_yardstick(
