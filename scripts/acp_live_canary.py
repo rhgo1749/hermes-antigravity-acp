@@ -18,19 +18,16 @@ Engines (--mode default only):
   replay       legacy flat client; the historical default, behavior frozen.
   parked       issue #93: the deployed Parked-MCP provider/client driven
                through its Hermes-facing facade (model discovery and
-               selection success, plain response, one harmless harness-owned
-               MCP tool parked inside a single held prompt with a unique
-               sentinel proving delivery, same-conversation follow-up, usage
-               contract through the shared gate, containment declaration and
-               native-permission enforcement, cancellation, teardown).  The
-               whole parked run is bounded by --timeout and its children are
-               cancelled and reaped on expiry.  Requires exactly one
-               execution lane: --fake-acp-only (explicit fake ACP binary;
-               engine env/launcher resolution disabled) or
-               --operator-supervised-live (attended terminal + typed
-               approval; never CI).  Parked exit codes: 0 all verdicts pass,
-               1 error or fail, 2 refused preflight, 3 inconclusive (the run
-               did NOT fully verify the contract).  See docs/live-canary.md.
+               selection, plain response, one harmless harness-owned MCP tool
+               parked inside a single held prompt with a sentinel proving
+               delivery, same-conversation follow-up, #87 usage gate,
+               containment observation, cancellation, direct-child teardown).
+               Requires POSIX SIGALRM on the main thread (--timeout bounds
+               the run) and exactly one lane: --fake-acp-only (explicit fake
+               binary; env/launcher resolution disabled) or
+               --operator-supervised-live (attended TTY + typed approval).
+               Exit codes: 0 pass, 1 error/fail, 2 refused preflight,
+               3 inconclusive.  See docs/live-canary.md.
 
 Evidence correlation: every frame keeps the JSON-RPC id (in strict
 raw-probe mode a server-chosen id persists only as a deterministic
@@ -374,35 +371,43 @@ def _redact_factory(client_module: Any):
     return clean_text
 
 
-# The parked lane's loopback MCP endpoint carries per-run secrets in the URL
-# path (parked_mcp._path); the path must never persist even though the host
-# and port are harmless.
 _LOOPBACK_MCP_URL_RE = re.compile(
     r"(?P<origin>https?://(?:127\.0\.0\.1|localhost|\[::1\])(?::\d+)?)/(?P<path>[^\s\"']*)"
 )
+_SECRET_KEY_EXACT = frozenset({
+    "token", "password", "passwd", "secret", "credential", "credentials",
+    "authorization", "proxyauthorization", "apikey", "xapikey",
+    "cookie", "setcookie", "privatekey", "authcode", "authorizationcode",
+})
+_SECRET_KEY_FRAGMENTS = (
+    "accesstoken", "refreshtoken", "idtoken", "oauthtoken",
+    "bearertoken", "sessiontoken", "csrftoken", "clientsecret",
+    "apikey", "privatekey", "secret", "password", "passwd",
+    "credential", "authorization", "cookie", "authcode",
+)
+
+
+def _is_secret_key(key: Any) -> bool:
+    if not isinstance(key, str):
+        return False
+    norm = re.sub(r"[^a-z0-9]", "", key.lower())
+    return norm in _SECRET_KEY_EXACT or any(frag in norm for frag in _SECRET_KEY_FRAGMENTS)
 
 
 class _ParkedRedactor:
-    """Parked-lane redactor: the plugin's own ACP error redactor plus
-    per-run dynamic secrets learned from the frames themselves.
-
-    Session ids and the loopback MCP bearer/path are minted per run and have
-    no fixed shape, so pattern redaction alone cannot catch them when they
-    resurface inside server responses.  The sanitizer registers each raw
-    value the moment it first appears (and replaces it structurally there);
-    every later occurrence in any frame, log line or summary field is
-    replaced by the same redactor.  Reuses the replay engine's
-    ``_redact_acp_error_detail`` for the fixed secret shapes (Bearer,
-    secret assignments, bare tokens, OAuth URLs) rather than duplicating it.
-    """
+    """Reuses the plugin's ``_redact_acp_error_detail`` plus per-run secrets."""
 
     def __init__(self, base: Any) -> None:
         self._base = base
         self._extra: set[str] = set()
 
     def add_secret(self, value: Any) -> None:
-        if isinstance(value, str) and len(value) >= 8:
+        if not isinstance(value, str):
+            return
+        if len(value) >= 8:
             self._extra.add(value)
+        if value.lower().startswith("bearer "):
+            self.add_secret(value.split(None, 1)[1])
 
     def __call__(self, text: Any) -> str:
         if not isinstance(text, str):
@@ -411,22 +416,26 @@ class _ParkedRedactor:
             text = self._base(text) or ""
         for secret in sorted(self._extra, key=len, reverse=True):
             text = text.replace(secret, "<run-secret>")
-        text = _LOOPBACK_MCP_URL_RE.sub(
+        return _LOOPBACK_MCP_URL_RE.sub(
             lambda m: m.group("origin") + "/<path-redacted>", text)
-        return text
 
 
-_SECRET_HEADER_NAMES = {"authorization", "proxy-authorization", "x-api-key", "api-key"}
+def _register_secret_leaves(node: Any, redactor: _ParkedRedactor) -> None:
+    if isinstance(node, str):
+        redactor.add_secret(node)
+    elif isinstance(node, dict):
+        for val in node.values():
+            _register_secret_leaves(val, redactor)
+    elif isinstance(node, list):
+        for item in node:
+            _register_secret_leaves(item, redactor)
 
 
 def _redact_structural(node: Any, redactor: _ParkedRedactor) -> Any:
-    """Replace per-run secret-bearing protocol members at every nesting level.
-
-    Returns a structure safe to hand to the legacy sanitizer; the raw values
-    are registered with the redactor first so free-text mentions in later
-    frames are covered too.
-    """
+    """Structurally redact session ids, loopback MCP paths, and secret JSON fields."""
     if isinstance(node, dict):
+        is_secret_kv = "value" in node and _is_secret_key(
+            node.get("name") if "name" in node else node.get("key"))
         out: dict[str, Any] = {}
         for key, value in node.items():
             if key == "sessionId" and isinstance(value, str) and value:
@@ -436,20 +445,16 @@ def _redact_structural(node: Any, redactor: _ParkedRedactor) -> Any:
             elif key == "url" and isinstance(value, str):
                 match = _LOOPBACK_MCP_URL_RE.fullmatch(value.strip())
                 if match:
-                    redactor.add_secret(match.group("path"))
+                    mcp_path = match.group("path")
+                    redactor.add_secret(mcp_path)
+                    for seg in mcp_path.split("/"):
+                        redactor.add_secret(seg)
                     out[key] = match.group("origin") + "/<path-redacted>"
                 else:
                     out[key] = value
-            elif key == "headers" and isinstance(value, list):
-                safe: list[Any] = []
-                for item in value:
-                    if (isinstance(item, dict)
-                            and str(item.get("name", "")).lower()
-                            in _SECRET_HEADER_NAMES):
-                        redactor.add_secret(str(item.get("value", "")))
-                        item = {**item, "value": "<redacted>"}
-                    safe.append(item)
-                out[key] = safe
+            elif (key == "value" and is_secret_kv) or _is_secret_key(key):
+                _register_secret_leaves(value, redactor)
+                out[key] = "<redacted>"
             else:
                 out[key] = _redact_structural(value, redactor)
         return out
@@ -458,20 +463,7 @@ def _redact_structural(node: Any, redactor: _ParkedRedactor) -> Any:
     return node
 
 
-def _make_parked_sanitizer(redactor: _ParkedRedactor):
-    """Parked-lane frame sanitizer: structural secret registration on top of
-    the established default-mode sanitizer (which is kept byte-compatible
-    for the replay lane)."""
-
-    def sanitize_parked(frame: Any, clean_text: Any) -> Any:
-        return _sanitize(_redact_structural(frame, redactor), clean_text)
-
-    return sanitize_parked
-
-
 def _teardown_verdict(exited: list[bool]) -> str:
-    """Direct-children teardown verdict: a child we spawned that we could
-    not confirm exited is a FAILURE, not an inconclusive observation."""
     if not exited:
         return "inconclusive"
     return "pass" if all(exited) else "fail"
@@ -1278,65 +1270,26 @@ def _git_revision(repo: Path) -> str | None:
 
 def _parked_connections_teardown(parked_client: Any,
                                  spawned: list[Any]) -> tuple[list[Any], list[bool]]:
-    """Close every conversation the run registered and report whether each
-    ACP direct child this run spawned is confirmed exited."""
+    """Close registered conversations and any remaining spawned ACP connections."""
     for registry in list(parked_client._registries.values()):
         registry.close_all()
     parked_client._registries.clear()
-    deadline = time.monotonic() + 10.0
-    exited: list[bool] = []
     for conn in spawned:
-        while time.monotonic() < deadline:
-            proc = getattr(conn, "_proc", None)
-            if (getattr(conn, "exited", False)
-                    or (proc is not None and proc.returncode is not None)):
-                break
-            time.sleep(0.05)
         proc = getattr(conn, "_proc", None)
-        exited.append(bool(
-            getattr(conn, "exited", False)
-            or (proc is not None and proc.returncode is not None)))
+        if proc is not None and proc.returncode is None:
+            conn.close()
+    exited = [
+        bool(getattr(conn, "exited", False)
+             or (getattr(conn, "_proc", None) is not None
+                 and conn._proc.returncode is not None))
+        for conn in spawned
+    ]
     return spawned, exited
 
 
 def run_parked(args, module, recorder: FrameRecorder, evidence_dir: Path,
                started: float) -> int:
-    """Issue #93: drive the deployed Parked-MCP provider/client as Hermes does.
-
-    No mock engine and no protocol re-implementation: the engine modules are
-    imported from the loaded plugin package and driven through the same
-    OpenAI-shaped facade Hermes calls.  ACP stdio is teed into the frame
-    recorder by wrapping the engine's own ``AcpConnection`` at spawn time.
-    The driver answers parked tool calls with a canned, uniquely-tagged
-    sentinel string; it never executes anything on the host, and the parked
-    round only PASSES when that sentinel is echoed back by the model (proof
-    the result was delivered into the same held prompt), never on a merely
-    non-empty answer.
-
-    Fake-lane isolation (``--fake-acp-only``): an explicit ``--command`` fake
-    binary is mandatory; the engine's own env/launcher resolution
-    (``HERMES_ANTIGRAVITY_ACP_MCP_COMMAND`` / ``HERMES_ANTIGRAVITY_ACP_COMMAND``
-    / official launcher) is scrubbed for the run and the command is rejected
-    when it resolves (realpath) to the official launcher, so the lane can
-    never implicitly reach a real launcher, MUX configuration, authentication
-    or inference.
-
-    Evidence hygiene: frames, engine log facts, answers and errors pass
-    through ``_ParkedRedactor`` — the plugin's own ACP error redactor plus
-    per-run dynamic secrets (session ids, loopback MCP bearer and URL path)
-    registered the moment they first appear.
-
-    ``--timeout`` bounds the WHOLE parked run (wall clock, SIGALRM); on
-    expiry or any error the finally block cancels in-flight engine work and
-    tears down every session and ACP child the canary owns before reporting.
-
-    Verdicts are per-probe ``pass`` / ``fail`` (contract exercised and
-    breached) / ``inconclusive`` (probe could not be exercised).  A direct
-    child that fails to exit is ``fail``, never hidden as inconclusive.
-    Exit codes: 0 = every verdict pass; 1 = error or any fail; 2 = refused
-    preflight; 3 = no fail but at least one inconclusive (the run did NOT
-    fully verify the contract).
-    """
+    """Issue #93: drive the deployed Parked-MCP provider/client outside the gateway."""
     import importlib
 
     pkg = module.__name__
@@ -1344,28 +1297,18 @@ def run_parked(args, module, recorder: FrameRecorder, evidence_dir: Path,
     parked_acp = importlib.import_module(pkg + ".parked.acp_connection")
     parked_session = importlib.import_module(pkg + ".parked.session")
     parked_usage = importlib.import_module(pkg + ".parked.usage_contract")
+    parked_upstream = importlib.import_module(pkg + ".parked._upstream")
+    client_module = importlib.import_module(pkg + ".client")
 
-    # Reuse the plugin's established redactor for the fixed secret shapes;
-    # _ParkedRedactor adds the per-run dynamic secrets on top.
-    redactor = _ParkedRedactor(getattr(
-        importlib.import_module(pkg + ".client"),
-        "_redact_acp_error_detail", None))
+    redactor = _ParkedRedactor(
+        getattr(parked_upstream, "_redact_acp_error_detail", None))
     clean_text = redactor
     recorder._clean = redactor
-    recorder._sanitize = _make_parked_sanitizer(redactor)
+    recorder._sanitize = lambda frame, ct: _sanitize(
+        _redact_structural(frame, redactor), ct)
 
     scrubbed: dict[str, str] = {}
     if args.fake_acp_only:
-        # Fake-lane isolation is structural, not name-based: the command is
-        # explicit, the engine's resolution env is removed for the run, and
-        # the official launcher is refused by resolved path, not basename.
-        if args.command is None:
-            print(
-                "parked fake lane requires an explicit --command fake ACP "
-                "binary; the engine's env/launcher resolution is disabled in "
-                "this lane", file=sys.stderr,
-            )
-            return 2
         command = args.command
         for var in ("HERMES_ANTIGRAVITY_ACP_MCP_COMMAND",
                     "HERMES_ANTIGRAVITY_ACP_COMMAND"):
@@ -1373,37 +1316,24 @@ def run_parked(args, module, recorder: FrameRecorder, evidence_dir: Path,
                 scrubbed[var] = os.environ.pop(var)
         official = parked_client._default_official_command()
         if official and os.path.realpath(command) == os.path.realpath(official):
-            print(
-                "parked fake lane command resolves to the official launcher; "
-                "refusing", file=sys.stderr,
-            )
+            print("parked fake lane command resolves to the official launcher; refusing",
+                  file=sys.stderr)
             os.environ.update(scrubbed)
             return 2
     else:
         command = args.command or parked_client._default_command()[0]
-    # The canary is a standalone client, not a Hermes conversation.  Inside a
-    # Hermes-hosted process the engine keys EVERY request to one conversation
-    # via HERMES_SESSION_KEY/HERMES_SESSION_ID, which would collapse the
-    # canary's separate probe conversations onto the main session (and let a
-    # probe retire it).  Scrub the identity for the run so the documented
-    # standalone affinity (cwd + opening user prefix) applies.
+    # Standalone client: isolate from ambient Hermes session keys so probes
+    # never collide with a parent conversation.
     for var in ("HERMES_SESSION_KEY", "HERMES_SESSION_ID"):
         if var in os.environ:
             scrubbed[var] = os.environ.pop(var)
 
-    # Tee every ACP child this run spawns.  client._spawn_factory resolves
-    # AcpConnection from the client module's globals at spawn time, and
-    # start() opens the pipes via subprocess.Popen from acp_connection's
-    # globals — both are rebound for the duration of start() only.
     original_connection = parked_acp.AcpConnection
     spawned_connections: list[Any] = []
 
     class _TeeConnection(original_connection):
         def __init__(self, *conn_args, **conn_kwargs):
             super().__init__(*conn_args, **conn_kwargs)
-            # Teardown must verify EVERY child this run spawned, not just the
-            # conversations still registered at the end (retired ones are
-            # removed from the registry while their child is still ours).
             spawned_connections.append(self)
 
         def start(self):
@@ -1424,9 +1354,6 @@ def run_parked(args, module, recorder: FrameRecorder, evidence_dir: Path,
 
     parked_client.AcpConnection = _TeeConnection  # type: ignore[attr-defined]
 
-    # Engine-side decisions (usage-gate rejections etc.) surface as fixed
-    # "acp-mcp" log lines; capture them sanitized so a gate rejection is
-    # distinguishable from a silent server omission.
     class _EngineLogCollector(logging.Handler):
         def __init__(self) -> None:
             super().__init__()
@@ -1437,9 +1364,7 @@ def run_parked(args, module, recorder: FrameRecorder, evidence_dir: Path,
                 msg = record.getMessage()
             except Exception:  # noqa: BLE001
                 return
-            if "acp-mcp" not in msg:
-                return
-            if len(self.messages) < 20:
+            if "acp-mcp" in msg and len(self.messages) < 20:
                 self.messages.append(clean_text(msg)[:200])
 
     engine_logs = _EngineLogCollector()
@@ -1474,26 +1399,22 @@ def run_parked(args, module, recorder: FrameRecorder, evidence_dir: Path,
             and entry["frame"].get("method") == method
         ]
 
-    def response_for(request_id: Any) -> dict[str, Any] | None:
+    def frame_by_id(direction: str, request_id: Any) -> dict[str, Any] | None:
         if request_id is None:
             return None
         for entry in recorder.frames:
             frame = entry.get("frame")
-            if (entry.get("dir") == "in" and isinstance(frame, dict)
+            if (entry.get("dir") == direction and isinstance(frame, dict)
                     and frame.get("id") == request_id
                     and ("result" in frame or "error" in frame)):
                 return frame
         return None
 
     def _alarm(signum: int, frame: Any) -> None:  # noqa: ANN001
-        raise CanaryTimeout(
-            f"parked lane exceeded --timeout={args.timeout}s")
+        raise CanaryTimeout(f"parked lane exceeded --timeout={args.timeout}s")
 
-    have_alarm = hasattr(signal, "SIGALRM")
-    previous_handler = None
-    if have_alarm:
-        previous_handler = signal.signal(signal.SIGALRM, _alarm)
-        signal.setitimer(signal.ITIMER_REAL, max(1.0, float(args.timeout)))
+    previous_handler = signal.signal(signal.SIGALRM, _alarm)
+    signal.setitimer(signal.ITIMER_REAL, max(1.0, float(args.timeout)))
     try:
         try:
             messages = [{"role": "user", "content": args.prompt}]
@@ -1515,12 +1436,12 @@ def run_parked(args, module, recorder: FrameRecorder, evidence_dir: Path,
             final_text = first_text
             assistant_row: dict[str, Any] | None = None
             tool_rows: list[dict[str, Any]] = []
+            turn1_completion = first
             if calls:
                 ids = [str(getattr(call, "id", "")) for call in calls]
                 tool_round["call_ids"] = ids
                 tool_round["call_id_shape_ok"] = bool(ids) and all(
-                    re.fullmatch(r"call_[0-9a-f]{32}", one) for one in ids
-                )
+                    re.fullmatch(r"call_[0-9a-f]{32}", one) for one in ids)
                 assistant_row = {
                     "role": "assistant", "content": None,
                     "tool_calls": [
@@ -1541,44 +1462,31 @@ def run_parked(args, module, recorder: FrameRecorder, evidence_dir: Path,
                     {"role": "tool", "tool_call_id": one, "content": sentinel}
                     for one in ids
                 ]
-                # Parked contract: the tool result is answered into the SAME
-                # held ACP prompt; the engine must not open a second
-                # session/prompt.
                 second = client.chat.completions.create(
                     model=args.model, messages=messages + [assistant_row, *tool_rows],
                     tools=[dict(PARKED_CANARY_TOOL)], stream=False,
                 )
+                turn1_completion = second
                 final_text = second.choices[0].message.content or ""
-                # A merely non-empty answer proves NOTHING about delivery:
-                # PASS requires the unique sentinel to come back through the
-                # model, proving the canned result reached it.
                 tool_round["sentinel_echoed_by_model"] = sentinel in final_text
             prompts_during_round = len(out_frames("session/prompt"))
             if calls:
                 tool_round["prompt_requests_across_round"] = prompts_during_round
                 if prompts_during_round != 1:
-                    # Held-prompt contract broken: a second prompt request
-                    # was opened across the parked round.
                     verdicts["parked_tool_round"] = "fail"
                 elif tool_round["call_id_shape_ok"] and tool_round["sentinel_echoed_by_model"]:
                     verdicts["parked_tool_round"] = "pass"
                 else:
-                    # Delivery into the model could not be confirmed (the
-                    # answer never repeated the sentinel): inconclusive,
-                    # never a silent pass.
                     verdicts["parked_tool_round"] = "inconclusive"
             else:
-                # The model chose not to call the advertised tool: the parked
-                # round was never exercised.  Inconclusive, not a failure.
                 verdicts["parked_tool_round"] = "inconclusive"
             verdicts["plain_response"] = "pass" if final_text.strip() else "fail"
 
             follow_text = (args.follow_up if args.follow_up is not None
                            else PARKED_FOLLOW_UP_PROMPT)
-            follow_messages = list(messages)
-            if assistant_row is not None:
-                follow_messages += [assistant_row, *tool_rows]
-            follow_messages += [
+            turn1_messages = (messages + [assistant_row, *tool_rows]
+                              if assistant_row is not None else list(messages))
+            follow_messages = turn1_messages + [
                 {"role": "assistant", "content": final_text},
                 {"role": "user", "content": follow_text},
             ]
@@ -1601,148 +1509,163 @@ def run_parked(args, module, recorder: FrameRecorder, evidence_dir: Path,
                 "pass" if follow_up["same_session_no_new"] else "fail"
             )
 
+            # Usage contract (#87): distinguish server report anomaly from engine
+            # contract success (rejecting anomalous usage is PASS).
             usage = getattr(third, "usage", None)
+            turn1_usage = getattr(turn1_completion, "usage", None)
             observations = getattr(third, "antigravity_usage_observations", None)
-            summary["usage"] = {
-                # OpenAI-style names as the deployed facade exposes them.
-                "final_turn_reported": None if usage is None else {
-                    "prompt_tokens": getattr(usage, "prompt_tokens", None),
-                    "completion_tokens": getattr(usage, "completion_tokens", None),
-                    "total_tokens": getattr(usage, "total_tokens", None),
-                },
-                "observations_present": bool(observations),
-                "observations": _sanitize(observations, clean_text) if observations else None,
-                "local_estimate_tokens": parked_usage.transcript_tokens(follow_messages),
-                "gate_rejection_logged": any(
-                    "rejected" in line for line in engine_logs.messages),
-                "billing_claim": "none; server-reported figures are unverified telemetry",
+            local_tokens = parked_usage.transcript_tokens(follow_messages)
+            gate_rejection_logged = any(
+                "rejected" in line for line in engine_logs.messages)
+            reported_dict = None if usage is None else {
+                "prompt_tokens": getattr(usage, "prompt_tokens", None),
+                "completion_tokens": getattr(usage, "completion_tokens", None),
+                "total_tokens": getattr(usage, "total_tokens", None),
             }
-            # Existence of a usage figure alone verifies nothing: PASS
-            # requires the server-reported usage to have PASSED the shared
-            # usage gate against the local estimate.  A logged gate
-            # rejection means the server sent contract-violating usage:
-            # exercised and breached -> fail.
-            if summary["usage"]["gate_rejection_logged"]:
-                verdicts["usage_contract"] = "fail"
-            elif (summary["usage"]["final_turn_reported"] is not None
-                    and summary["usage"]["local_estimate_tokens"]):
+            if usage is not None and local_tokens:
+                reported_in = getattr(usage, "prompt_tokens", None)
+                t1_in = getattr(turn1_usage, "prompt_tokens", None) if turn1_usage is not None else None
+                if not isinstance(reported_in, int):
+                    plausible = False
+                elif isinstance(t1_in, int):
+                    t1_local = parked_usage.transcript_tokens(turn1_messages)
+                    growth_ok, _, _ = parked_usage.reported_usage_growth_consistent(
+                        prev_reported=t1_in, reported=reported_in,
+                        prev_local=t1_local, local=local_tokens,
+                    )
+                    plausible = (
+                        parked_usage.first_turn_report_plausible(
+                            reported=t1_in, local=t1_local)
+                        and growth_ok
+                    )
+                else:
+                    plausible = parked_usage.first_turn_report_plausible(
+                        reported=reported_in, local=local_tokens)
+                server_report_status = "plausible" if plausible else "anomalous_accepted"
+                verdicts["usage_contract"] = "pass" if plausible else "fail"
+            elif usage is None and gate_rejection_logged:
+                server_report_status = "anomalous_rejected"
                 verdicts["usage_contract"] = "pass"
             else:
+                server_report_status = "unavailable"
                 verdicts["usage_contract"] = "inconclusive"
 
+            summary["usage"] = {
+                "final_turn_reported": reported_dict,
+                "server_report_status": server_report_status,
+                "observations_present": bool(observations),
+                "observations": recorder._sanitize(observations, clean_text) if observations else None,
+                "local_estimate_tokens": local_tokens,
+                "gate_rejection_logged": gate_rejection_logged,
+                "billing_claim": "none; server-reported figures are unverified telemetry",
+            }
+
+            # Containment: observe disabledTools on session/new plus any actual
+            # non-MCP permission requests (zero native grants allowed).
             disabled: list[str] = []
+            mcp_server_names: set[str] = set()
             for entry in out_frames("session/new"):
-                meta = ((entry["frame"].get("params") or {}).get("_meta") or {})
-                antigravity = meta.get("antigravity") or {}
-                listed = antigravity.get("disabledTools")
+                params = entry["frame"].get("params") or {}
+                for srv in params.get("mcpServers") or []:
+                    if isinstance(srv, dict) and srv.get("name"):
+                        mcp_server_names.add(str(srv["name"]))
+                listed = ((params.get("_meta") or {}).get("antigravity") or {}).get("disabledTools")
                 if isinstance(listed, list):
                     disabled = [str(one) for one in listed]
             native_tools = [str(one) for one in getattr(parked_session, "NATIVE_TOOLS", [])]
-            # Evidence lists are capped by the sanitizer; a truncated recording
-            # must never masquerade as a mismatch.  The authoritative set
-            # equality is asserted against the fake's own request log in tests.
             recorded_prefix_ok = bool(
-                disabled
-                and native_tools
-                and disabled == native_tools[:len(disabled)]
-            )
+                disabled and native_tools and disabled == native_tools[:len(disabled)])
+
+            native_perm_observed = native_perm_refused = native_perm_allowed = 0
+            for entry in recorder.frames:
+                frame = entry.get("frame")
+                if not (entry.get("dir") == "in" and isinstance(frame, dict)
+                        and frame.get("method") == "session/request_permission"):
+                    continue
+                params = frame.get("params") or {}
+                tool_call = params.get("toolCall") or {}
+                meta = tool_call.get("_meta") or {}
+                mcp_meta = meta.get("mcp") if isinstance(meta, dict) else None
+                is_ours = (
+                    isinstance(meta, dict) and meta.get("is_mcp_tool_call") is True
+                    and isinstance(mcp_meta, dict)
+                    and str(mcp_meta.get("server") or "") in mcp_server_names
+                )
+                if is_ours:
+                    continue
+                native_perm_observed += 1
+                opt_kinds = {
+                    str(opt.get("optionId")): str(opt.get("kind"))
+                    for opt in params.get("options") or [] if isinstance(opt, dict)
+                }
+                resp = frame_by_id("out", frame.get("id"))
+                outcome = ((resp or {}).get("result") or {}).get("outcome") or {}
+                kind = ("cancelled" if outcome.get("outcome") == "cancelled"
+                        else opt_kinds.get(str(outcome.get("optionId")), ""))
+                if kind.startswith("allow"):
+                    native_perm_allowed += 1
+                elif resp is not None:
+                    native_perm_refused += 1
+
             summary["containment"] = {
                 "disabled_native_tools_recorded": len(disabled) or None,
                 "engine_declared_native_tools": len(native_tools) or None,
                 "recorded_matches_engine_declaration_prefix": recorded_prefix_ok,
                 "run_command_in_engine_native_tools": "run_command" in native_tools,
+                "native_permission_requests_observed": native_perm_observed,
+                "native_permission_requests_refused": native_perm_refused,
+                "native_permission_requests_allowed": native_perm_allowed,
             }
-            # This verdict covers the DECLARATION only (config delivery).
-            # Whether a native tool would actually be BLOCKED at execution
-            # time is a separate verdict exercised by the permission probe
-            # below; conflating the two would let a config echo stand in
-            # for enforcement.
-            verdicts["containment_declaration"] = (
-                "pass" if recorded_prefix_ok and "run_command" in native_tools
-                else "inconclusive"
-            )
-
-            probe_id: Any = None
-            probe_options: dict[str, str] = {}
-            probe_outcome: dict[str, Any] = {}
-            for entry in recorder.frames:
-                frame = entry.get("frame")
-                if not isinstance(frame, dict):
-                    continue
-                if (entry.get("dir") == "in"
-                        and frame.get("method") == "session/request_permission"):
-                    tool_call = (frame.get("params") or {}).get("toolCall") or {}
-                    label = " ".join(str(tool_call.get(k) or "")
-                                     for k in ("name", "title"))
-                    if "canary-native-probe" in label:
-                        probe_id = frame.get("id")
-                        for option in (frame.get("params") or {}).get("options") or []:
-                            if isinstance(option, dict):
-                                probe_options[str(option.get("optionId"))] = str(
-                                    option.get("kind"))
-                elif (probe_id is not None and "raw" not in probe_outcome
-                        and entry.get("dir") == "out" and frame.get("id") == probe_id
-                        and ("result" in frame or "error" in frame)):
-                    probe_outcome["raw"] = (frame.get("result") or {}).get("outcome")
-            summary["native_permission_probe"] = {
-                "observed": probe_id is not None,
-                "outcome": _sanitize(probe_outcome.get("raw"), clean_text),
-                "options": probe_options,
-            }
-            if probe_id is None:
-                verdicts["native_tool_execution_blocked"] = "inconclusive"
+            if (native_perm_allowed > 0 or native_perm_refused < native_perm_observed
+                    or (out_frames("session/new") and not recorded_prefix_ok)):
+                verdicts["containment"] = "fail"
+            elif recorded_prefix_ok and "run_command" in native_tools:
+                verdicts["containment"] = "pass"
             else:
-                outcome = probe_outcome.get("raw")
-                kind = ""
-                if isinstance(outcome, dict):
-                    if outcome.get("outcome") == "cancelled":
-                        kind = "cancelled"
-                    else:
-                        kind = probe_options.get(str(outcome.get("optionId")), "")
-                if kind.startswith("reject") or kind == "cancelled":
-                    verdicts["native_tool_execution_blocked"] = "pass"
-                elif kind.startswith("allow"):
-                    verdicts["native_tool_execution_blocked"] = "fail"
-                else:
-                    verdicts["native_tool_execution_blocked"] = "inconclusive"
+                verdicts["containment"] = "inconclusive"
 
-            # Model selection: the REQUEST existing is not success.  Verify
-            # (a) the server actually advertised the requested model in the
-            # session/new result (real model discovery), (b) the selection
-            # request carried exactly the requested model (no silent
-            # fallback), and (c) the server's response to that request
-            # succeeded.
+            # Model discovery + selection: reuse client._session_model_ids to cover
+            # both configOptions and models.availableModels.
             advertised: list[str] = []
+            model_config_ids: set[str] = {"model"}
             new_reqs = out_frames("session/new")
             if new_reqs:
-                new_resp = response_for(new_reqs[0]["frame"].get("id"))
-                if new_resp is not None:
-                    models = (new_resp.get("result") or {}).get("models") or {}
-                    advertised = [
-                        str(m.get("modelId"))
-                        for m in models.get("availableModels") or []
-                        if isinstance(m, dict)
-                    ]
+                new_resp = frame_by_id("in", new_reqs[0]["frame"].get("id"))
+                new_result = new_resp.get("result") if isinstance(new_resp, dict) else None
+                if isinstance(new_result, dict):
+                    advertised = client_module._session_model_ids(new_result)
+                    model_config_ids.update(
+                        str(opt.get("id") or "model")
+                        for opt in client_module._model_config_options(new_result)
+                    )
             exact_request: dict[str, Any] | None = None
             fallback_request: dict[str, Any] | None = None
             for entry in (out_frames("session/set_model")
                           + out_frames("session/set_config_option")):
-                params = entry["frame"].get("params") or {}
-                candidate = params.get("modelId", params.get("value"))
+                req = entry["frame"]
+                params = req.get("params") or {}
+                if req.get("method") == "session/set_config_option":
+                    if str(params.get("configId") or "") not in model_config_ids:
+                        continue
+                    candidate = params.get("value")
+                else:
+                    candidate = params.get("modelId")
                 if candidate is None:
                     continue
                 if str(candidate) == args.model:
-                    exact_request = entry["frame"]
+                    exact_request = req
                 elif fallback_request is None:
-                    fallback_request = entry["frame"]
+                    fallback_request = req
             selection_request = exact_request or fallback_request
             selection_response = (
-                response_for(selection_request.get("id"))
+                frame_by_id("in", selection_request.get("id"))
                 if selection_request is not None else None)
             selection_ok = bool(
                 isinstance(selection_response, dict)
                 and "result" in selection_response
                 and "error" not in selection_response)
+            selection_err = bool(
+                isinstance(selection_response, dict) and "error" in selection_response)
             summary["model_selection"] = {
                 "requested": args.model,
                 "advertised_ids": advertised[:40],
@@ -1750,31 +1673,18 @@ def run_parked(args, module, recorder: FrameRecorder, evidence_dir: Path,
                     "exact" if exact_request is not None
                     else ("fallback" if fallback_request is not None else None)),
                 "selection_response_ok": selection_ok,
-                "selection_response_error": bool(
-                    isinstance(selection_response, dict)
-                    and "error" in selection_response),
+                "selection_response_error": selection_err,
             }
             if selection_request is None:
                 verdicts["model_selection"] = "inconclusive"
-            elif summary["model_selection"]["selection_response_error"]:
+            elif selection_err or exact_request is None:
                 verdicts["model_selection"] = "fail"
-            elif not selection_ok:
-                verdicts["model_selection"] = "inconclusive"
-            elif exact_request is None:
-                # The engine selected a DIFFERENT model than requested.
-                verdicts["model_selection"] = "fail"
-            elif not advertised or args.model not in advertised:
-                # Selection succeeded but the server never advertised the
-                # model: real discovery is unverified.
+            elif not selection_ok or not advertised or args.model not in advertised:
                 verdicts["model_selection"] = "inconclusive"
             else:
                 verdicts["model_selection"] = "pass"
 
-            # Cancellation: start a throwaway completion on its own fresh
-            # conversation, wait until the engine has actually issued the
-            # session/prompt (visible in the tee), then interrupt through
-            # the facade's cancel() and require BOTH the vendor-visible
-            # session/cancel notification and an interrupted request.
+            # Cancellation: issue a prompt on a throwaway conversation and abort it.
             cancel_probe = {"attempted": True}
             prompts_before = len(out_frames("session/prompt"))
             thread_result: dict[str, Any] = {}
@@ -1807,11 +1717,8 @@ def run_parked(args, module, recorder: FrameRecorder, evidence_dir: Path,
             if not cancel_probe["prompt_issued"]:
                 verdicts["cancel_path"] = "inconclusive"
             elif (cancel_probe["thread_alive"]
-                    or not cancel_probe["session_cancel_sent"]):
-                verdicts["cancel_path"] = "fail"
-            elif thread_result.get("outcome") in (None, "returned"):
-                # cancel() was issued yet the request completed normally:
-                # the interrupt path did not take effect.
+                    or not cancel_probe["session_cancel_sent"]
+                    or thread_result.get("outcome") in (None, "returned")):
                 verdicts["cancel_path"] = "fail"
             else:
                 verdicts["cancel_path"] = "pass"
@@ -1820,16 +1727,11 @@ def run_parked(args, module, recorder: FrameRecorder, evidence_dir: Path,
         except Exception as exc:  # noqa: BLE001 - the canary reports, never re-raises
             error = clean_text(f"{type(exc).__name__}: {exc}")[:400]
     finally:
-        if have_alarm:
-            signal.setitimer(signal.ITIMER_REAL, 0)
-            if previous_handler is not None:
-                signal.signal(signal.SIGALRM, previous_handler)
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
         os.environ.update(scrubbed)
         engine_logger.removeHandler(engine_logs)
         try:
-            # Stop any in-flight engine work (a timed-out prompt, the cancel
-            # probe thread) BEFORE reaping, so teardown never races a live
-            # request.
             client.cancel()
         except Exception:  # noqa: BLE001
             pass
@@ -1849,8 +1751,6 @@ def run_parked(args, module, recorder: FrameRecorder, evidence_dir: Path,
             "direct_children_exited": all(exited) if exited else None,
             "descendant_tree": "not asserted (issue #94 F-3 is out of scope)",
         }
-        # A direct child we spawned that did not exit is OUR failure, never
-        # hidden behind inconclusive.
         verdicts["normal_teardown"] = _teardown_verdict(exited)
         recorder._fh.close()
 
@@ -1881,7 +1781,6 @@ def run_parked(args, module, recorder: FrameRecorder, evidence_dir: Path,
     if "inconclusive" in verdicts.values():
         return 3
     return 0
-
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -1984,11 +1883,18 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 2
+        if not hasattr(signal, "SIGALRM") or threading.current_thread() is not threading.main_thread():
+            print(
+                "--engine parked requires POSIX SIGALRM on the main thread for "
+                "--timeout enforcement",
+                file=sys.stderr,
+            )
+            return 2
         if args.fake_acp_only and args.command is None:
             print(
                 "parked fake lane requires an explicit --command fake ACP "
                 "binary; the engine's env/launcher resolution is disabled in "
-                "this lane, so an implicit real launcher is impossible",
+                "this lane",
                 file=sys.stderr,
             )
             return 2
