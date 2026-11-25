@@ -123,15 +123,17 @@ def scan_source(source: str) -> list[tuple[int, str]]:
     return findings
 
 
-def _self_test_body_lines(tree: ast.AST) -> set[int]:
-    """Linenos INSIDE test_scanner_* function BODIES only.
+def _self_test_exempt_nodes(tree: ast.AST) -> set[int]:
+    """id()s of string Constant nodes inside test_scanner_* function BODIES.
 
-    Round-3 review N9: line-RANGE exemptions also covered the signature,
-    so a real id in a default argument (``def test_scanner_x(p="gpt-4")``)
-    escaped.  Body statements' nodes only — decorators, defaults, and
-    annotations are not exempt.
+    Round-3 review N9: line-RANGE exemptions covered the signature, so a
+    real id in a default argument escaped.  Round-4 review N11: filtering
+    by LINE conflates nodes sharing a line — a one-line function's default
+    argument sits on the same line as its body.  Exempt by NODE IDENTITY
+    within body subtrees; decorators, defaults, and annotations are not
+    body nodes and stay flagged.
     """
-    lines: set[int] = set()
+    exempt: set[int] = set()
     for node in ast.walk(tree):
         if (
             isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
@@ -139,10 +141,37 @@ def _self_test_body_lines(tree: ast.AST) -> set[int]:
         ):
             for stmt in node.body:
                 for child in ast.walk(stmt):
-                    lineno = getattr(child, "lineno", None)
-                    if lineno is not None:
-                        lines.add(lineno)
-    return lines
+                    if isinstance(child, ast.Constant) and isinstance(child.value, str):
+                        exempt.add(id(child))
+    return exempt
+
+
+def _scan_parsed_tree(
+    tree: ast.AST, exempt_constants: set[int] | None = None
+) -> list[tuple[int, str]]:
+    """Core string-literal scan over ONE parsed tree.
+
+    ``exempt_constants`` is a set of node id()s from THIS tree — id()s
+    across separately-parsed trees are unrelated objects and must never be
+    mixed (round-4 review N11 follow-through).
+    """
+    docstrings = _docstring_nodes(tree)
+    findings = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if id(node) in docstrings:
+                continue
+            if exempt_constants is not None and id(node) in exempt_constants:
+                continue
+            for hit in _flagged_occurrences(node.value):
+                findings.append((node.lineno, hit))
+    return findings
+
+
+def scan_source_with_self_test_exemption(source: str) -> list[tuple[int, str]]:
+    """Scan one source, exempting string literals inside test_scanner_* bodies."""
+    tree = ast.parse(source)
+    return _scan_parsed_tree(tree, _self_test_exempt_nodes(tree))
 
 
 def _is_self_test_file(path: Path) -> bool:
@@ -153,10 +182,10 @@ def _is_self_test_file(path: Path) -> bool:
 
 def scan_file(path: Path, root: Path | None = None) -> list[str]:
     source = path.read_text(encoding="utf-8")
-    findings = scan_source(source)
     if _is_self_test_file(path):
-        body_lines = _self_test_body_lines(ast.parse(source))
-        findings = [(lineno, hit) for lineno, hit in findings if lineno not in body_lines]
+        findings = scan_source_with_self_test_exemption(source)
+    else:
+        findings = scan_source(source)
     rel = path.relative_to(root) if root is not None else path.relative_to(TESTS_DIR)
     return [
         f"{rel}:{lineno}: real vendor model id {hit!r} "
@@ -210,6 +239,12 @@ def test_allowlist_exceptions_are_documented_and_unexpired() -> None:
             f"{path}: exception must carry "
             "'(approved <name>, YYYY-MM-DD; expires YYYY-MM-DD)'"
         )
+        # Round-4 review N12: BOTH dates must be real calendar dates, not
+        # just date-shaped strings.
+        try:
+            date.fromisoformat(match.group("approved"))
+        except ValueError as exc:
+            raise AssertionError(f"{path}: invalid approval date: {exc}") from exc
         assert date.fromisoformat(match.group("expires")) >= today, (
             f"{path}: exception expired on {match.group('expires')} — renew "
             "with operator sign-off or fix the fixture"
@@ -302,14 +337,22 @@ def test_scanner_self_test_exemption_is_body_scoped_exact_path() -> None:
     # (a) the real file scans clean apart from documented allowlisted shapes
     assert scan_file(TESTS_DIR / SELF_TEST_FILE) == []
 
-    # (b) default-argument id is NOT exempt (signature is not body)
-    default_src = 'def test_scanner_r3(probe="gemini-3-pro") -> None:\n    return None\n'
-    tree = ast.parse(default_src)
-    findings = scan_source(default_src)
-    body_lines = _self_test_body_lines(tree)
-    kept = [(lineno, hit) for lineno, hit in findings if lineno in body_lines]
-    assert findings == [(1, "gemini-3")] and kept == [], (
-        "default-argument ids must be flagged, body literals exempt"
+    # (b) default-argument id is NOT exempt, even when the default shares
+    # its line with an exempt body literal (round-4 review N11: line-based
+    # filtering conflated them; node identity does not)
+    same_line_src = (
+        'def test_scanner_r3(probe="gemini-3-pro") -> None:\n'
+        '    return "gemini-3-body"\n'
+    )
+    flagged = scan_source_with_self_test_exemption(same_line_src)
+    assert flagged == [(1, "gemini-3")], (
+        "default-argument ids must be flagged; body literals exempt — "
+        "exemption must key on node identity, not line"
+    )
+    one_line_src = 'def test_scanner_r4(probe="gpt-4"): return "gpt-4-body"\n'
+    flagged = scan_source_with_self_test_exemption(one_line_src)
+    assert flagged == [(1, "gpt-4")], (
+        "one-line def: the default on the SAME line as the body must stay flagged (N11)"
     )
 
     # (c) nested same-basename impostor gets no exemption
