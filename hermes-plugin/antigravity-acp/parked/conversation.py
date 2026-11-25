@@ -694,7 +694,8 @@ class Conversation:
                  step_deadline: float = STEP_DEADLINE_SECONDS, call_deadline: float = DEFAULT_DEADLINE_SECONDS,
                  terminal_tools: frozenset[str] = frozenset(),
                  collect_window: float = COLLECT_WINDOW_SECONDS,
-                 initial_conn: AcpConnection | None = None, cwd: str | None = None, owns_cwd: bool = False):
+                 initial_conn: AcpConnection | None = None, cwd: str | None = None, owns_cwd: bool = False,
+                 fence: str | None = None):
         self.key = key
         self._spawn = spawn  # (key, cwd) -> started + initialized AcpConnection
         self.stateless = stateless
@@ -733,7 +734,7 @@ class Conversation:
         self._usage_baseline: tuple[int, int] | None = None  # (accepted reported input, local estimate)
         self.images = _Images()  # image numbering of the current ACP session
         self._seen_sys_msgs: set[str] = set()  # sha256 of large <system-message> blocks already sent in this session
-        self.fence = "TOOL-OUTPUT-" + secrets.token_hex(4)  # unguessable to tool output, stable across replays
+        self.fence = fence or "TOOL-OUTPUT-" + secrets.token_hex(4)  # unguessable to tool output, stable across replays
         self.nudged = False  # one re-ask per user turn after a degenerate final reply
         self.last_activity = time.monotonic()
         self.last_used = time.monotonic()
@@ -856,12 +857,31 @@ class Conversation:
             raise ProviderError(f"could not open an Antigravity session: {type(error).__name__}: {error}") from None
 
     def cancel(self, token: threading.Event | None = None) -> None:
-        """Hermes interrupt (request-scoped facade ``cancel()``): fast, never waits on agy."""
+        """Hermes interrupt (request-scoped facade ``cancel()``).
+
+        User stop is TERMINAL for the conversation: the warm agy child is reaped,
+        never kept. The vendor's compute stop after ``session/cancel`` is not
+        observable here, and Core's request-slot worker may exit before a daemon
+        retiree could signal the tree — so the interrupt path itself closes the
+        connection (stdin EOF, terminate, kill; the reader thread reaps the
+        zombie). Warm reuse across turns stays for supersede/deadline/replay.
+        Fast in practice: no protocol response is awaited, only local signals.
+        """
         if token is not None:
             token.set()
+        conn, cwd, owns_cwd = None, None, False
         with self.lock:
             if token is None or self.owner_token is token:
                 self._retire("cancelled")
+                self.closed = True
+                conn, self.conn = self.conn, None
+                cwd, owns_cwd = self.cwd, self._owns_cwd
+        try:
+            if conn is not None:
+                conn.close()
+        finally:
+            if owns_cwd and cwd is not None:
+                shutil.rmtree(cwd, ignore_errors=True)
 
     def close(self) -> None:
         with self.lock:
@@ -1204,10 +1224,16 @@ class Registry:
         now = time.monotonic()
         with self._lock:
             idle = [k for k, c in self._conversations.items()
-                    if k != key and not c.live and now - c.last_used > self._idle_ttl]
+                    if k != key and not c.live and not c.closed and now - c.last_used > self._idle_ttl]
             reaped = [self._conversations.pop(k) for k in idle]
             conv = self._conversations.get(key)
-            if conv is None:
+            if conv is not None and conv.closed:
+                # A cancelled conversation is terminal: its warm child is already
+                # reaped; the next turn gets a fresh one carrying the same fence so
+                # the rendered replay prefix stays byte-identical across the stop.
+                conv = Conversation(key, self._spawn, fence=conv.fence)
+                self._conversations[key] = conv
+            elif conv is None:
                 conv = self._conversations[key] = Conversation(key, self._spawn)
         for c in reaped:
             c.close()
