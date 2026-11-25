@@ -1442,11 +1442,15 @@ def run_parked(args, module, recorder: FrameRecorder, evidence_dir: Path,
             and entry["frame"].get("method") == method
         ]
 
-    def server_prompt_usage(request_id: Any) -> dict[str, Any] | None:
-        """The server's own usage report for one session/prompt result."""
+    def server_prompt_usage(request_id: Any) -> Any:
+        """The server's own usage value on one session/prompt result, verbatim
+        for the engine parser to classify; None only when no usage was
+        reported at all (absent key / null), never a filtered malformed one."""
         response = frame_by_id("in", request_id)
-        raw = ((response or {}).get("result") or {}).get("usage")
-        return raw if isinstance(raw, dict) else None
+        result = (response or {}).get("result")
+        if not isinstance(result, dict) or result.get("usage") is None:
+            return None
+        return result["usage"]
 
     def frame_by_id(direction: str, request_id: Any) -> dict[str, Any] | None:
         if request_id is None:

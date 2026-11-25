@@ -36,6 +36,8 @@ MALFORMED_USAGE = {
                                           "outputTokens": 8, "totalTokens": 48},
     "parked_usage_malformed_negative_thought": {"inputTokens": 40, "outputTokens": 8,
                                                 "totalTokens": 48, "thoughtTokens": -1},
+    "parked_usage_malformed_scalar": "banana",
+    "parked_usage_malformed_list": [40, 8, 48],
 }
 import json
 import os as _os
@@ -209,11 +211,14 @@ while True:
                     if SCENARIO == "parked_no_sentinel"
                     else "TOOL_ROUND tools=" + ",".join(names) + " echo=" + echoed + leak)
             emit(chunk(text))
-            usage = ({"inputTokens": 10_000_000, "outputTokens": 8, "totalTokens": 10_000_008}
-                     if SCENARIO in ("parked_inflated_usage",
-                                     "parked_usage_turn1_bad_turn2_rejected")
-                     else MALFORMED_USAGE.get(SCENARIO)
-                     or {"inputTokens": 40, "outputTokens": 8, "totalTokens": 48})
+            if SCENARIO in MALFORMED_USAGE:
+                usage = MALFORMED_USAGE[SCENARIO]
+            elif SCENARIO in ("parked_inflated_usage",
+                              "parked_usage_turn1_bad_turn2_rejected"):
+                usage = {"inputTokens": 10_000_000, "outputTokens": 8,
+                         "totalTokens": 10_000_008}
+            else:
+                usage = {"inputTokens": 40, "outputTokens": 8, "totalTokens": 48}
             res = {"stopReason": "end_turn", "usage": usage}
             res.update(extra)
             emit({"jsonrpc": "2.0", "id": rpc_id, "result": res})
@@ -518,6 +523,8 @@ def test_parked_turn1_anomalous_accepted_turn2_rejected_fails_contract(
     "parked_usage_malformed_negative_input",
     "parked_usage_malformed_bool_input",
     "parked_usage_malformed_negative_thought",
+    "parked_usage_malformed_scalar",
+    "parked_usage_malformed_list",
 ))
 def test_parked_malformed_usage_rejected_passes_contract(
         canary, monkeypatch, tmp_path, scenario):
