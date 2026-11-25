@@ -410,6 +410,8 @@ def test_guard_rejects_inflated_first_turn_without_seeding_baseline(
     assert affinity not in client._TURN_USAGE_BASELINES
     payload = _state_payload(tmp_path)
     assert payload["usage_drop_counters"]["dropped_inflated_turn_usage"] == 1
+    entry = _semantics_payload(tmp_path)["usage_semantics_verdicts"][FAKE_IDENTITY]
+    assert entry["rejected_turns"] == 1
 
     sane = SimpleNamespace(prompt_tokens=115_000)
     kept = client._guard_reported_turn_usage(
