@@ -28,6 +28,7 @@ is a fail-closed divergence.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import sys
 from pathlib import Path
@@ -67,14 +68,36 @@ def main() -> int:
         print("PROBE|FAIL reason=runs-as-root")
         return 1
 
+    # Replay is created only under an explicit install-time declaration; the
+    # probe declares it so the live auth-boundary surface keeps being
+    # exercised against the Replay profile — and the probe itself witnesses
+    # the declaration path end-to-end.
+    plugin_dir = Path(hermes_home) / "plugins" / "model-providers" / "antigravity-acp"
+    if plugin_dir.is_dir():
+        launch_config_path = plugin_dir / "launch_config.json"
+        declared: dict[str, object] = {}
+        if launch_config_path.exists():
+            declared = json.loads(launch_config_path.read_text(encoding="utf-8"))
+        raw_extra = declared.get("extra_providers", [])
+        extra = [
+            item
+            for item in (raw_extra if isinstance(raw_extra, list) else [])
+            if isinstance(item, str)
+        ]
+        if "antigravity-acp-replay" not in extra:
+            declared["extra_providers"] = [*extra, "antigravity-acp-replay"]
+            launch_config_path.write_text(
+                json.dumps(declared, sort_keys=True) + "\n", encoding="utf-8"
+            )
+
     import providers
 
-    # 0.9.0 identity split: the DEFAULT id ``antigravity-acp`` is the Parked-MCP
-    # engine; the Replay engine — whose client surface this probe exercises
-    # live (list_models against the official binary, zero credentials) — keeps
-    # the explicit ``antigravity-acp-replay`` id.  Both identities must be
-    # discovered from the HERMES_HOME projection; the live auth-boundary flow
-    # runs on the Replay profile.
+    # The DEFAULT id ``antigravity-acp`` is the Parked-MCP engine; the Replay
+    # engine — whose client surface this probe exercises live (list_models
+    # against the official binary, zero credentials) — keeps the explicit
+    # ``antigravity-acp-replay`` id, created here via the declaration above.
+    # Both identities must be discovered from the HERMES_HOME projection; the
+    # live auth-boundary flow runs on the Replay profile.
     default_profile = providers.get_provider_profile("antigravity-acp")
     replay_profile = providers.get_provider_profile("antigravity-acp-replay")
     if default_profile is None or replay_profile is None:

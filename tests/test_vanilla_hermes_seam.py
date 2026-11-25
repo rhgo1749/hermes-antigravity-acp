@@ -14,6 +14,7 @@ contracts in ``test_upstream_hermes_runtime_contracts.py``.
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import subprocess
 import sys
@@ -60,6 +61,14 @@ def _load_real_plugin(monkeypatch, tmp_path, provider_name: str = "antigravity-a
     deployer.install(deployer.SOURCE, hermes_home, apply=True)
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     installed = hermes_home / "plugins/model-providers/antigravity-acp"
+    # Replay is created only under an explicit install-time declaration
+    # (launch_config.json extra_providers); declare it when the test asks for
+    # that provider, mirroring what an opt-in installer writes.
+    if provider_name == "antigravity-acp-replay":
+        (installed / "launch_config.json").write_text(
+            json.dumps({"extra_providers": ["antigravity-acp-replay"]}, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
     core = Path(providers.__file__).resolve().parent.parent
     origin = ProviderOrigin(installed, hermes_home, core)
     with origin.observing():
