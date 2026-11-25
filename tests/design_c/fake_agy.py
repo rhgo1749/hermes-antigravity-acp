@@ -162,9 +162,12 @@ def main():
         elif method == "session/new":
             state["next_sid"] += 1
             sid = f"s{state['next_sid']}"
-            state["sessions"][sid] = params["mcpServers"][0]
+            state["sessions"][sid] = params["mcpServers"][0] if params.get("mcpServers") else None
             log(ev="new", sid=sid, meta=params.get("_meta"))
-            reply = {"jsonrpc": "2.0", "id": rid, "result": {"sessionId": sid}}
+            result: dict = {"sessionId": sid}
+            if B.get("available_models") is not None:
+                result["models"] = {"availableModels": B["available_models"]}
+            reply = {"jsonrpc": "2.0", "id": rid, "result": result}
             if B.get("new_delay"):
                 threading.Timer(float(B["new_delay"]), emit, args=(reply,)).start()
             else:
