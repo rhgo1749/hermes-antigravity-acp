@@ -8,21 +8,26 @@ PR #88 fixed the behavior by hand-copying the parked gate into ``client.py``
 re-forks a contract name, bypasses the shared decision callables, or
 diverges from the shared behavior matrix at the tolerance boundaries.
 
-Defense layers (external review of PR #89 folded in):
-- AST scan: neither engine may OWN any contract name (constants, estimator,
-  CJK ranges, decision functions) — catches plain, annotated, and nested
-  re-definitions;
-- delegation spies: each engine's guard must actually CALL the decision
-  callables it imports, with the right arguments, and adopt their verdict —
-  catches inline re-implementation that keeps the imports;
-- independent boundary matrix: both engines are driven with hardcoded
-  expected verdicts at the exact tolerance edges (flat 64K and 8x scaled,
-  +/-1), so a silently re-tuned copy fails;
+Defense layers (external reviews of PR #89 rounds 1-2 folded in):
+- AST ownership scan: neither engine may bind any contract name anywhere
+  (module level, nested, annotated, tuple/list destructuring, walrus) —
+  implemented as every ``ast.Name`` in Store context plus def/class names;
+- delegation spies with FORCED verdicts on counterfactual inputs: each
+  guard must call the decision callables it imports with the right
+  arguments AND adopt WHATEVER verdict they return — catches inline
+  re-implementation and extra private vetoes that keep the imports;
+- estimator delegation chain: the Parked gate's ``local`` yardstick must BE
+  the return value of the shared ``transcript_tokens`` — catches inline
+  ``sum(len(...) // 3 + 1)`` copies that are identical on ASCII and diverge
+  on CJK/tool-calls;
+- independent boundary matrix: hardcoded expected verdicts at the EXACT
+  tolerance edges (upper and lower, +/-1, flat 64K and 8x scaled), driven
+  through both engines, so a silently re-tuned copy fails;
 - object identity: the engines' imported names ARE the contract's objects.
 A re-implementation that agrees with the contract at every tested boundary
 is behaviorally identical and is explicitly NOT claimed to be detectable.
 
-Witnesses replaying the real drifts:
+Witnesses replaying the real drifts (round-2 hardened gate):
 - against ``e92d19d`` (pre-#88): every gate test fails — the Replay engine
   accepted the inflated first turn unconditionally;
 - against ``382625c`` (#88 merged): every gate test fails — the AST scan and
@@ -50,8 +55,8 @@ ENGINE_FILES = {
 }
 CONTRACT_FILE = PLUGIN_DIR / "parked" / "usage_contract.py"
 
-# Names the contract owns; an engine defining any of these (module level,
-# nested, or annotated) is a re-fork.
+# Names the contract owns; an engine binding any of these (plain, annotated,
+# nested, destructured, walrus) is a re-fork.
 CONTRACT_NAMES = {
     "USAGE_GROWTH_FACTOR",
     "USAGE_GROWTH_SLACK_TOKENS",
@@ -67,17 +72,19 @@ FORBIDDEN_OWN_NAMES = CONTRACT_NAMES | {f"_{name}" for name in CONTRACT_NAMES}
 
 
 def _owned_names(path: Path) -> set[str]:
+    """Every name the module binds: Store-context ``ast.Name`` + def/class names.
+
+    Covers plain assignment, annotated assignment, tuple/list destructuring
+    (``FACTOR, unused = (8, 0)``), walrus, for/comprehension targets, and
+    nested defs — not just module-level ``Assign`` statements.
+    """
     tree = ast.parse(path.read_text(encoding="utf-8"))
     owned: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             owned.add(node.name)
-        elif isinstance(node, ast.Assign):
-            for target in node.targets:
-                if isinstance(target, ast.Name):
-                    owned.add(target.id)
-        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-            owned.add(node.target.id)
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            owned.add(node.id)
     return owned
 
 
@@ -196,107 +203,206 @@ def test_engines_share_the_identical_decision_objects(monkeypatch, tmp_path) -> 
 
 
 # ---------------------------------------------------------------------------
-# Delegation spies: the guards must CALL the contract, not merely import it.
+# Delegation spies with FORCED verdicts on counterfactual inputs: the guards
+# must CALL the contract, pass the right arguments, and adopt WHATEVER
+# verdict it returns.  A private extra veto (``or reported == X``) or an
+# inline copy that ignores the shared verdict fails a forced-verdict case.
 
 
-def test_replay_guard_delegates_first_turn_decision(monkeypatch, tmp_path) -> None:
+@pytest.mark.parametrize("verdict", [True, False])
+@pytest.mark.parametrize("reported", [65_000, 65_001])
+def test_replay_guard_first_turn_delegates_and_adopts_verdict(
+    monkeypatch, tmp_path, reported, verdict
+) -> None:
     client, _contract, _conversation = _load_package(monkeypatch, tmp_path)
     calls = []
 
     def spy(*, reported, local):
         calls.append((reported, local))
-        return False
+        return verdict
 
     monkeypatch.setattr(client, "first_turn_report_plausible", spy)
-    kept, baseline = _flat_gate(client, "spy-first", 123, 456)
-    assert calls == [(123, 456)], "Replay guard bypassed the shared first-turn decision"
-    assert kept is None and baseline is None, "spy verdict was not adopted"
+    # Full input x verdict cross: the REAL contract accepts 65_000 and
+    # rejects 65_001 at local=1_000; the spy verdict must decide on EVERY
+    # combination, so a private extra veto keyed on any input is caught by
+    # the combination where it contradicts the forced verdict.
+    kept, baseline = _flat_gate(client, f"spy-ft-{reported}-{verdict}", reported, 1_000)
+    assert calls == [(reported, 1_000)], "Replay guard bypassed the shared first-turn decision"
+    assert (kept is not None) is verdict
+    assert (baseline is None) is (not verdict)
+    if verdict:
+        assert baseline == (reported, 1_000)
 
-    monkeypatch.setattr(client, "first_turn_report_plausible", lambda **kw: True)
-    kept, baseline = _flat_gate(client, "spy-first-2", 123, 456)
-    assert kept is not None and baseline == (123, 456)
 
-
-def test_replay_guard_delegates_growth_decision(monkeypatch, tmp_path) -> None:
+@pytest.mark.parametrize("verdict", [True, False])
+@pytest.mark.parametrize("reported", [105_000, 600_000])
+def test_replay_guard_growth_delegates_and_adopts_verdict(
+    monkeypatch, tmp_path, reported, verdict
+) -> None:
     client, _contract, _conversation = _load_package(monkeypatch, tmp_path)
-    _flat_gate(client, "spy-growth", 100_000, 90_000)  # seed baseline
+    _flat_gate(client, f"spy-gr-{reported}-{verdict}", 100_000, 90_000)  # seed
     calls = []
 
     def spy(*, prev_reported, reported, prev_local, local):
         calls.append((prev_reported, reported, prev_local, local))
-        return False, 7, 3
+        return verdict, 7, 3
 
     monkeypatch.setattr(client, "reported_usage_growth_consistent", spy)
-    kept, baseline = _flat_gate(client, "spy-growth", 105_000, 95_000)
-    assert calls == [(100_000, 105_000, 90_000, 95_000)], (
+    # Full input x verdict cross: the REAL contract accepts 105_000 and
+    # rejects 600_000 on this baseline; the spy verdict must decide on
+    # EVERY combination.
+    kept, baseline = _flat_gate(client, f"spy-gr-{reported}-{verdict}", reported, 90_000)
+    assert calls == [(100_000, reported, 90_000, 90_000)], (
         "Replay guard bypassed the shared growth decision or passed wrong arguments"
     )
-    assert kept is None and baseline == (100_000, 90_000), (
-        "spy verdict was not adopted / baseline not preserved"
-    )
+    assert (kept is not None) is verdict
+    assert baseline == ((reported, 90_000) if verdict else (100_000, 90_000))
 
 
-def test_parked_gate_delegates_decisions(monkeypatch, tmp_path) -> None:
+@pytest.mark.parametrize("verdict", [True, False])
+@pytest.mark.parametrize("reported", [65_000, 65_001])
+def test_parked_gate_first_turn_delegates_and_adopts_verdict(
+    monkeypatch, tmp_path, reported, verdict
+) -> None:
     _client, _contract, conversation = _load_package(monkeypatch, tmp_path)
     messages = _messages(_chars_for(1_000))
-    first_calls = []
+    calls = []
+
+    def spy(*, reported, local):
+        calls.append((reported, local))
+        return verdict
+
+    monkeypatch.setattr(conversation, "first_turn_report_plausible", spy)
+    kept, baseline = _parked_gate(conversation, None, reported, messages)
+    assert calls == [(reported, 1_000)], "parked gate bypassed the shared decision"
+    assert (kept is not None) is verdict
+    assert (baseline is None) is (not verdict)
+    if verdict:
+        assert baseline == (reported, 1_000)
+
+
+@pytest.mark.parametrize("verdict", [True, False])
+@pytest.mark.parametrize("reported", [105_000, 600_000])
+def test_parked_gate_growth_delegates_and_adopts_verdict(
+    monkeypatch, tmp_path, reported, verdict
+) -> None:
+    _client, _contract, conversation = _load_package(monkeypatch, tmp_path)
+    calls = []
+
+    def spy(*, prev_reported, reported, prev_local, local):
+        calls.append((prev_reported, reported, prev_local, local))
+        return verdict, 7, 3
+
+    monkeypatch.setattr(conversation, "reported_usage_growth_consistent", spy)
+    # Full input x verdict cross (real contract: accept 105_000, reject
+    # 600_000 on this baseline); the forced verdict must always decide.
+    kept, baseline = _parked_gate(
+        conversation, (100_000, 90_000), reported, _messages(_chars_for(90_000))
+    )
+    assert calls == [(100_000, reported, 90_000, 90_000)]
+    assert (kept is not None) is verdict
+    assert baseline == ((reported, 90_000) if verdict else (100_000, 90_000))
+
+
+def test_parked_gate_delegates_estimator_to_shared_transcript_tokens(
+    monkeypatch, tmp_path
+) -> None:
+    """The gate's ``local`` yardstick must BE the shared estimator's output.
+
+    Round-2 review mutant: the gate inlined ``sum(len(m["content"]) // 3 + 1
+    for m in messages)`` while keeping the import — identical on ASCII,
+    divergent on CJK/tool-calls.  The estimator spy returns a sentinel no
+    inline yardstick could produce; the decision spy must receive it.
+    """
+    _client, _contract, conversation = _load_package(monkeypatch, tmp_path)
+    monkeypatch.setattr(conversation, "transcript_tokens", lambda messages: 4_242)
+    seen = []
 
     def spy_first(*, reported, local):
-        first_calls.append((reported, local))
-        return False
+        seen.append((reported, local))
+        return True
 
     monkeypatch.setattr(conversation, "first_turn_report_plausible", spy_first)
-    kept, baseline = _parked_gate(conversation, None, 65_001, messages)
-    assert first_calls == [(65_001, 1_000)], "parked gate bypassed the shared decision"
-    assert kept is None and baseline is None
+    kept, baseline = _parked_gate(conversation, None, 4_242, _messages(30))
+    assert seen == [(4_242, 4_242)], (
+        "parked gate did not route its local estimate through the shared "
+        "transcript_tokens (inline yardstick re-fork)"
+    )
+    assert kept is not None and baseline == (4_242, 4_242)
 
-    growth_calls = []
 
-    def spy_growth(*, prev_reported, reported, prev_local, local):
-        growth_calls.append((prev_reported, reported, prev_local, local))
-        return False, 7, 3
+def test_replay_guard_adopts_native_tokens_as_local_yardstick(
+    monkeypatch, tmp_path
+) -> None:
+    """The flat guard must hand its native_tokens to the decision unchanged.
 
-    monkeypatch.setattr(conversation, "reported_usage_growth_consistent", spy_growth)
-    kept, baseline = _parked_gate(conversation, (100_000, 90_000), 105_000, messages)
-    assert growth_calls == [(100_000, 105_000, 90_000, 1_000)]
-    assert kept is None and baseline == (100_000, 90_000)
+    The Replay estimator wiring (``prior_native_tokens + estimate_tokens``)
+    lives at the prompt-build call site; the identity assertion above pins
+    the estimator object, this spy pins the argument plumbing.
+    """
+    client, _contract, _conversation = _load_package(monkeypatch, tmp_path)
+    seen = []
+    monkeypatch.setattr(
+        client, "first_turn_report_plausible",
+        lambda **kw: seen.append((kw["reported"], kw["local"])) or True,
+    )
+    _flat_gate(client, "spy-native", 999, 5_555)
+    assert seen == [(999, 5_555)]
 
 
 # ---------------------------------------------------------------------------
-# Independent boundary matrix: hardcoded verdicts at the exact tolerance
-# edges (tolerance = max(8*(ref+1), 64_000)), driven through BOTH engines.
-# Expected values are written out, not computed from the contract.
+# Independent boundary matrix: hardcoded verdicts at the EXACT tolerance
+# edges (tolerance = max(8*(|expected|+1), 64_000)), upper AND lower side,
+# +/-1, driven through BOTH engines.  Expected values are written out, not
+# computed from the contract.  First-turn lower edges are mathematically
+# negative (no non-negative report can undershoot a small local estimate by
+# 64K+), so lower edges are exercised in the growth matrix instead.
 
 FIRST_TURN_CASES = [
-    # (reported, local, expect_accept) — flat 64K slack edge at tiny local
-    pytest.param(65_000, 1_000, True, id="flat-edge-accept"),
-    pytest.param(65_001, 1_000, False, id="flat-edge-plus-one-reject"),
-    # 8x scaled edge at 100K local: tolerance = 8*(100_000+1) = 800_008
-    pytest.param(900_008, 100_000, True, id="scaled-edge-accept"),
-    pytest.param(900_009, 100_000, False, id="scaled-edge-plus-one-reject"),
+    # tolerance = max(8*(local+1), 64_000); local = 1_000 -> 64_000
+    pytest.param(65_000, 1_000, True, id="flat-upper-edge-accept"),
+    pytest.param(65_001, 1_000, False, id="flat-upper-edge-plus-one-reject"),
+    # local = 100_000 -> tolerance = 8*100_001 = 800_008
+    pytest.param(900_008, 100_000, True, id="scaled-upper-edge-accept"),
+    pytest.param(900_009, 100_000, False, id="scaled-upper-edge-plus-one-reject"),
 ]
 
 GROWTH_CASES = [
-    # baseline (100_000, 90_000); expected growth 1_000; tolerance 64_000
-    pytest.param(164_000, 91_000, True, id="flat-slack-accept"),
-    pytest.param(165_001, 91_000, False, id="flat-slack-plus-one-reject"),
-    # expected growth 100_000; tolerance 8*100_001 = 800_008
-    pytest.param(1_000_008, 190_000, True, id="scaled-edge-accept"),
-    pytest.param(1_000_009, 190_000, False, id="scaled-edge-plus-one-reject"),
-    # negative re-anchor within scaled tolerance
-    pytest.param(120_000, 110_000, True, id="reanchor-accept"),
+    # baseline (100_000, 90_000), local 91_000 -> expected growth 1_000,
+    # tolerance = max(8*1_001, 64_000) = 64_000; exact edges:
+    pytest.param(165_000, 91_000, True, id="flat-upper-edge-accept"),
+    pytest.param(165_001, 91_000, False, id="flat-upper-edge-plus-one-reject"),
+    pytest.param(37_000, 91_000, True, id="flat-lower-edge-accept"),
+    pytest.param(36_999, 91_000, False, id="flat-lower-edge-minus-one-reject"),
+    # baseline (100_000, 90_000), local 190_000 -> expected 100_000,
+    # tolerance = 8*100_001 = 800_008:
+    pytest.param(1_000_008, 190_000, True, id="scaled-upper-edge-accept"),
+    pytest.param(1_000_009, 190_000, False, id="scaled-upper-edge-plus-one-reject"),
+    # baseline (1_000_000, 900_000), local 1_000_000 -> expected 100_000,
+    # tolerance 800_008; lower edge report = 1_000_000 - 700_008:
+    pytest.param(299_992, 1_000_000, True, id="scaled-lower-edge-accept"),
+    pytest.param(299_991, 1_000_000, False, id="scaled-lower-edge-minus-one-reject"),
+    # genuine shrink re-anchor within scaled tolerance
+    pytest.param(120_000, 110_000, True, id="reanchor-shrink-accept"),
+    # server grows while the transcript shrinks: divergence 210_000 > 80_008
+    pytest.param(300_000, 80_000, False, id="server-grows-transcript-shrinks-reject"),
     # server collapse while transcript grows
     pytest.param(1_000, 390_000, False, id="collapse-reject"),
 ]
 
 GROWTH_BASELINE = (100_000, 90_000)
+BIG_BASELINE = (1_000_000, 900_000)
 REANCHOR_BASELINE = (400_000, 380_000)
+_BASELINE_BY_CASE = {
+    (299_992, 1_000_000): BIG_BASELINE,
+    (299_991, 1_000_000): BIG_BASELINE,
+    (120_000, 110_000): REANCHOR_BASELINE,
+    (1_000, 390_000): REANCHOR_BASELINE,
+}
 
 
 def _growth_baseline(reported: int, local: int) -> tuple[int, int]:
-    # collapse-reject measures against the re-anchored baseline; all other
-    # growth cases measure against GROWTH_BASELINE.
-    return REANCHOR_BASELINE if (reported, local) == (1_000, 390_000) else GROWTH_BASELINE
+    return _BASELINE_BY_CASE.get((reported, local), GROWTH_BASELINE)
 
 
 @pytest.mark.parametrize(("reported", "local", "accept"), FIRST_TURN_CASES)
