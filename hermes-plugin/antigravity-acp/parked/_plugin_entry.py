@@ -163,6 +163,11 @@ def register_parked_profiles(
         env_vars=(),
         base_url="acp://antigravity-mcp",
         auth_type="external_process",
+        # Compatibility id for pre-0.9.0 configs: it must keep RESOLVING by
+        # name (resolution never consults listing), but a fresh install's
+        # picker must not offer a second entry that duplicates the default
+        # engine under another name.
+        hidden=True,
         supports_vision=True,  # images go to agy as ACP image blocks / MCP image content
         process_command=stored_process_command or _default_official_command(),
         process_args=tuple(stored_process_args),

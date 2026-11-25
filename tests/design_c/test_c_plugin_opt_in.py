@@ -180,6 +180,15 @@ def test_single_plugin_registers_three_disjoint_profiles(monkeypatch) -> None:
         assert compat.aliases == ("agy-mcp",)
         assert compat.base_url == "acp://antigravity-mcp"
 
+        # Picker visibility: the compatibility id duplicates the default
+        # engine, so a fresh install's picker must not offer it (Hermes
+        # hides ``hidden`` profiles from pickers while resolution by name
+        # keeps working for pre-0.9.0 configs). The default and the
+        # explicitly selectable Replay engine stay listed.
+        assert getattr(compat, "hidden", False) is True
+        assert getattr(default, "hidden", False) is False
+        assert getattr(replay, "hidden", False) is False
+
         # Replay stays explicitly selectable, never a silent fallback.
         assert set(replay.aliases) == {"agy-replay", "antigravity-replay"}
 
