@@ -6,25 +6,26 @@ This document specifies the Parked-MCP execution engine at [hermes-plugin/antigr
 
 ## Provider Identity and Engine Selection
 
-One plugin package registers three disjoint model-provider profiles; there is no provider name, alias, or `base_url` collision between them.
+A default install creates exactly one model-provider profile — `antigravity-acp` — with no provider-name or alias collision. The historical `antigravity-acp-mcp`/`agy-mcp` ids are aliases on the default profile (resolution without creation), and the Replay profile registers only when the installer-written `launch_config.json` declares it in `extra_providers`.
 
-| Attribute | Parked-MCP default (`antigravity-acp`) | Parked-MCP compatibility (`antigravity-acp-mcp`) | Replay engine (`antigravity-acp-replay`) |
-|---|---|---|---|
-| Plugin directory | `hermes-plugin/antigravity-acp/` | same package | same package |
-| Engine source | `parked/` subpackage | same `parked/` subpackage | parent flat modules (`client.py` et al.) |
-| Registered provider name | `antigravity-acp` | `antigravity-acp-mcp` | `antigravity-acp-replay` |
-| Aliases | `antigravity-cli`, `agy`, `antigravity`, `agy-acp`, `antigravity-official-acp` | `agy-mcp` | (none) |
-| Marker `base_url` | `acp://antigravity` | `acp://antigravity-mcp` | `acp://antigravity` |
-| Default launcher | `~/.local/bin/antigravity-acp-official` (`.cmd` on Windows), then `PATH` lookup | same | same |
-| Static `fallback_models` | `()` | `()` | `()` |
+| Attribute | Parked-MCP default (`antigravity-acp`) | Replay engine (`antigravity-acp-replay`) |
+|---|---|---|
+| Plugin directory | `hermes-plugin/antigravity-acp/` | same package |
+| Engine source | `parked/` subpackage | parent flat modules (`client.py` et al.) |
+| Created by a default install | yes | no — needs an explicit `extra_providers` declaration in `launch_config.json` |
+| Registered provider name | `antigravity-acp` | `antigravity-acp-replay` |
+| Aliases | `antigravity-cli`, `agy`, `antigravity`, `agy-acp`, `antigravity-official-acp`; compatibility ids `antigravity-acp-mcp`, `agy-mcp` | `agy-replay`, `antigravity-replay` |
+| Marker `base_url` | `acp://antigravity` | `acp://antigravity` |
+| Default launcher | `~/.local/bin/antigravity-acp-official` (`.cmd` on Windows), then `PATH` lookup | same |
+| Static `fallback_models` | `()` | `()` |
 
-Selecting the engine is a profile-config change only:
+Selecting the engine is a profile-config change once the Replay provider has been created by an explicit install declaration:
 
 ```yaml
 # Parked-MCP (default; also what pre-0.9.0 `antigravity-acp-mcp` configs resolve to)
 model:
   provider: antigravity-acp
-# Explicit Replay engine alternative
+# Explicit Replay engine alternative (requires the launch_config.json declaration)
 model:
   provider: antigravity-acp-replay
 ```

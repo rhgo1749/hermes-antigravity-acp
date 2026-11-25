@@ -117,14 +117,19 @@ def register_parked_profiles(
     *,
     stored_process_command: str | None = None,
     stored_process_args: tuple[str, ...] = (),
-) -> tuple[AntigravityAcpMcpProfile, AntigravityAcpMcpProfile]:
-    """Register the default ``antigravity-acp`` and compatibility ``antigravity-acp-mcp`` profiles.
+) -> AntigravityAcpMcpProfile:
+    """Register the single default ``antigravity-acp`` Parked-MCP profile.
 
-    Both profiles run the same Parked-MCP engine; they differ only in identity
-    surface (name/aliases/base_url marker/env-var scope).  ``stored_process_command``/
-    ``stored_process_args`` carry the installer-preserved launch config so a
-    host pinned by ``deploy_hermes_profiles.py`` keeps its launch target across
-    the engine switch.  Returns ``(default, compat)`` for test introspection.
+    A default install creates exactly one provider profile.  The
+    historical compatibility ids ``antigravity-acp-mcp``/``agy-mcp`` are plain
+    aliases on this profile: they resolve for existing configs but are never
+    created as separate providers and never appear in a picker.  Hermes core
+    does not match config ``base_url`` against profile ``base_url``, and the
+    ``acp://`` marker plays no routing role, so aliasing is resolution-safe.
+    ``stored_process_command``/``stored_process_args`` carry the
+    installer-preserved launch config so a host pinned by
+    ``deploy_hermes_profiles.py`` keeps its launch target across the engine
+    switch.  Returns the default profile for test introspection.
     """
     default = AntigravityAcpMcpProfile(
         name="antigravity-acp",
@@ -134,6 +139,10 @@ def register_parked_profiles(
             "antigravity",
             "agy-acp",
             "antigravity-official-acp",
+            # Compatibility ids (pre-0.9.0 Parked-MCP identity): aliases only,
+            # never separately-created providers.
+            "antigravity-acp-mcp",
+            "agy-mcp",
         ),
         display_name="Antigravity ACP",
         description=(
@@ -154,22 +163,5 @@ def register_parked_profiles(
         process_args_env_var="HERMES_ANTIGRAVITY_ACP_ARGS",
         fallback_models=(),
     )
-    compat = AntigravityAcpMcpProfile(
-        name="antigravity-acp-mcp",
-        aliases=("agy-mcp",),
-        display_name="Antigravity ACP (MCP tools)",
-        description="Google Antigravity via the official ACP server; Hermes tools over a parked loopback MCP endpoint",
-        api_mode="chat_completions",
-        env_vars=(),
-        base_url="acp://antigravity-mcp",
-        auth_type="external_process",
-        supports_vision=True,  # images go to agy as ACP image blocks / MCP image content
-        process_command=stored_process_command or _default_official_command(),
-        process_args=tuple(stored_process_args),
-        process_command_env_vars=("HERMES_ANTIGRAVITY_ACP_MCP_COMMAND", "HERMES_ANTIGRAVITY_ACP_COMMAND"),
-        process_args_env_var="HERMES_ANTIGRAVITY_ACP_MCP_ARGS",
-        fallback_models=(),
-    )
     register_provider(default)
-    register_provider(compat)
-    return default, compat
+    return default
