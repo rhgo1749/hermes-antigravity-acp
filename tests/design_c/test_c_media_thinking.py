@@ -1,16 +1,19 @@
 """Images (ACP image blocks, MCP image content) and thinking level (reasoning_effort -> agy) end to end."""
 
+import json
 import os
+import sys
 
 import pytest
 
+from antigravity_acp_mcp.acp_connection import AcpConnection
 from antigravity_acp_mcp.client import thinking_level
 from antigravity_acp_mcp.conversation import MAX_PROMPT_IMAGES, degenerate, render_delta, render_replay
 from antigravity_acp_mcp.matcher import classify, explain_mismatch, view_after
 from antigravity_acp_mcp.permission import PermissionGate
 from antigravity_acp_mcp.session import new_session
 
-from ._support import SYS, TOOLS, asst, dump, events, make_conv
+from ._support import FAKE_AGY as FAKE, SYS, TOOLS, asst, dump, events, make_conv
 
 PNG_A, PNG_B = "QUFBQQ==", "QkJCQg=="
 SERVER = {"type": "http", "name": "hermes-deadbeef", "url": "http://127.0.0.1:1/mcp/p", "headers": []}
@@ -222,23 +225,41 @@ def test_second_degenerate_reply_is_returned_as_is(tmp_path):
 
 
 def test_replays_of_one_conversation_share_a_byte_identical_prefix(tmp_path):
-    conv, log = make_conv(tmp_path, [[{"call": {"name": "fetch", "arguments": {"k": "a"}}}], [{"text": "x"}],
-                                     [{"text": "y"}]])
+    # User stop is terminal for the ACP child; the registry hands the next turn a
+    # fresh conversation carrying the same fence, so the rendered replay prefix
+    # survives the cancel byte-identical.
+    from antigravity_acp_mcp.conversation import Registry
+    log = tmp_path / "agy.log"
+    behaviour = json.dumps({"script": [[{"call": {"name": "fetch", "arguments": {"k": "a"}}}]],
+                            "log": str(log), "new_delay": 0})
+
+    def spawn(key: str, cwd: str) -> AcpConnection:
+        conn = AcpConnection(sys.executable, [FAKE, behaviour], cwd)
+        conn.start()
+        conn.initialize()
+        return conn
+
+    reg = Registry(spawn)
     try:
         msgs = [SYS, {"role": "user", "content": "q"}]
+        conv = reg.get("k1")
+        fence = conv.fence
         r1 = conv.run(msgs, TOOLS, "m")
         msgs += [asst(r1["tool_calls"]), {"role": "tool", "tool_call_id": r1["tool_calls"][0].id, "content": "A"}]
-        conv.cancel()  # retire: each next request replays on a fresh session
+        conv.cancel()  # terminal: child reaped; the registry replaces it on the next get
+        conv = reg.get("k1")
+        assert conv.fence == fence  # render state survives the terminal cancel
         conv.run(msgs, TOOLS, "m")
         conv.cancel()
+        conv = reg.get("k1")
         conv.run(msgs, TOOLS, "m")
         prompts = [e["text"] for e in events(log) if e["ev"] == "prompt"]
-        assert len(prompts) == 3 and prompts[1].count(conv.fence) == 2
+        assert len(prompts) == 3 and prompts[1].count(fence) == 2
         # identical through the end of the fenced tool output, not just the system band
-        end = prompts[1].rindex(conv.fence) + len(conv.fence)
+        end = prompts[1].rindex(fence) + len(fence)
         assert prompts[2][:end] == prompts[1][:end]
     finally:
-        conv.close()
+        reg.close_all()
 
 
 @pytest.mark.parametrize("literal_row", [

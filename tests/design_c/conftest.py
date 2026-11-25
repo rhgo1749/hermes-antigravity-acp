@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
-PLUGIN_DIR = ROOT / "hermes-plugin" / "antigravity-acp-mcp"
+PLUGIN_DIR = ROOT / "hermes-plugin" / "antigravity-acp" / "parked"
 
 
 def _bootstrap_package() -> None:

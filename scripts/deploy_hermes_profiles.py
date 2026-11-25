@@ -49,7 +49,7 @@ import shutil
 import sys
 import uuid
 from collections.abc import Mapping
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 PROVIDER = "antigravity-acp"
 PROVIDER_PLUGIN_NAME = "antigravity-acp-provider"
@@ -80,6 +80,21 @@ REQUIRED = (
     "request_trace.py",
     "hermes_compat.py",
     "login.py",
+    # Parked-MCP default engine (0.9.0).  Nested paths are managed files:
+    # the copy stage creates parent directories and the overlay scan recurses
+    # into managed subdirectories, so a stale parked/ tree can never survive
+    # a redeploy as an unmanaged leftover.
+    "parked/__init__.py",
+    "parked/_hermes_seam.py",
+    "parked/_plugin_entry.py",
+    "parked/_upstream.py",
+    "parked/acp_connection.py",
+    "parked/client.py",
+    "parked/conversation.py",
+    "parked/matcher.py",
+    "parked/parked_mcp.py",
+    "parked/permission.py",
+    "parked/session.py",
 )
 # Provider-tree byte sets this installer verifiably shipped before the
 # provenance marker existed (sha256 of each managed file at that release).
@@ -381,18 +396,50 @@ OVERLAY_SCAN_IGNORED_SUFFIXES = (".pyc", ".pyo")
 
 def _installer_owned_tree_names(managed_files: tuple[str, ...]) -> set[str]:
     """Names this installer may legitimately leave inside a provider tree."""
-    return set(managed_files) | {PIN_FILE, LAUNCH_CONFIG_FILE, INSTALL_PROVENANCE_FILE}
+    names = set(managed_files) | {PIN_FILE, LAUNCH_CONFIG_FILE, INSTALL_PROVENANCE_FILE}
+    # Managed nested paths (e.g. ``parked/client.py``) additionally license
+    # their parent directory names at the top level; the scan below recurses
+    # into those directories and checks their contents against the full
+    # relative names, so nothing inside a managed subdirectory escapes.
+    for name in managed_files:
+        parts = PurePosixPath(name).parts
+        for i in range(1, len(parts) - 1):
+            names.add("/".join(parts[:i]))
+        if len(parts) > 1:
+            names.add(parts[0])
+    return names
 
 
-def _unmanaged_tree_entries(target: Path, allowed: set[str]) -> list[str]:
+def _unmanaged_tree_entries(target: Path, allowed: set[str], _prefix: str = "") -> list[str]:
     entries = []
-    for entry in target.iterdir():
-        name = entry.name
-        if name in allowed or name in OVERLAY_SCAN_IGNORED_NAMES:
-            continue
-        if name.endswith(OVERLAY_SCAN_IGNORED_SUFFIXES):
-            continue
-        entries.append(name)
+
+    def scan(base: Path, prefix: str) -> None:
+        depth = len(PurePosixPath(prefix).parts) if prefix else 0
+        # Child names that continue a managed relative path: recursion into
+        # these is required, and their contents are checked against the full
+        # relative names.
+        managed_children = {
+            PurePosixPath(rel).parts[depth]
+            for rel in allowed
+            if len(PurePosixPath(rel).parts) > depth
+            and PurePosixPath(rel).parts[:depth]
+            == (PurePosixPath(prefix).parts if prefix else ())
+        }
+        for entry in base.iterdir():
+            name = entry.name
+            rel = f"{prefix}/{name}" if prefix else name
+            if name in OVERLAY_SCAN_IGNORED_NAMES:
+                continue
+            if name.endswith(OVERLAY_SCAN_IGNORED_SUFFIXES):
+                continue
+            if entry.is_dir() and name in managed_children:
+                scan(entry, rel)
+                continue
+            if rel in allowed:
+                continue
+            entries.append(rel)
+
+    scan(target, _prefix)
     return sorted(entries)
 
 
@@ -575,7 +622,17 @@ def install(
     managed_files = tuple(files or REQUIRED)
     if not set(REQUIRED).issubset(managed_files):
         raise ValueError("Managed provider files must include the generic provider contract")
-    if any(Path(name).name != name or name.startswith(".") for name in managed_files):
+
+    def _bad_managed_name(name: str) -> bool:
+        parts = PurePosixPath(name.replace("\\", "/")).parts
+        return (
+            not parts
+            or name.startswith("/")
+            or ".." in parts
+            or any(part.startswith(".") for part in parts)
+        )
+
+    if any(_bad_managed_name(name) for name in managed_files):
         raise ValueError("Unexpected managed provider filename")
     if not source.is_dir() or any(
         not (source / name).is_file() or (source / name).is_symlink()
@@ -685,6 +742,7 @@ def install(
         try:
             candidate.mkdir(parents=True)
             for name in managed_files:
+                (candidate / name).parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source / name, candidate / name)
             if target.exists():
                 # historical reference boundary: update propagation carries ONLY this

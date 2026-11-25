@@ -236,5 +236,84 @@ class ProviderOriginTests(unittest.TestCase):
         self.assertIn("runtime_payload_drift", origin.errors)
 
 
+class NestedEngineLayoutFrameTests(unittest.TestCase):
+    """0.9.0 layout: the default factory executes from parked/_plugin_entry.py.
+
+    The gateway envelope hook probes _FACTORY_SOURCES/_CLIENT_SOURCES in order;
+    a non-matching relative must reject WITHOUT recording runtime_code_mismatch,
+    otherwise probing the Replay source first would poison provenance for every
+    Parked-MCP turn. This binds frames executed from compiled installed bytes
+    (Python >= 3.12 code objects compare by value), mirroring accepts_frame().
+    """
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="provider-origin-nested-")
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name).resolve()
+        self.home = self.root / "home"
+        self.plugin = self.home / "plugins/model-providers/antigravity-acp"
+        (self.plugin / "parked").mkdir(parents=True)
+        (self.plugin / "__init__.py").write_text(
+            "def create_client(self, **kw):\n    return 'replay-factory'\n", encoding="utf-8")
+        (self.plugin / "client.py").write_text(
+            "class ReplayClient:\n    def cancel(self):\n        return None\n", encoding="utf-8")
+        (self.plugin / "parked" / "__init__.py").write_text("# parked package\n", encoding="utf-8")
+        (self.plugin / "parked" / "_plugin_entry.py").write_text(
+            "def create_client(self, **kw):\n    return 'parked-factory'\n", encoding="utf-8")
+        (self.plugin / "parked" / "client.py").write_text(
+            "class ParkedClient:\n    def cancel(self):\n        return None\n", encoding="utf-8")
+        (self.plugin / "plugin.yaml").write_text("name: candidate\n", encoding="utf-8")
+        self.core = self.root / "core"
+        (self.core / "providers").mkdir(parents=True)
+        self.origin = ProviderOrigin(self.plugin, self.home, self.core)
+
+    def _return_frame(self, relative: str, function: str):
+        import types
+        path = self.plugin / relative
+        code = compile(path.read_bytes(), str(path), "exec", dont_inherit=True)
+        prior = sys.getprofile()
+        frames: list = []
+
+        def observer(frame, event, arg):
+            frames.append((frame, event))
+
+        sys.setprofile(observer)
+        try:
+            module = types.ModuleType("__probe__")
+            module.__dict__["__file__"] = str(path)
+            exec(code, module.__dict__)
+            if function == "cancel":
+                cls = next(v for v in module.__dict__.values()
+                           if isinstance(v, type) and hasattr(v, "cancel"))
+                cls().cancel()
+            else:
+                module.__dict__[function](None)
+        finally:
+            sys.setprofile(prior)
+        return next(frame for frame, event in frames
+                    if event == "return" and frame.f_code.co_name == function)
+
+    def test_parked_factory_matches_nested_relative_without_poisoning(self):
+        frame = self._return_frame("parked/_plugin_entry.py", "create_client")
+        # Probing the Replay source first must reject cleanly (no error recorded).
+        self.assertFalse(self.origin.accepts_frame(frame, "__init__.py"))
+        self.assertEqual(self.origin.errors, [])
+        self.assertTrue(self.origin.accepts_frame(frame, "parked/_plugin_entry.py"))
+        self.assertEqual(self.origin.errors, [])
+
+    def test_replay_factory_still_matches_top_level_relative(self):
+        frame = self._return_frame("__init__.py", "create_client")
+        self.assertFalse(self.origin.accepts_frame(frame, "parked/_plugin_entry.py"))
+        self.assertEqual(self.origin.errors, [])
+        self.assertTrue(self.origin.accepts_frame(frame, "__init__.py"))
+        self.assertEqual(self.origin.errors, [])
+
+    def test_parked_cancel_matches_nested_client(self):
+        frame = self._return_frame("parked/client.py", "cancel")
+        self.assertFalse(self.origin.accepts_frame(frame, "client.py"))
+        self.assertEqual(self.origin.errors, [])
+        self.assertTrue(self.origin.accepts_frame(frame, "parked/client.py"))
+
+
 if __name__ == "__main__":
     unittest.main()

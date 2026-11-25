@@ -1,14 +1,17 @@
 name: antigravity-acp-provider
 kind: model-provider
-version: 0.8.0
-description: Google Antigravity through Google's official ACP server
+version: 0.9.0
+description: Google Antigravity through Google's official ACP server (Parked-MCP default engine; Replay engine selectable)
 author: rhgo1749
 # Compatibility floor proven by CI (catalog-floor-gate job): official Hermes
 # v0.21.6 passes `hermes plugins validate --install-deps` and the strict
 # provider-seam tests. Raise only with a new floor-gate run; never guess.
 requires_hermes: ">=0.21.6"
 # Registered surface, verified against the validate capability probe: this
-# plugin registers exactly one model-provider profile and nothing else.
+# plugin registers exactly three model-provider profiles and nothing else —
+# `antigravity-acp` (default; Parked-MCP engine), `antigravity-acp-mcp`
+# (compatibility id; same engine), and `antigravity-acp-replay` (Replay
+# engine, explicit alternative).
 provides_tools: []
 provides_hooks: []
 provides_middleware: []

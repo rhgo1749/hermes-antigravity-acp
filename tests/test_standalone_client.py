@@ -59,7 +59,7 @@ def _load(monkeypatch):
     module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, module_name, module)
     spec.loader.exec_module(module)
-    client = module.antigravity_acp.create_client()
+    client = module.antigravity_acp_replay.create_client()
     client_module = sys.modules[module_name + ".client"]
     return module, client, client_module
 

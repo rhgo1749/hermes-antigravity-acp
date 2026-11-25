@@ -750,7 +750,7 @@ def _write_wire_server(tmp_path, mode: str):
 
 
 def _wire_client(module, tmp_path, mode: str):
-    return module.antigravity_acp.create_client(
+    return module.antigravity_acp_replay.create_client(
         command=sys.executable,
         args=[
             str(_write_wire_server(tmp_path, mode)),

@@ -442,8 +442,14 @@ class Run:
             self.pass_stage("request_response", "real_gateway_agent_loop_exact_challenge_response")
             self.current = "provider_factory"
             envelope = json.loads((self.root / "gateway-envelope.json").read_text())
-            expected = hashlib.sha256((self.plugin / "__init__.py").read_bytes()).hexdigest()
-            self.need(envelope["core_bootstrap_from_requested_source"] and expected in envelope["loaded_provider_sha256"],
+            # The observed factory may be either engine's (0.9.0 default: parked/_plugin_entry.py;
+            # Replay: top-level __init__.py). accepts_frame() already bound the executing code to
+            # the installed candidate bytes; this witness confirms the disk bytes at observation.
+            expected = {hashlib.sha256((self.plugin / rel).read_bytes()).hexdigest()
+                        for rel in ("__init__.py", "parked/_plugin_entry.py")
+                        if (self.plugin / rel).is_file()}
+            self.need(envelope["core_bootstrap_from_requested_source"]
+                      and bool(expected & set(envelope["loaded_provider_sha256"])),
                       "candidate_factory_not_executed")
             actual_origin = envelope.get("provider_origin", {})
             expected_origin = ProviderOrigin(self.plugin, self.profile, self.core).receipt()

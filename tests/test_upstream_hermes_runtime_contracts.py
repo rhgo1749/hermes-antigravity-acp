@@ -21,8 +21,11 @@ from test_vanilla_hermes_seam import _load_real_plugin
 
 
 def _load_client(monkeypatch, tmp_path):
-    plugin, profile = _load_real_plugin(monkeypatch, tmp_path)
-    assert providers.get_provider_profile("antigravity-acp") is profile
+    # These runtime contracts (env allowlist, session context, conversation
+    # registry) are the Replay engine's client contracts; the engine stays
+    # seam-proven under its explicit id after the 0.9.0 default switch.
+    plugin, profile = _load_real_plugin(monkeypatch, tmp_path, "antigravity-acp-replay")
+    assert providers.get_provider_profile("antigravity-acp-replay") is profile
     return importlib.import_module(f"{plugin.__name__}.client")
 
 

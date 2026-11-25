@@ -1,4 +1,10 @@
-"""Opt-in plugin contract, hygiene, and registration tests for hermes-plugin/antigravity-acp-mcp/."""
+"""Single-plugin dual-engine registration contract for the 0.9.0 surface.
+
+Since plugin 0.9.0 the Parked-MCP engine (``parked/``) and the Replay engine
+(flat modules) ship in ONE plugin tree and register three disjoint profiles:
+``antigravity-acp`` (default, Parked-MCP), ``antigravity-acp-mcp``
+(compatibility id, same engine), and ``antigravity-acp-replay`` (Replay).
+"""
 
 from __future__ import annotations
 
@@ -12,7 +18,7 @@ from typing import Any
 
 from ._support import PLUGIN_DIR, ROOT
 
-MANIFEST = PLUGIN_DIR / "plugin.yaml"
+MANIFEST = ROOT / "hermes-plugin" / "antigravity-acp" / "plugin.yaml"
 DEFAULT_PLUGIN_DIR = ROOT / "hermes-plugin" / "antigravity-acp"
 AUDIT_SCRIPT = ROOT / "scripts" / "audit_public_tree.py"
 
@@ -56,9 +62,9 @@ def _load_isolated_plugin(package_name: str, plugin_dir: Path) -> types.ModuleTy
     return module
 
 
-def test_opt_in_manifest_is_flat_valid_and_provider_only() -> None:
+def test_manifest_is_flat_valid_and_provider_only() -> None:
     entries = _flat_manifest(MANIFEST)
-    assert entries["name"] == "antigravity-acp-mcp-provider"
+    assert entries["name"] == "antigravity-acp-provider"
     assert entries["kind"] == "model-provider"
     assert re.fullmatch(r"\d+\.\d+\.\d+", entries["version"].strip("\"'"))
     assert entries["description"]
@@ -71,10 +77,10 @@ def test_opt_in_manifest_is_flat_valid_and_provider_only() -> None:
         "requires_env",
         "python_dependencies",
     ):
-        assert entries.get(key) == "[]", f"{key} must stay [] for provider-only opt-in plugin"
+        assert entries.get(key) == "[]", f"{key} must stay [] for a provider-only plugin"
 
 
-def test_opt_in_plugin_registers_only_provider() -> None:
+def test_parked_engine_registers_only_providers() -> None:
     registered: set[str] = set()
     for source in sorted(PLUGIN_DIR.glob("*.py")):
         tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
@@ -88,7 +94,7 @@ def test_opt_in_plugin_registers_only_provider() -> None:
     assert registered == {"register_provider"}
 
 
-def test_opt_in_plugin_env_reads_stay_within_declared_surface() -> None:
+def test_parked_engine_env_reads_stay_within_declared_surface() -> None:
     allowed_prefixes = ("HERMES_ANTIGRAVITY_ACP_",)
     allowed_exact = {
         "HERMES_SESSION_ID",
@@ -106,7 +112,7 @@ def test_opt_in_plugin_env_reads_stay_within_declared_surface() -> None:
     assert not offenders, f"undeclared environment reads: {sorted(offenders)}"
 
 
-def test_opt_in_plugin_tree_passes_public_hygiene_scan() -> None:
+def test_parked_tree_passes_public_hygiene_scan() -> None:
     audit = _load_audit_module()
     forbidden_mux = "antigravity-acp-" + "file-mux"
     files = [
@@ -114,7 +120,7 @@ def test_opt_in_plugin_tree_passes_public_hygiene_scan() -> None:
         for path in sorted(PLUGIN_DIR.rglob("*"))
         if path.is_file() and "__pycache__" not in path.relative_to(PLUGIN_DIR).parts
     ]
-    assert len(files) == 12
+    assert len(files) == 11  # 10 engine modules + package marker
     for path in files:
         text = path.read_text(encoding="utf-8")
         assert audit.scan_text(text) == [], f"secret rule triggered in {path.name}"
@@ -123,7 +129,7 @@ def test_opt_in_plugin_tree_passes_public_hygiene_scan() -> None:
         assert forbidden_mux not in text, f"personal mux reference in {path.name}"
 
 
-def test_opt_in_registration_non_collision_precedence_and_effort(monkeypatch) -> None:
+def test_single_plugin_registers_three_disjoint_profiles(monkeypatch) -> None:
     original_pkg = sys.modules.get("antigravity_acp_mcp")
     registered: list[Any] = []
 
@@ -140,60 +146,77 @@ def test_opt_in_registration_non_collision_precedence_and_effort(monkeypatch) ->
     monkeypatch.setitem(sys.modules, "providers", providers_mod)
     monkeypatch.setitem(sys.modules, "providers.base", providers_base_mod)
 
-    opt_in_pkg = "_isolated_opt_in_acp_mcp"
-    default_pkg = "_isolated_default_acp"
+    acp_pkg = "_isolated_default_acp"
     try:
-        _load_isolated_plugin(default_pkg, DEFAULT_PLUGIN_DIR)
-        _load_isolated_plugin(opt_in_pkg, PLUGIN_DIR)
+        _load_isolated_plugin(acp_pkg, DEFAULT_PLUGIN_DIR)
 
         assert sys.modules.get("antigravity_acp_mcp") is original_pkg
-        assert len(registered) == 2
-        default_profile, opt_in_profile = registered
+        assert len(registered) == 3
+        by_name = {profile.name: profile for profile in registered}
+        assert set(by_name) == {
+            "antigravity-acp-replay",
+            "antigravity-acp",
+            "antigravity-acp-mcp",
+        }
+        replay = by_name["antigravity-acp-replay"]
+        default = by_name["antigravity-acp"]
+        compat = by_name["antigravity-acp-mcp"]
 
-        assert opt_in_profile.name == "antigravity-acp-mcp"
-        assert opt_in_profile.aliases == ("agy-mcp",)
-        assert opt_in_profile.base_url == "acp://antigravity-mcp"
-        assert opt_in_profile.fallback_models == ()
-        assert opt_in_profile.supports_vision is True
-        assert opt_in_profile.auth_type == "external_process"
+        # The public default identity moved to the Parked-MCP engine; the
+        # historical aliases followed it.
+        assert set(default.aliases) == {
+            "antigravity-cli",
+            "agy",
+            "antigravity",
+            "agy-acp",
+            "antigravity-official-acp",
+        }
+        assert default.base_url == "acp://antigravity"
+        assert default.fallback_models == ()
+        assert default.supports_vision is True
+        assert default.auth_type == "external_process"
 
-        default_names = {default_profile.name, *default_profile.aliases}
-        opt_in_names = {opt_in_profile.name, *opt_in_profile.aliases}
-        assert default_names.isdisjoint(opt_in_names)
-        assert default_profile.base_url != opt_in_profile.base_url
+        # Compatibility surface unchanged for existing opt-in users.
+        assert compat.aliases == ("agy-mcp",)
+        assert compat.base_url == "acp://antigravity-mcp"
 
-        # Runtime command precedence: MCP_COMMAND > ACP_COMMAND > profile.process_command,
-        # while an explicit command= argument always wins.
+        # Replay stays explicitly selectable, never a silent fallback.
+        assert set(replay.aliases) == {"agy-replay", "antigravity-replay"}
+
+        # Profile identity surfaces are pairwise disjoint: no name or alias
+        # may resolve to two engines.
+        surfaces = [{profile.name, *profile.aliases} for profile in registered]
+        for i in range(len(surfaces)):
+            for j in range(i + 1, len(surfaces)):
+                assert surfaces[i].isdisjoint(surfaces[j]), (i, j)
+
+        # Runtime command precedence on the DEFAULT profile:
+        # MCP_COMMAND > ACP_COMMAND > profile.process_command; explicit wins.
         monkeypatch.delenv("HERMES_ANTIGRAVITY_ACP_MCP_COMMAND", raising=False)
         monkeypatch.delenv("HERMES_ANTIGRAVITY_ACP_COMMAND", raising=False)
-        opt_in_profile.process_command = "/profile/official-launcher"
-        assert opt_in_profile.create_client()._command == "/profile/official-launcher"
+        default.process_command = "/profile/official-launcher"
+        assert default.create_client()._command == "/profile/official-launcher"
 
         monkeypatch.setenv("HERMES_ANTIGRAVITY_ACP_COMMAND", "/env/shared-launcher")
-        assert opt_in_profile.create_client()._command == "/env/shared-launcher"
+        assert default.create_client()._command == "/env/shared-launcher"
 
         monkeypatch.setenv("HERMES_ANTIGRAVITY_ACP_MCP_COMMAND", "/env/mcp-launcher")
-        assert opt_in_profile.create_client()._command == "/env/mcp-launcher"
+        assert default.create_client()._command == "/env/mcp-launcher"
 
-        assert opt_in_profile.create_client(command="/explicit/launcher")._command == "/explicit/launcher"
+        assert default.create_client(command="/explicit/launcher")._command == "/explicit/launcher"
 
         # Effort mapping through build_api_kwargs_extras.
-        assert opt_in_profile.build_api_kwargs_extras(reasoning_config=None) == ({}, {})
-        assert opt_in_profile.build_api_kwargs_extras(
+        assert default.build_api_kwargs_extras(reasoning_config=None) == ({}, {})
+        assert default.build_api_kwargs_extras(
             reasoning_config={"enabled": False, "effort": "high"}
         ) == ({}, {"reasoning_effort": "none"})
-        assert opt_in_profile.build_api_kwargs_extras(
+        assert default.build_api_kwargs_extras(
             reasoning_config={"enabled": True, "effort": "xhigh"}
         ) == ({}, {"reasoning_effort": "xhigh"})
-        assert opt_in_profile.build_api_kwargs_extras(reasoning_config={}) == ({}, {})
+        assert default.build_api_kwargs_extras(reasoning_config={}) == ({}, {})
     finally:
         for mod_name in list(sys.modules):
-            if (
-                mod_name == opt_in_pkg
-                or mod_name.startswith(opt_in_pkg + ".")
-                or mod_name == default_pkg
-                or mod_name.startswith(default_pkg + ".")
-            ):
+            if mod_name == acp_pkg or mod_name.startswith(acp_pkg + "."):
                 sys.modules.pop(mod_name, None)
 
 

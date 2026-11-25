@@ -1,4 +1,13 @@
-"""Hermes model-provider registration (imported only by the built plugin's ``__init__.py``, never by tests)."""
+"""Parked-MCP profile construction and registration (called by the plugin's ``__init__.py``).
+
+Since plugin 0.9.0 the Parked-MCP engine owns the public default surface:
+``antigravity-acp`` (with the historical aliases) is the default profile and
+``antigravity-acp-mcp`` (alias ``agy-mcp``) remains registered unchanged for
+existing opt-in configurations.  The Replay engine is a separate profile
+(``antigravity-acp-replay``) registered by the parent package.  Registration is
+an explicit call — importing this module has no side effects — so tests can
+construct profiles without touching the global registry.
+"""
 
 from __future__ import annotations
 
@@ -104,21 +113,63 @@ class AntigravityAcpMcpProfile(ProviderProfile):
         return {}, ({"reasoning_effort": effort} if effort else {})
 
 
-antigravity_acp_mcp = AntigravityAcpMcpProfile(
-    name="antigravity-acp-mcp",
-    aliases=("agy-mcp",),
-    display_name="Antigravity ACP (MCP tools)",
-    description="Google Antigravity via the official ACP server; Hermes tools over a parked loopback MCP endpoint",
-    api_mode="chat_completions",
-    env_vars=(),
-    base_url="acp://antigravity-mcp",
-    auth_type="external_process",
-    supports_vision=True,  # images go to agy as ACP image blocks / MCP image content
-    process_command=_default_official_command(),
-    process_args=(),
-    process_command_env_vars=("HERMES_ANTIGRAVITY_ACP_MCP_COMMAND", "HERMES_ANTIGRAVITY_ACP_COMMAND"),
-    process_args_env_var="HERMES_ANTIGRAVITY_ACP_MCP_ARGS",
-    fallback_models=(),
-)
+def register_parked_profiles(
+    *,
+    stored_process_command: str | None = None,
+    stored_process_args: tuple[str, ...] = (),
+) -> tuple[AntigravityAcpMcpProfile, AntigravityAcpMcpProfile]:
+    """Register the default ``antigravity-acp`` and compatibility ``antigravity-acp-mcp`` profiles.
 
-register_provider(antigravity_acp_mcp)
+    Both profiles run the same Parked-MCP engine; they differ only in identity
+    surface (name/aliases/base_url marker/env-var scope).  ``stored_process_command``/
+    ``stored_process_args`` carry the installer-preserved launch config so a
+    host pinned by ``deploy_hermes_profiles.py`` keeps its launch target across
+    the engine switch.  Returns ``(default, compat)`` for test introspection.
+    """
+    default = AntigravityAcpMcpProfile(
+        name="antigravity-acp",
+        aliases=(
+            "antigravity-cli",
+            "agy",
+            "antigravity",
+            "agy-acp",
+            "antigravity-official-acp",
+        ),
+        display_name="Antigravity ACP",
+        description=(
+            "Google Antigravity through Google's official ACP server; Hermes tools over a "
+            "parked loopback MCP endpoint (default engine since 0.9.0)"
+        ),
+        api_mode="chat_completions",
+        env_vars=(),
+        base_url="acp://antigravity",
+        auth_type="external_process",
+        supports_vision=True,
+        process_command=stored_process_command or _default_official_command(),
+        process_args=tuple(stored_process_args),
+        process_command_env_vars=(
+            "HERMES_ANTIGRAVITY_ACP_MCP_COMMAND",
+            "HERMES_ANTIGRAVITY_ACP_COMMAND",
+        ),
+        process_args_env_var="HERMES_ANTIGRAVITY_ACP_ARGS",
+        fallback_models=(),
+    )
+    compat = AntigravityAcpMcpProfile(
+        name="antigravity-acp-mcp",
+        aliases=("agy-mcp",),
+        display_name="Antigravity ACP (MCP tools)",
+        description="Google Antigravity via the official ACP server; Hermes tools over a parked loopback MCP endpoint",
+        api_mode="chat_completions",
+        env_vars=(),
+        base_url="acp://antigravity-mcp",
+        auth_type="external_process",
+        supports_vision=True,  # images go to agy as ACP image blocks / MCP image content
+        process_command=stored_process_command or _default_official_command(),
+        process_args=tuple(stored_process_args),
+        process_command_env_vars=("HERMES_ANTIGRAVITY_ACP_MCP_COMMAND", "HERMES_ANTIGRAVITY_ACP_COMMAND"),
+        process_args_env_var="HERMES_ANTIGRAVITY_ACP_MCP_ARGS",
+        fallback_models=(),
+    )
+    register_provider(default)
+    register_provider(compat)
+    return default, compat

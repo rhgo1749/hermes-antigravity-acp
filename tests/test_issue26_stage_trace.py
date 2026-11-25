@@ -170,7 +170,7 @@ def _make_client(module, tmp_path: Path, mode: str):
     fake = tmp_path / "fake_acp_server.py"
     fake.write_text(FAKE_ACP, encoding="utf-8")
     fake_log = tmp_path / f"fake-events-{mode}-{time.time_ns()}.jsonl"
-    client = module.antigravity_acp.create_client(
+    client = module.antigravity_acp_replay.create_client(
         command=sys.executable,
         args=[str(fake), mode, str(fake_log)],
         acp_cwd=str(tmp_path),
@@ -486,7 +486,7 @@ def _tool_schema(name: str):
 
 def test_local_rejection_and_retry_classification(monkeypatch, tmp_path):
     module, client_module, trace_module, bridge_module = _load_plugin(monkeypatch, tmp_path, trace=True)
-    client = module.antigravity_acp.create_client()
+    client = module.antigravity_acp_replay.create_client()
     responses = [_malformed_call(), _valid_call()]
     turns: list[dict] = []
 

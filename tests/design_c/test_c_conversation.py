@@ -2,6 +2,7 @@
 
 import contextlib
 import json
+import os
 import sys
 import threading
 import time
@@ -119,6 +120,61 @@ def test_cancel_while_in_flight_returns_fast(tmp_path):
         assert any(e["ev"] == "cancel" for e in events(log))
     finally:
         conv.close()
+
+
+def test_cancel_reaps_the_warm_child_in_the_interrupt_path(tmp_path):
+    # User stop is terminal: the interrupt path itself must signal the tree
+    # (a daemon retiree could die with a request-slot worker before reaping).
+    conv, log = make_conv(tmp_path, [[{"silent": 20}]])
+    try:
+        err = {}
+        token = threading.Event()
+
+        def go():
+            try:
+                conv.run([SYS, U1], TOOLS, "m", token)
+            except Exception as exc:  # noqa: BLE001
+                err["e"] = exc
+
+        th = threading.Thread(target=go)
+        th.start()
+        time.sleep(1.0)
+        conn = conv.conn
+        assert conn is not None and conn._proc is not None
+        pid = conn._proc.pid
+        conv.cancel(token)
+        th.join(5)
+        assert isinstance(err.get("e"), CancelledByUser)
+        assert conn._proc.poll() is not None  # reaped synchronously, not left warm
+        with pytest.raises(OSError):
+            os.kill(pid, 0)
+        assert conv.closed and conv.conn is None
+    finally:
+        conv.close()  # idempotent after a terminal cancel
+
+
+def test_registry_replaces_a_cancelled_conversation(tmp_path):
+    from antigravity_acp_mcp.conversation import Registry
+    behaviour = json.dumps({"script": [[{"text": "hi"}]], "log": str(tmp_path / "r.log"), "new_delay": 0})
+    conns = []
+
+    def spawn(key: str, cwd: str):
+        conn = AcpConnection(sys.executable, [FAKE, behaviour], cwd)
+        conn.start()
+        conn.initialize()
+        conns.append(conn)
+        return conn
+
+    reg = Registry(spawn)
+    first = reg.get("k1")
+    assert reg.get("k1") is first  # warm reuse while the conversation is alive
+    first.run([SYS, U1], [], "m")
+    first.cancel()  # user stop with no in-flight turn: still terminal
+    assert first.closed and conns[0]._proc.poll() is not None
+    second = reg.get("k1")
+    assert second is not first and not second.closed
+    assert second.fence == first.fence  # render state carries over
+    reg.close_all()
 
 
 def test_silent_model_step_times_out(tmp_path):

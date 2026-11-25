@@ -42,7 +42,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _load_real_plugin(monkeypatch, tmp_path):
+def _load_real_plugin(monkeypatch, tmp_path, provider_name: str = "antigravity-acp-replay"):
     if providers is None:
         pytest.fail(
             "strict Hermes seam validation requires importing the real providers package; "
@@ -63,12 +63,27 @@ def _load_real_plugin(monkeypatch, tmp_path):
     core = Path(providers.__file__).resolve().parent.parent
     origin = ProviderOrigin(installed, hermes_home, core)
     with origin.observing():
-        profile = providers.get_provider_profile("antigravity-acp")
+        profile = providers.get_provider_profile(provider_name)
     module = sys.modules.get(profile.__class__.__module__)
     assert module is not None
     module_path = getattr(module, "__file__", None)
     assert isinstance(module_path, str)
-    assert origin.accepts(module_path, "__init__.py"), "candidate/home/runtime provenance unverified"
+    # The profile's defining module must be a tracked file of the installed
+    # tree itself (or of a Core-staged frozen snapshot bound by the observer):
+    # the Replay profile lives in the package ``__init__.py``, the Parked-MCP
+    # profiles live under ``parked/``.  Core may serve the plugin from a
+    # runtime snapshot root, so the in-tree relative path is derived from the
+    # last occurrence of the installed directory name — never assumed, and
+    # ``accepts`` re-verifies payload bytes against the installed tree.
+    resolved_module = Path(module_path).resolve()
+    parts = resolved_module.parts
+    tree_name = installed.name
+    if tree_name not in parts:
+        pytest.fail(f"module path {resolved_module} is outside any {tree_name} tree")
+    tree_index = len(parts) - 1 - parts[::-1].index(tree_name)
+    relative = Path(*parts[tree_index + 1 :]).as_posix()
+    assert relative, f"module path {resolved_module} is the tree root itself"
+    assert origin.accepts(module_path, relative), "candidate/home/runtime provenance unverified"
     if "providers.plugin_reload" in sys.modules:
         _assert_genuine_core_provenance("providers.plugin_reload", core)
     return module, profile
@@ -151,7 +166,9 @@ def _state_provenance_symbol(upstream_path: Path | None) -> str:
 
 
 def test_vanilla_upstream_create_client_seam_builds_standalone_client(monkeypatch, tmp_path) -> None:
-    module, profile = _load_real_plugin(monkeypatch, tmp_path)
+    # The Replay engine stays seam-proven under its explicit id: selecting it
+    # must keep working byte-for-byte after 0.9.0 made Parked MCP the default.
+    module, profile = _load_real_plugin(monkeypatch, tmp_path, "antigravity-acp-replay")
     assert providers is not None
     assert callable(providers.register_provider)
 
@@ -175,7 +192,7 @@ def test_vanilla_upstream_create_client_seam_builds_standalone_client(monkeypatc
         assert os.environ.get("HERMES_TESTED_TREE") == tree
         assert Path(providers.__file__).resolve().is_relative_to(upstream_path)
 
-    assert profile is module.antigravity_acp
+    assert profile is module.antigravity_acp_replay
     assert isinstance(profile, module.ProviderProfile)
     direct_client = profile.create_client(
         api_key="antigravity-acp",
@@ -200,7 +217,7 @@ def test_vanilla_upstream_create_client_seam_builds_standalone_client(monkeypatc
 
     run_agent_before = sys.modules.get("run_agent")
     agent = SimpleNamespace(
-        provider="antigravity-acp",
+        provider="antigravity-acp-replay",
         _client_log_context=lambda: "",
         _build_keepalive_http_client=lambda *args, **kwargs: None,
     )
@@ -229,6 +246,55 @@ def test_vanilla_upstream_create_client_seam_builds_standalone_client(monkeypatc
     assert client.HERMES_SKIP_TRANSPORT_WRAP is True
     assert client.HERMES_SKIP_ASYNC_WRAP is True
     assert not any(base.__name__ == "CopilotACPClient" for base in client.__class__.__mro__)
+
+
+def test_vanilla_upstream_default_profile_seam_builds_parked_client(monkeypatch, tmp_path) -> None:
+    """The DEFAULT public identity (``antigravity-acp``) resolves to the Parked-MCP
+    engine and survives the same genuine Core dispatch as the Replay engine."""
+    module, profile = _load_real_plugin(monkeypatch, tmp_path, "antigravity-acp")
+    assert providers is not None
+    assert profile is not None
+    assert profile.name == "antigravity-acp"
+    assert profile.__class__.__module__.endswith("parked._plugin_entry")
+    assert isinstance(profile, module.ProviderProfile)
+    # The compatibility id resolves to the same engine class, distinct instance.
+    compat = providers.get_provider_profile("antigravity-acp-mcp")
+    assert compat is not profile
+    assert compat.__class__ is profile.__class__
+
+    direct_client = profile.create_client(
+        api_key="antigravity-acp",
+        base_url="acp://antigravity",
+        command="antigravity-acp-official",
+        args=[],
+    )
+    assert direct_client.__class__.__name__ == "AntigravityAcpMcpClient"
+    assert callable(direct_client.chat.completions.create)
+    assert not any(base.__name__ == "CopilotACPClient" for base in direct_client.__class__.__mro__)
+
+    from agent.agent_runtime_helpers import create_openai_client
+
+    agent = SimpleNamespace(
+        provider="antigravity-acp",
+        _client_log_context=lambda: "",
+        _build_keepalive_http_client=lambda *args, **kwargs: None,
+    )
+    client = create_openai_client(
+        agent,
+        {
+            "api_key": "antigravity-acp",
+            "base_url": "acp://antigravity",
+            "command": "antigravity-acp-official",
+            "args": [],
+        },
+        reason="default-parked-mcp-test",
+        shared=False,
+    )
+    assert client.__class__.__name__ == "AntigravityAcpMcpClient"
+    assert client.__class__.__module__.endswith("parked.client")
+    assert callable(client.chat.completions.create)
+    assert client.HERMES_SKIP_TRANSPORT_WRAP is True
+    assert client.HERMES_SKIP_ASYNC_WRAP is True
 
 
 def test_core_provenance_oracle_rejects_substituted_core_modules(monkeypatch) -> None:

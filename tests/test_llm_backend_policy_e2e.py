@@ -108,7 +108,7 @@ def _make_client(module, tmp_path: Path, *, postprocessing_policy: str | None = 
     }
     if postprocessing_policy is not None:
         kwargs["postprocessing_policy"] = postprocessing_policy
-    return module.antigravity_acp.create_client(**kwargs)
+    return module.antigravity_acp_replay.create_client(**kwargs)
 
 
 def _write_fake_server(tmp_path: Path, mode: str) -> tuple[Path, Path]:
@@ -298,13 +298,13 @@ def test_backend_policy_is_opt_in_and_fail_closed_on_typo(monkeypatch, tmp_path)
     module, client_module = _load_module(monkeypatch, tmp_path)
     assert client_module.POSTPROCESSING_POLICY_AGENT == "agent"
     assert client_module.POSTPROCESSING_POLICY_LLM_BACKEND == "llm_backend"
-    default_client = module.antigravity_acp.create_client(
+    default_client = module.antigravity_acp_replay.create_client(
         command=sys.executable, args=[], acp_cwd=str(tmp_path)
     )
     assert default_client.postprocessing_policy == "agent"
     assert default_client._llm_backend_postprocessing is False
     with pytest.raises(ValueError, match="postprocessing_policy must be one of"):
-        module.antigravity_acp.create_client(
+        module.antigravity_acp_replay.create_client(
             command=sys.executable,
             args=[],
             acp_cwd=str(tmp_path),
@@ -658,7 +658,7 @@ def _spawn_env(module, tmp_path: Path, *, args: list[str],
     }
     if policy is not None:
         kwargs["postprocessing_policy"] = policy
-    client = module.antigravity_acp.create_client(**kwargs)
+    client = module.antigravity_acp_replay.create_client(**kwargs)
     proc = client._spawn()
     proc.wait(timeout=15)
     return json.loads(probe.read_text(encoding="utf-8"))
