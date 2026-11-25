@@ -32,7 +32,7 @@ import time
 import unicodedata
 from collections.abc import Callable
 from dataclasses import replace
-from typing import Any
+from typing import Any, TypeGuard
 
 from .acp_connection import AcpConnection, AcpError
 from .matcher import (
@@ -102,6 +102,98 @@ def degenerate(text: str) -> bool:
     (seen 2026-11-23: 47 output tokens, content ``}``). Empty text is left to Hermes' own empty-reply handling."""
     stripped = text.strip()
     return bool(stripped) and len(stripped) <= 8 and all(unicodedata.category(c).startswith("P") for c in stripped)
+
+
+# ---- usage semantics (ported from the old engine's verified contract; docs/acp-usage-telemetry.md) ----------
+# ACP ``usage_update`` frames carry per-model-call consumption DELTA observations (``used``/``size``) whose
+# server semantics are NOT verified — the canonical doc is explicit that ``used`` is not cumulative context
+# occupancy and never billing. Reporting them as ``prompt_tokens`` makes every Hermes reader integrate
+# frame snapshots as consumption (issue #6 class; #194 chain audit: 25.39M "tokens" that were a frame
+# integral), so they are exposed ONLY as an explicitly unverified observation channel.
+# ``completion.usage`` is fed ONLY by the server's own ``session/prompt`` result breakdown, and only after a
+# growth-consistency gate against this adapter's local transcript estimate (2026-11-23 incident: a ~31K
+# transcript reported as ~1.07M fired the Core compression gate twice early).
+_CONTEXT_OBSERVATION_SOURCE = "acp.session/update:usage_update"
+_USAGE_OBSERVATION_SEMANTICS = ("usage_update.used is per-model-call consumption delta, not billing usage "
+                                "and not verified cumulative context occupancy; size is the context window")
+_USAGE_SCOPE_UNVERIFIED = "unverified_server_semantics"  # no runtime verdict store here: label honestly
+_USAGE_GROWTH_FACTOR = 8
+_USAGE_GROWTH_SLACK_TOKENS = 64_000
+_CJK_RANGES = (
+    (0x1100, 0x11FF), (0x2E80, 0x2FFF), (0x3040, 0x30FF), (0x3130, 0x318F),
+    (0x3400, 0x4DBF), (0x4E00, 0x9FFF), (0xAC00, 0xD7AF), (0xF900, 0xFAFF),
+    (0xFE30, 0xFE4F), (0xFF00, 0xFFDC), (0x20000, 0x3134F),
+)
+
+
+def _nonnegative_int(value: Any) -> TypeGuard[int]:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _estimate_tokens(text: str) -> int:
+    """Conservative token estimate (CJK ~1 token/char, other ~1 token/3 chars); old-engine port."""
+    if not text:
+        return 0
+    cjk = sum(1 for ch in text if any(lo <= ord(ch) <= hi for lo, hi in _CJK_RANGES))
+    return cjk + (len(text) - cjk) // 3 + 1
+
+
+def _transcript_tokens(messages: list[dict[str, Any]]) -> int:
+    """Local estimate of the transcript this adapter grew; the gate's independent yardstick."""
+    total = 0
+    for msg in messages:
+        content = msg.get("content")
+        if isinstance(content, str):
+            total += _estimate_tokens(content)
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and isinstance(part.get("text"), str):
+                    total += _estimate_tokens(part["text"])
+        for call in msg.get("tool_calls") or []:
+            fn = call.get("function") if isinstance(call, dict) else None
+            if isinstance(fn, dict):
+                total += _estimate_tokens(str(fn.get("name") or "")) + _estimate_tokens(str(fn.get("arguments") or ""))
+    return total
+
+
+def _consumption_from_prompt_result(result: dict[str, Any]) -> dict[str, int] | None:
+    """The server's own per-turn breakdown from the ``session/prompt`` result; None when absent/invalid.
+
+    Old-engine field contract (``_turn_usage_from_prompt_result``): ``inputTokens``, ``outputTokens`` and
+    ``totalTokens`` are REQUIRED nonnegative ints — a report missing any of them is rejected whole, never
+    patched with invented zeros or a locally summed total. ``thoughtTokens`` adds into output;
+    ``totalTokens`` is forwarded exactly as reported; ``cachedReadTokens`` stays separate.
+    """
+    usage = result.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    required = ("inputTokens", "outputTokens", "totalTokens")
+    optional = ("thoughtTokens", "cachedReadTokens")
+    for name in required:
+        if not _nonnegative_int(usage.get(name)):
+            return None
+    for name in optional:
+        if usage.get(name) is not None and not _nonnegative_int(usage[name]):
+            return None
+    out = {"input_tokens": usage["inputTokens"],
+           "output_tokens": usage["outputTokens"] + (usage.get("thoughtTokens") or 0),
+           "total_tokens": usage["totalTokens"]}
+    if usage.get("cachedReadTokens") is not None:
+        out["cached_read_tokens"] = usage["cachedReadTokens"]
+    return out
+
+
+def _reported_usage_growth_consistent(*, prev_reported: int, reported: int,
+                                      prev_local: int, local: int) -> tuple[bool, int, int]:
+    """Server-reported input growth must track the local transcript growth (old-engine port).
+
+    Tolerance is deliberately generous (8x plus a flat 64K slack): this gate rejects order-of-magnitude
+    divergence, not bookkeeping noise. Returns ``(ok, reported_growth, expected_growth)``.
+    """
+    expected = local - prev_local
+    actual = reported - prev_reported
+    tolerance = max(_USAGE_GROWTH_FACTOR * (abs(expected) + 1), _USAGE_GROWTH_SLACK_TOKENS)
+    return abs(actual - expected) <= tolerance, actual, expected
 
 
 class ProviderError(RuntimeError):
@@ -635,7 +727,10 @@ class Conversation:
         self.owner_token: threading.Event | None = None
         self.text: list[str] = []
         self.reasoning: list[str] = []
-        self.usage: dict[str, int] | None = None
+        self.usage: dict[str, int] | None = None  # consumption: session/prompt RESULT breakdown only (gated)
+        self.occupancy: dict[str, int] | None = None  # usage_update used/size: occupancy reading, never billing
+        self.frame_usage: dict[str, int] | None = None  # usage_update token fields: telemetry only
+        self._usage_baseline: tuple[int, int] | None = None  # (accepted reported input, local estimate)
         self.images = _Images()  # image numbering of the current ACP session
         self._seen_sys_msgs: set[str] = set()  # sha256 of large <system-message> blocks already sent in this session
         self.fence = "TOOL-OUTPUT-" + secrets.token_hex(4)  # unguessable to tool output, stable across replays
@@ -701,6 +796,7 @@ class Conversation:
                 self.handed = []
                 self.last_activity = time.monotonic()
                 self.text, self.reasoning, self.usage = [], [], None
+                self.occupancy, self.frame_usage = None, None
             elif decision.kind == "continue":
                 gen = self.gen
                 self.nudged = False
@@ -845,6 +941,7 @@ class Conversation:
         if self.server is not None:
             self.server.clear_completed()
         self.text, self.reasoning, self.usage = [], [], None
+        self.occupancy, self.frame_usage = None, None
         self.last_activity = time.monotonic()
 
         def worker() -> None:
@@ -925,15 +1022,72 @@ class Conversation:
             elif kind == "agent_thought_chunk" and content.get("type", "text") == "text":
                 self.reasoning.append(str(content.get("text") or ""))
             elif kind == "usage_update":
-                usage: dict[str, int] = dict(self.usage or {})
-                for src_k, dst_k in (("used", "used"), ("size", "size"), ("inputTokens", "input_tokens"),
-                                     ("outputTokens", "output_tokens"), ("input_tokens", "input_tokens"),
-                                     ("output_tokens", "output_tokens")):
+                # Frames feed the OCCUPANCY and telemetry channels only; they never reach ``self.usage``
+                # (consumption), which is fed exclusively by the session/prompt result breakdown.
+                occ: dict[str, int] = dict(self.occupancy or {})
+                for key in ("used", "size"):
+                    val = u.get(key)
+                    if _nonnegative_int(val):
+                        occ[key] = int(val)
+                if occ:
+                    self.occupancy = occ
+                fu: dict[str, int] = dict(self.frame_usage or {})
+                for src_k, dst_k in (("inputTokens", "input_tokens"), ("outputTokens", "output_tokens"),
+                                     ("input_tokens", "input_tokens"), ("output_tokens", "output_tokens")):
                     val = u.get(src_k)
-                    if isinstance(val, int) and not isinstance(val, bool) and val >= 0:
-                        usage[dst_k] = val
-                if usage:
-                    self.usage = usage
+                    if _nonnegative_int(val):
+                        fu[dst_k] = int(val)
+                if fu:
+                    self.frame_usage = fu
+
+    def _usage_observation(self) -> dict[str, Any] | None:
+        """Latest ``usage_update`` frame readings as ONE explicitly-unverified observation channel.
+
+        Never billing: the canonical doc labels these per-call deltas semantically unverified, and this
+        adapter holds no runtime verdict store to promote them.
+        """
+        if not self.occupancy and not self.frame_usage:
+            return None
+        obs: dict[str, Any] = {"source": _CONTEXT_OBSERVATION_SOURCE, "scope": _USAGE_SCOPE_UNVERIFIED,
+                               "semantics": _USAGE_OBSERVATION_SEMANTICS, "is_billing_usage": False}
+        obs.update(self.occupancy or {})
+        if self.frame_usage:
+            obs["frame_tokens"] = dict(self.frame_usage)
+        return obs
+
+    def _gate_turn_consumption(self, result: dict[str, Any],
+                               messages: list[dict[str, Any]]) -> dict[str, int] | None:
+        """Consumption for this turn: the prompt-result breakdown, gated on growth consistency.
+
+        A rejected report yields ``None`` so Hermes falls back to its own token estimate instead of
+        compacting against a number this adapter cannot vouch for; the last trusted baseline is kept,
+        so a permanently inflated server keeps getting rejected.
+        """
+        consumption = _consumption_from_prompt_result(result)
+        if consumption is None:
+            return None
+        reported = consumption["input_tokens"]
+        local = _transcript_tokens(messages)
+        baseline = self._usage_baseline
+        if baseline is None:
+            # First turn (or first after a restart): the old engine accepted unconditionally, so a server
+            # inflated from turn one could set a bogus baseline that every later turn then "agrees" with.
+            # Gate the absolute report against the local transcript estimate with the same divergence
+            # tolerance; a rejected first report leaves no baseline, so turn two is gated on its own.
+            if abs(reported - local) > max(_USAGE_GROWTH_FACTOR * (local + 1), _USAGE_GROWTH_SLACK_TOKENS):
+                logger.warning("acp-mcp: first-turn inputTokens %d rejected: diverges from local transcript "
+                               "estimate %d beyond tolerance; Hermes falls back to its own estimate", reported, local)
+                return None
+            self._usage_baseline = (reported, local)
+            return consumption
+        ok, actual, expected = _reported_usage_growth_consistent(
+            prev_reported=baseline[0], reported=reported, prev_local=baseline[1], local=local)
+        if ok:
+            self._usage_baseline = (reported, local)
+            return consumption
+        logger.warning("acp-mcp: reported inputTokens rejected: server growth %d vs local estimate growth %d; "
+                       "Hermes falls back to its own token estimate this turn", actual, expected)
+        return None
 
     def _fail(self, gen: int, reason: str, exc: ProviderError, *, drop_conn: bool = False) -> ProviderError:
         with self.lock:
@@ -995,7 +1149,8 @@ class Conversation:
                     elif self.terminal_tools and all(c.name in self.terminal_tools for c in calls):
                         self._retire("terminal-handout")  # caller ends on this tool (e.g. SubagentHandback)
                 return {"text": "".join(self.text), "reasoning": "".join(self.reasoning), "tool_calls": calls,
-                        "finish_reason": "tool_calls", "usage": dict(self.usage) if self.usage else None}
+                        "finish_reason": "tool_calls", "usage": None,
+                        "usage_observation": self._usage_observation()}
             if kind == "end":
                 self._drain_updates(gen)
                 if payload.stop_reason == "cancelled":
@@ -1013,8 +1168,10 @@ class Conversation:
                     self.view = view_after(messages)
                     if self.server is not None:
                         self.server.clear_completed()
+                    self.usage = self._gate_turn_consumption(payload.result, messages)
                 return {"text": "".join(self.text), "reasoning": "".join(self.reasoning), "tool_calls": [],
-                        "finish_reason": payload.finish_reason, "usage": dict(self.usage) if self.usage else None}
+                        "finish_reason": payload.finish_reason, "usage": dict(self.usage) if self.usage else None,
+                        "usage_observation": self._usage_observation()}
             if kind == "guard-loop":
                 self._drain_updates(gen)
                 with self.lock:
@@ -1022,7 +1179,8 @@ class Conversation:
                         self._retire("guard-loop")
                     self.view = replace(view_after(messages), retired=True)
                 return {"text": GUARD_LOOP_TEXT, "reasoning": "", "tool_calls": [], "finish_reason": "stop",
-                        "usage": dict(self.usage) if self.usage else None}
+                        "usage": None,
+                        "usage_observation": self._usage_observation()}
             if kind == "foreign":
                 raise self._fail(gen, "native-tool", ProviderError("agy attempted a native tool; session cancelled"),
                                  drop_conn=True)

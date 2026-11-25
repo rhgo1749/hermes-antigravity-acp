@@ -13,7 +13,11 @@ from typing import Any
 
 from ._hermes_seam import _conversation_affinity, _DualModeCompletionCreate, completion_to_stream_chunks
 from .acp_connection import AcpConnection
-from .conversation import Conversation, Registry
+from .conversation import (
+    _nonnegative_int,
+    Conversation,
+    Registry,
+)
 
 ACP_MARKER_BASE_URL = "acp://antigravity-mcp"
 THINKING_ENV = "HERMES_ANTIGRAVITY_ACP_MCP_THINKING_LEVEL"  # low|medium|high|xhigh; overrides reasoning_effort
@@ -92,19 +96,31 @@ def _completion(result: dict, model: str) -> SimpleNamespace:
     message = SimpleNamespace(content=result["text"], tool_calls=tool_calls,
                               reasoning=result["reasoning"] or None, reasoning_content=result["reasoning"] or None,
                               reasoning_details=None)
-    return SimpleNamespace(choices=[SimpleNamespace(message=message, finish_reason=result["finish_reason"])],
-                           usage=_usage(result.get("usage")), model=model)
+    completion = SimpleNamespace(
+        choices=[SimpleNamespace(message=message, finish_reason=result["finish_reason"])],
+        usage=_usage(result.get("usage")), model=model)
+    # One honest observation channel (never billing): the latest usage_update frame readings, explicitly
+    # labelled semantically-unverified per docs/acp-usage-telemetry.md — NOT a verified occupancy claim.
+    obs = result.get("usage_observation")
+    completion.antigravity_usage_observations = obs
+    return completion
 
 
 def _usage(u: dict | None) -> SimpleNamespace | None:
-    """agy's usage_update (input/output tokens, or context ``used``) as OpenAI-style usage; None when agy sent none."""
+    """The gated ``session/prompt`` result breakdown as OpenAI-style usage; None when absent or rejected.
+
+    All three totals must be present (the old-engine required-field contract); nothing is invented here
+    and there is NO fallback to frame ``used``. None lets Hermes' own estimate stand.
+    """
     if not u:
         return None
-    prompt = u.get("input_tokens", u.get("used"))
-    completion = u.get("output_tokens", 0)
-    if prompt is None:
+    prompt, completion, total = u.get("input_tokens"), u.get("output_tokens"), u.get("total_tokens")
+    if not all(_nonnegative_int(v) for v in (prompt, completion, total)):
         return None
-    return SimpleNamespace(prompt_tokens=prompt, completion_tokens=completion, total_tokens=prompt + completion)
+    ns = SimpleNamespace(prompt_tokens=prompt, completion_tokens=completion, total_tokens=total)
+    if _nonnegative_int(u.get("cached_read_tokens")):
+        ns.prompt_tokens_details = SimpleNamespace(cached_tokens=u["cached_read_tokens"])
+    return ns
 
 
 class AntigravityAcpMcpClient:
