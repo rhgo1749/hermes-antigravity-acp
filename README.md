@@ -594,6 +594,12 @@ older client and is not a published end-to-end result for this candidate. See
 `docs/clean-env-e2e-smoke.md` for the machine-readable evidence record and
 the standing NO-GO boundary.
 
+`scripts/acp_live_canary.py --engine parked` (issue #93) drives the deployed
+Parked-MCP provider/client end-to-end outside the gateway: credential-free
+fake-ACP verification in CI, and a class-4 live lane only under an
+operator-supervised, separately-approved run
+(`docs/live-canary.md`).
+
 ## Hermes provider plugin
 
 `hermes-plugin/antigravity-acp/` is a standalone Hermes model-provider plugin.

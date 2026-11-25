@@ -14,6 +14,17 @@ Modes:
                provider E2E). Requires explicit command and fresh evidence.
   raw-allow    disabled historical alias; cannot run any subprocess.
 
+Engines (--mode default only):
+  replay       legacy flat client; the historical default, behavior frozen.
+  parked       issue #93: the deployed Parked-MCP provider/client driven
+               through its Hermes-facing facade (model selection, plain
+               response, one harmless harness-owned MCP tool parked inside a
+               single held prompt, same-conversation follow-up, usage
+               contract, teardown).  Requires exactly one execution lane:
+               --fake-acp-only (credential-free fake ACP subprocess) or
+               --operator-supervised-live (attended terminal + typed
+               approval; never CI).  See docs/live-canary.md.
+
 Evidence correlation: every frame keeps the JSON-RPC id (in strict
 raw-probe mode a server-chosen id persists only as a deterministic
 ``num_<sha256[:12]>`` correlation token, so equal ids still join across
@@ -98,6 +109,38 @@ CANARY_RUNNER = (
     "else\n"
     "    python3 -m unittest -q\n"
     "fi\n"
+)
+
+
+# Issue #93: the Parked-MCP lane advertises exactly ONE harmless,
+# harness-owned MCP tool.  The driver answers the parked call with a canned
+# string; nothing is executed on the host in any lane.
+PARKED_CANARY_TOOL: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "canary_echo",
+        "description": (
+            "Harmless canary probe owned by the test harness: echoes the "
+            "given text back verbatim. It never touches the host."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "token to echo back"},
+            },
+            "required": ["text"],
+        },
+    },
+}
+
+PARKED_PROMPT = (
+    "Call the canary_echo tool exactly once with text=\"ping-42\", then tell "
+    "me in one short sentence what it returned."
+)
+
+PARKED_FOLLOW_UP_PROMPT = (
+    "What exact token did canary_echo return a moment ago? Reply with just "
+    "that token."
 )
 
 
@@ -353,6 +396,19 @@ def _sanitize(frame: Any, clean_text: Any) -> Any:
                 out[key] = clean_text(value)[:LONG_STRING_CAP]
                 if len(value) > LONG_STRING_CAP:
                     out[key + "_len"] = len(value)
+            elif key == "headers" and isinstance(value, list):
+                # MCP server headers ride as [{name, value}] pairs; an
+                # Authorization value (e.g. the parked loopback bearer token)
+                # is a secret in every lane.
+                safe_headers = []
+                for item in value:
+                    if (isinstance(item, dict)
+                            and str(item.get("name", "")).lower()
+                            in {"authorization", "proxy-authorization",
+                                "x-api-key", "api-key"}):
+                        item = {**item, "value": "<redacted>"}
+                    safe_headers.append(_sanitize(item, clean_text))
+                out[key] = safe_headers
             else:
                 out[key] = _sanitize(value, clean_text)
         return out
@@ -1093,12 +1149,343 @@ def run_raw_allow(args, recorder: FrameRecorder, evidence_dir: Path) -> int:
         )
 
 
+def _git_revision(repo: Path) -> str | None:
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return proc.stdout.strip() or None
+
+
+def run_parked(args, module, recorder: FrameRecorder, evidence_dir: Path,
+               started: float) -> int:
+    """Issue #93: drive the deployed Parked-MCP provider/client as Hermes does.
+
+    No mock engine and no protocol re-implementation: the engine modules are
+    imported from the loaded plugin package and driven through the same
+    OpenAI-shaped facade Hermes calls.  ACP stdio is teed into the frame
+    recorder by wrapping the engine's own ``AcpConnection`` at spawn time.
+    The driver answers parked tool calls with a canned harmless string; it
+    never executes anything on the host.
+
+    Verdicts distinguish ``fail`` (contract breached) from ``inconclusive``
+    (the probe could not be exercised, e.g. the model chose not to call the
+    advertised tool).  Exit code: 2 = refused preflight, 1 = error or fail,
+    0 = no fail verdicts (inconclusive verdicts are reported, not hidden).
+    """
+    import importlib
+
+    pkg = module.__name__
+    parked_client = importlib.import_module(pkg + ".parked.client")
+    parked_acp = importlib.import_module(pkg + ".parked.acp_connection")
+    parked_session = importlib.import_module(pkg + ".parked.session")
+    parked_usage = importlib.import_module(pkg + ".parked.usage_contract")
+
+    clean_text = _redact_factory(parked_client)
+    recorder._clean = clean_text
+
+    command = args.command or parked_client._default_command()[0]
+    if args.fake_acp_only and Path(command).name == "antigravity-acp-official":
+        print(
+            "parked fake lane must point --command at a fake ACP binary; the "
+            "engine-resolved default is the official launcher", file=sys.stderr,
+        )
+        return 2
+
+    # Tee every ACP child this run spawns.  client._spawn_factory resolves
+    # AcpConnection from the client module's globals at spawn time, and
+    # start() opens the pipes via subprocess.Popen from acp_connection's
+    # globals — both are rebound for the duration of start() only.
+    original_connection = parked_acp.AcpConnection
+
+    class _TeeConnection(original_connection):
+        def start(self):
+            real_popen = subprocess.Popen
+
+            def _teeing_popen(*popen_args, **popen_kwargs):
+                proc = real_popen(*popen_args, **popen_kwargs)
+                proc.stdin = _StdinTee(proc.stdin, recorder)  # type: ignore[assignment]
+                proc.stdout = _StdoutTee(proc.stdout, recorder)  # type: ignore[assignment]
+                return proc
+
+            parked_acp.subprocess = types.SimpleNamespace(  # type: ignore[attr-defined]
+                Popen=_teeing_popen, PIPE=subprocess.PIPE)
+            try:
+                super().start()
+            finally:
+                parked_acp.subprocess = subprocess  # type: ignore[attr-defined]
+
+    parked_client.AcpConnection = _TeeConnection  # type: ignore[attr-defined]
+
+    # Engine-side decisions (usage-gate rejections etc.) surface as fixed
+    # "acp-mcp" log lines; capture them sanitized so a gate rejection is
+    # distinguishable from a silent server omission.
+    class _EngineLogCollector(logging.Handler):
+        def __init__(self) -> None:
+            super().__init__()
+            self.messages: list[str] = []
+
+        def emit(self, record: logging.LogRecord) -> None:
+            try:
+                msg = record.getMessage()
+            except Exception:  # noqa: BLE001
+                return
+            if "acp-mcp" not in msg:
+                return
+            if len(self.messages) < 20:
+                self.messages.append(clean_text(msg)[:200])
+
+    engine_logs = _EngineLogCollector()
+    engine_logger = logging.getLogger(pkg + ".parked")
+    engine_logger.addHandler(engine_logs)
+
+    client = parked_client.AntigravityAcpMcpClient(command=command, args=[])
+    summary: dict[str, Any] = {
+        "engine": "parked",
+        "client_class": type(client).__name__,
+        "started_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "server_binary_basename": Path(command).name,
+        "command_resolution": "explicit" if args.command else "engine-default",
+        "model_requested": args.model,
+        "runtime_python": sys.version.split()[0],
+        "harness_revision": _git_revision(Path(args.repo)),
+    }
+    verdicts: dict[str, str] = {}
+    error: str | None = None
+    first_text = final_text = follow_answer = ""
+    tool_round: dict[str, Any] = {}
+    follow_up: dict[str, Any] = {}
+    try:
+        def out_frames(method: str) -> list[dict[str, Any]]:
+            return [
+                entry for entry in recorder.frames
+                if entry.get("dir") == "out"
+                and isinstance(entry.get("frame"), dict)
+                and entry["frame"].get("method") == method
+            ]
+
+        messages = [{"role": "user", "content": args.prompt}]
+        first = client.chat.completions.create(
+            model=args.model, messages=messages,
+            tools=[dict(PARKED_CANARY_TOOL)], stream=False,
+        )
+        first_text = first.choices[0].message.content or ""
+        calls = list(getattr(first.choices[0].message, "tool_calls", None) or [])
+
+        tool_round = {
+            "advertised": True,
+            "calls_observed": bool(calls),
+            "call_id_shape_ok": None,
+            "answered_in_same_prompt": None,
+            "prompt_requests_across_round": None,
+        }
+        final_text = first_text
+        assistant_row: dict[str, Any] | None = None
+        tool_rows: list[dict[str, Any]] = []
+        if calls:
+            ids = [str(getattr(call, "id", "")) for call in calls]
+            tool_round["call_ids"] = ids
+            tool_round["call_id_shape_ok"] = bool(ids) and all(
+                re.fullmatch(r"call_[0-9a-f]{32}", one) for one in ids
+            )
+            assistant_row = {
+                "role": "assistant", "content": None,
+                "tool_calls": [
+                    {
+                        "id": str(getattr(call, "id", "")),
+                        "type": "function",
+                        "function": {
+                            "name": str(getattr(
+                                getattr(call, "function", None), "name", "")),
+                            "arguments": str(getattr(
+                                getattr(call, "function", None), "arguments", "{}")),
+                        },
+                    }
+                    for call in calls
+                ],
+            }
+            tool_rows = [
+                {"role": "tool", "tool_call_id": one,
+                 "content": "canary-simulated-result"}
+                for one in ids
+            ]
+            # Parked contract: the tool result is answered into the SAME held
+            # ACP prompt; the engine must not open a second session/prompt.
+            second = client.chat.completions.create(
+                model=args.model, messages=messages + [assistant_row, *tool_rows],
+                tools=[dict(PARKED_CANARY_TOOL)], stream=False,
+            )
+            final_text = second.choices[0].message.content or ""
+            tool_round["answered_in_same_prompt"] = bool(final_text.strip())
+        prompts_during_round = len(out_frames("session/prompt"))
+        if calls:
+            tool_round["prompt_requests_across_round"] = prompts_during_round
+            tool_round["ok"] = bool(
+                tool_round["call_id_shape_ok"]
+                and tool_round["answered_in_same_prompt"]
+                and prompts_during_round == 1
+            )
+            verdicts["parked_tool_round"] = "pass" if tool_round["ok"] else "fail"
+        else:
+            # The model chose not to call the advertised tool: the parked
+            # round was never exercised.  Inconclusive, not a failure.
+            verdicts["parked_tool_round"] = "inconclusive"
+        verdicts["plain_response"] = "pass" if final_text.strip() else "fail"
+
+        follow_text = (args.follow_up if args.follow_up is not None
+                       else PARKED_FOLLOW_UP_PROMPT)
+        follow_messages = list(messages)
+        if assistant_row is not None:
+            follow_messages += [assistant_row, *tool_rows]
+        follow_messages += [
+            {"role": "assistant", "content": final_text},
+            {"role": "user", "content": follow_text},
+        ]
+        third = client.chat.completions.create(
+            model=args.model, messages=follow_messages,
+            tools=[dict(PARKED_CANARY_TOOL)], stream=False,
+        )
+        follow_answer = third.choices[0].message.content or ""
+        follow_up = {
+            "answered": bool(follow_answer.strip()),
+            "prompt_requests_total": len(out_frames("session/prompt")),
+            "session_new_requests_total": len(out_frames("session/new")),
+            "model_selection_requests_total": len(
+                out_frames("session/set_model")
+                + out_frames("session/set_config_option")
+            ),
+        }
+        follow_up["same_session_no_new"] = bool(
+            follow_up["answered"]
+            and follow_up["session_new_requests_total"] == 1
+            and follow_up["prompt_requests_total"] == 2
+        )
+        verdicts["follow_up_same_session"] = (
+            "pass" if follow_up["same_session_no_new"] else "fail"
+        )
+
+        usage = getattr(third, "usage", None)
+        observations = getattr(third, "antigravity_usage_observations", None)
+        summary["usage"] = {
+            # OpenAI-style names as the deployed facade exposes them.
+            "final_turn_reported": None if usage is None else {
+                "prompt_tokens": getattr(usage, "prompt_tokens", None),
+                "completion_tokens": getattr(usage, "completion_tokens", None),
+                "total_tokens": getattr(usage, "total_tokens", None),
+            },
+            "observations_present": bool(observations),
+            "observations": _sanitize(observations, clean_text) if observations else None,
+            "local_estimate_tokens": parked_usage.transcript_tokens(follow_messages),
+            "billing_claim": "none; server-reported figures are unverified telemetry",
+        }
+        verdicts["usage_contract"] = (
+            "pass" if summary["usage"]["final_turn_reported"] else "inconclusive"
+        )
+
+        disabled: list[str] = []
+        for entry in out_frames("session/new"):
+            meta = ((entry["frame"].get("params") or {}).get("_meta") or {})
+            antigravity = meta.get("antigravity") or {}
+            listed = antigravity.get("disabledTools")
+            if isinstance(listed, list):
+                disabled = [str(one) for one in listed]
+        native_tools = [str(one) for one in getattr(parked_session, "NATIVE_TOOLS", [])]
+        # Evidence lists are capped by the sanitizer; a truncated recording
+        # must never masquerade as a mismatch.  The authoritative set
+        # equality is asserted against the fake's own request log in tests.
+        recorded_prefix_ok = bool(
+            disabled
+            and native_tools
+            and disabled == native_tools[:len(disabled)]
+        )
+        summary["containment"] = {
+            "disabled_native_tools_recorded": len(disabled) or None,
+            "engine_declared_native_tools": len(native_tools) or None,
+            "recorded_matches_engine_declaration_prefix": recorded_prefix_ok,
+            "run_command_in_engine_native_tools": "run_command" in native_tools,
+        }
+        verdicts["containment"] = (
+            "pass" if recorded_prefix_ok and "run_command" in native_tools
+            else "inconclusive"
+        )
+
+        connections = []
+        for registry in list(parked_client._registries.values()):
+            for conversation in list(getattr(registry, "_conversations", {}).values()):
+                conn = getattr(conversation, "conn", None)
+                if conn is not None:
+                    connections.append(conn)
+            registry.close_all()
+        parked_client._registries.clear()
+        exited = [
+            bool(getattr(conn, "exited", False)
+                 or (getattr(conn, "_proc", None) is not None
+                     and conn._proc.returncode is not None))
+            for conn in connections
+        ]
+        summary["teardown"] = {
+            "acp_connections": len(connections),
+            "direct_children_exited": all(exited) if exited else None,
+            "descendant_tree": "not asserted (issue #94 F-3 is out of scope)",
+        }
+        verdicts["normal_teardown"] = (
+            "pass" if exited and all(exited) else "inconclusive"
+        )
+
+        summary["model_selection"] = {
+            "requested": args.model,
+            "selection_requests": follow_up["model_selection_requests_total"],
+        }
+        verdicts["model_selection"] = (
+            "pass" if follow_up["model_selection_requests_total"] >= 1 else "inconclusive"
+        )
+    except Exception as exc:  # noqa: BLE001 - the canary reports, never re-raises
+        error = clean_text(f"{type(exc).__name__}: {exc}")[:400]
+    finally:
+        engine_logger.removeHandler(engine_logs)
+        try:
+            client.close()
+        except Exception:  # noqa: BLE001
+            pass
+        recorder._fh.close()
+
+    summary["engine_log_facts"] = engine_logs.messages
+    summary["answers"] = {
+        "initial": clean_text(first_text)[:200],
+        "final": clean_text(final_text)[:200],
+        "follow_up": clean_text(follow_answer)[:200],
+    }
+    summary["tool_round"] = tool_round
+    summary["follow_up"] = follow_up
+    summary["verdicts"] = verdicts
+    summary["error"] = error
+    summary["elapsed_seconds"] = round(time.monotonic() - started, 2)
+    (evidence_dir / "summary.json").write_text(
+        json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    print(json.dumps(summary, indent=2, ensure_ascii=False))
+    if error is not None:
+        return 1
+    return 1 if "fail" in verdicts.values() else 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", default=str(Path(__file__).resolve().parents[1]))
     parser.add_argument("--cwd", required=True, help="absolute isolated worktree path")
     parser.add_argument("--mode", choices=("default", "raw-probe", "raw-allow"), required=True)
     parser.add_argument("--model", default="gemini-3.8-flash-low")
+    parser.add_argument(
+        "--engine",
+        choices=("replay", "parked"),
+        default="replay",
+        help="replay = legacy flat client (preserved default); parked = the "
+             "deployed Parked-MCP provider/client (issue #93). The parked "
+             "engine requires an explicit execution lane flag.",
+    )
     parser.add_argument("--timeout", type=float, default=600.0)
     parser.add_argument("--evidence", required=True)
     parser.add_argument(
@@ -1138,9 +1525,15 @@ def main() -> int:
     )
     parser.add_argument(
         "--command",
-        default=str(Path.home() / ".local" / "bin" / "antigravity-acp-official"),
+        default=None,
+        help="ACP launcher; when omitted the replay engine keeps its "
+             "historical default and the parked engine uses its own "
+             "supported resolution (env override -> official launcher)",
     )
     args = parser.parse_args()
+    if args.command is None and args.engine == "replay":
+        # Byte-compatible with every pre-#93 invocation.
+        args.command = str(Path.home() / ".local" / "bin" / "antigravity-acp-official")
     if args.mode == "raw-allow":
         print(
             "raw-allow is disabled: automatic ACP tool approval is unsafe. "
@@ -1160,7 +1553,23 @@ def main() -> int:
             file=sys.stderr,
         )
         return 2
-    if args.fake_acp_only and Path(args.command).name == "antigravity-acp-official":
+    if args.engine == "parked":
+        # Issue #93: the parked engine drives the real deployed provider, so
+        # it never runs unattended.  Live inference additionally needs the
+        # attended terminal + typed confirmation below.
+        if args.mode != "default":
+            print("--engine parked supports --mode default only", file=sys.stderr)
+            return 2
+        if args.fake_acp_only == args.operator_supervised_live:
+            print(
+                "parked engine requires exactly one execution lane: "
+                "--fake-acp-only or --operator-supervised-live. Neither flag "
+                "grants vendor approval.",
+                file=sys.stderr,
+            )
+            return 2
+    if (args.fake_acp_only and args.command is not None
+            and Path(args.command).name == "antigravity-acp-official"):
         print("fake ACP lane refuses the default official binary", file=sys.stderr)
         return 2
     if args.mode == "raw-probe" and not (
@@ -1184,7 +1593,9 @@ def main() -> int:
             print("live canary not confirmed", file=sys.stderr)
             return 2
     if args.prompt is None:
-        if args.mode == "raw-probe":
+        if args.engine == "parked":
+            args.prompt = PARKED_PROMPT
+        elif args.mode == "raw-probe":
             args.prompt = "Reply with exactly pong."
         else:
             args.prompt = (
@@ -1266,6 +1677,16 @@ def main() -> int:
     collector = TelemetryCollector()
     logging.getLogger().addHandler(collector)
     logging.getLogger().setLevel(logging.INFO)
+
+    if args.engine == "parked":
+        # Issue #93: drive the deployed Parked-MCP provider/client; the
+        # replay client object is deliberately never constructed on this
+        # path (a silent fallback would defeat the whole point).
+        try:
+            return run_parked(args, module, recorder, evidence_dir,
+                              started=time.monotonic())
+        finally:
+            logging.getLogger().removeHandler(collector)
 
     client = module.antigravity_acp_replay.create_client(
         command=args.command, args=[], acp_cwd=cwd, rate_limit_retries=0,
