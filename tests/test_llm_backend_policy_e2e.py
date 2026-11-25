@@ -610,7 +610,7 @@ def test_single_mode_backend_never_receives_mux_declaration_env(
     module, _client_module = _load_module(monkeypatch, tmp_path)
     default_client = _make_client(module, tmp_path)
     default_client.chat.completions.create(
-        model="gemini-3-pro", messages=[{"role": "user", "content": "agent turn"}]
+        model="fake-model-a", messages=[{"role": "user", "content": "agent turn"}]
     )
     agent_rows = _rows(tmp_path / "fake_acp_log.jsonl")
     assert agent_rows, "fake server must have logged the agent request"
@@ -621,7 +621,7 @@ def test_single_mode_backend_never_receives_mux_declaration_env(
 
     backend_client = _make_client(module, tmp_path, postprocessing_policy="llm_backend")
     backend_client.chat.completions.create(
-        model="gemini-3-pro", messages=[{"role": "user", "content": "one-shot note"}]
+        model="fake-model-a", messages=[{"role": "user", "content": "one-shot note"}]
     )
     rows = _rows(tmp_path / "fake_acp_log.jsonl")
     backend_rows = rows[len(agent_rows):]
