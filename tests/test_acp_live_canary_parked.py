@@ -26,6 +26,17 @@ SECRET_JSON_REFRESH = "json-refresh-secret-222"
 SECRET_JSON_API_KEY = "json-apikey-secret-333"
 
 PARKED_FAKE_SOURCE = r"""
+MALFORMED_USAGE = {
+    "parked_usage_malformed_missing_total": {"inputTokens": 40, "outputTokens": 8},
+    "parked_usage_malformed_string_input": {"inputTokens": "40",
+                                            "outputTokens": 8, "totalTokens": 48},
+    "parked_usage_malformed_negative_input": {"inputTokens": -5,
+                                              "outputTokens": 8, "totalTokens": 48},
+    "parked_usage_malformed_bool_input": {"inputTokens": True,
+                                          "outputTokens": 8, "totalTokens": 48},
+    "parked_usage_malformed_negative_thought": {"inputTokens": 40, "outputTokens": 8,
+                                                "totalTokens": 48, "thoughtTokens": -1},
+}
 import json
 import os as _os
 import sys
@@ -201,13 +212,16 @@ while True:
             usage = ({"inputTokens": 10_000_000, "outputTokens": 8, "totalTokens": 10_000_008}
                      if SCENARIO in ("parked_inflated_usage",
                                      "parked_usage_turn1_bad_turn2_rejected")
-                     else {"inputTokens": 40, "outputTokens": 8, "totalTokens": 48})
+                     else MALFORMED_USAGE.get(SCENARIO)
+                     or {"inputTokens": 40, "outputTokens": 8, "totalTokens": 48})
             res = {"stopReason": "end_turn", "usage": usage}
             res.update(extra)
             emit({"jsonrpc": "2.0", "id": rpc_id, "result": res})
         else:
             emit(chunk("FOLLOW_UP_ANSWER ping-42"))
-            if SCENARIO == "parked_usage_turn1_bad_turn2_rejected":
+            if SCENARIO in MALFORMED_USAGE:
+                usage = MALFORMED_USAGE[SCENARIO]
+            elif SCENARIO == "parked_usage_turn1_bad_turn2_rejected":
                 usage = {"inputTokens": 20_000_000, "outputTokens": 8,
                          "totalTokens": 20_000_008}
             elif SCENARIO == "parked_inflated_usage":
@@ -498,6 +512,27 @@ def test_parked_turn1_anomalous_accepted_turn2_rejected_fails_contract(
     assert summary["verdicts"]["usage_contract"] == "fail"
 
 
+@pytest.mark.parametrize("scenario", (
+    "parked_usage_malformed_missing_total",
+    "parked_usage_malformed_string_input",
+    "parked_usage_malformed_negative_input",
+    "parked_usage_malformed_bool_input",
+    "parked_usage_malformed_negative_thought",
+))
+def test_parked_malformed_usage_rejected_passes_contract(
+        canary, monkeypatch, tmp_path, scenario):
+    """Engine-parser boundaries (missing required field, wrong type, negative,
+    bool, invalid optional): the engine rejects the report whole and that is
+    contract PASS, never a canary false FAIL."""
+    code, summary, _, _, _, _ = _run_parked(canary, monkeypatch, tmp_path, scenario)
+    assert code == 0 and summary["overall"] == "pass"
+    turns = summary["usage"]["turns"]
+    assert all(t["server_reported"] and not t["report_valid"]
+               and not t["engine_accepted"] for t in turns)
+    assert summary["usage"]["server_report_status"] == "invalid_rejected"
+    assert summary["verdicts"]["usage_contract"] == "pass"
+
+
 def test_parked_plausible_usage_rejected_fails_contract(canary, monkeypatch, tmp_path):
     """#87 boundary: the engine rejecting a PLAUSIBLE report is a contract
     breach (false rejection), not a pass."""
@@ -521,8 +556,9 @@ def test_parked_plausible_usage_rejected_fails_contract(canary, monkeypatch, tmp
 
 
 def test_parked_usage_verdict_decision_table(canary):
-    def turn(reported, accepted, plausible):
+    def turn(reported, accepted, plausible, valid=None):
         return {"server_reported": reported, "engine_accepted": accepted,
+                "report_valid": reported if valid is None else valid,
                 "plausible": plausible}
     # normal accepted -> PASS
     assert canary._usage_verdict([turn(True, True, True)]) == ("plausible", "pass")
@@ -532,6 +568,14 @@ def test_parked_usage_verdict_decision_table(canary):
     assert canary._usage_verdict([turn(True, True, False)]) == ("anomalous_accepted", "fail")
     # normal rejected -> FAIL
     assert canary._usage_verdict([turn(True, False, True)]) == ("plausible_rejected", "fail")
+    # malformed rejected -> PASS
+    assert canary._usage_verdict(
+        [turn(True, False, False, valid=False)]) == ("invalid_rejected", "pass")
+    # malformed accepted -> FAIL
+    assert canary._usage_verdict(
+        [turn(True, True, False, valid=False)]) == ("invalid_accepted", "fail")
+    # usage invented with no server report -> FAIL
+    assert canary._usage_verdict([turn(False, True, None)]) == ("invented_usage", "fail")
     # nothing reported -> INCONCLUSIVE
     assert canary._usage_verdict([turn(False, False, None)]) == ("unavailable", "inconclusive")
     assert canary._usage_verdict([]) == ("unavailable", "inconclusive")
@@ -542,6 +586,8 @@ def test_parked_usage_verdict_decision_table(canary):
         [turn(True, False, False), turn(True, True, False)]) == ("anomalous_accepted", "fail")
     assert canary._usage_verdict(
         [turn(True, False, True), turn(True, True, True)]) == ("plausible_rejected", "fail")
+    assert canary._usage_verdict(
+        [turn(True, True, True, valid=False), turn(True, False, False)]) == ("invalid_accepted", "fail")
     assert canary._usage_verdict(
         [turn(True, True, True), turn(True, False, False)]) == ("mixed", "pass")
 

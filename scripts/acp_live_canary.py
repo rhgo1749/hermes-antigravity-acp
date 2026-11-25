@@ -470,21 +470,31 @@ def _teardown_verdict(exited: list[bool]) -> str:
 
 
 def _usage_verdict(turns: list[dict[str, Any]]) -> tuple[str, str]:
-    """Decision table per reported turn: plausible+accepted and
-    anomalous+rejected are contract success; accepted-anomalous or
-    rejected-plausible on ANY turn is a breach (fail).  Nothing reported is
+    """Per reported turn the engine may accept only a parser-valid, plausible
+    report: valid+plausible accepted, or invalid/implausible rejected, is
+    contract success.  Breaches (fail): accepting an invalid or implausible
+    report, rejecting a valid plausible one, or surfacing usage the server
+    never reported.  Any-turn breach fails the whole run; nothing reported is
     inconclusive."""
+    if any(not t["server_reported"] and t["engine_accepted"] for t in turns):
+        return "invented_usage", "fail"
     reported = [t for t in turns if t["server_reported"]]
     if not reported:
         return "unavailable", "inconclusive"
-    if any(not t["engine_accepted"] and t["plausible"] for t in reported):
-        return "plausible_rejected", "fail"
+    if any(t["engine_accepted"] and not t["report_valid"] for t in reported):
+        return "invalid_accepted", "fail"
     if any(t["engine_accepted"] and not t["plausible"] for t in reported):
         return "anomalous_accepted", "fail"
-    if all(t["engine_accepted"] for t in reported):
-        return "plausible", "pass"
-    if all(not t["engine_accepted"] for t in reported):
+    if any(not t["engine_accepted"] and t["report_valid"] and t["plausible"]
+           for t in reported):
+        return "plausible_rejected", "fail"
+    accepted = [t for t in reported if t["engine_accepted"]]
+    if not accepted:
+        if all(not t["report_valid"] for t in reported):
+            return "invalid_rejected", "pass"
         return "anomalous_rejected", "pass"
+    if len(accepted) == len(reported):
+        return "plausible", "pass"
     return "mixed", "pass"
 
 
@@ -1329,6 +1339,7 @@ def run_parked(args, module, recorder: FrameRecorder, evidence_dir: Path,
     parked_acp = importlib.import_module(pkg + ".parked.acp_connection")
     parked_session = importlib.import_module(pkg + ".parked.session")
     parked_usage = importlib.import_module(pkg + ".parked.usage_contract")
+    parked_conv = importlib.import_module(pkg + ".parked.conversation")
     parked_upstream = importlib.import_module(pkg + ".parked._upstream")
     client_module = importlib.import_module(pkg + ".client")
 
@@ -1567,22 +1578,32 @@ def run_parked(args, module, recorder: FrameRecorder, evidence_dir: Path,
                     (turn1_completion, third), turn_locals):
                 accepted = getattr(completion, "usage", None) is not None
                 turn = {"server_reported": raw_usage is not None,
+                        "report_valid": False,
                         "engine_accepted": accepted,
                         "plausible": None}
                 if raw_usage is not None:
-                    reported_in = raw_usage.get("inputTokens")
-                    if not isinstance(reported_in, int) or not local:
-                        plausible = False
-                    elif baseline is None:
-                        plausible = parked_usage.first_turn_report_plausible(
-                            reported=reported_in, local=local)
+                    # Same parser the engine gates on: a report it rejects as
+                    # malformed must never be judged plausible here (that was
+                    # a false FAIL when the engine behaved correctly).
+                    consumption = parked_conv._consumption_from_prompt_result(
+                        {"usage": raw_usage})
+                    turn["report_valid"] = consumption is not None
+                    if consumption is None:
+                        turn["plausible"] = False
+                    elif not local:
+                        turn["plausible"] = False
                     else:
-                        plausible, _, _ = parked_usage.reported_usage_growth_consistent(
-                            prev_reported=baseline[0], reported=reported_in,
-                            prev_local=baseline[1], local=local)
-                    turn["plausible"] = plausible
-                    if accepted:
-                        baseline = (reported_in, local)
+                        reported_in = consumption["input_tokens"]
+                        if baseline is None:
+                            plausible = parked_usage.first_turn_report_plausible(
+                                reported=reported_in, local=local)
+                        else:
+                            plausible, _, _ = parked_usage.reported_usage_growth_consistent(
+                                prev_reported=baseline[0], reported=reported_in,
+                                prev_local=baseline[1], local=local)
+                        turn["plausible"] = plausible
+                        if accepted:
+                            baseline = (reported_in, local)
                 usage_turns.append(turn)
             server_report_status, verdicts["usage_contract"] = _usage_verdict(usage_turns)
 
