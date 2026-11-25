@@ -49,13 +49,15 @@ def _load_entry(monkeypatch):
     spec.loader.exec_module(module)
     # Registration is explicit since 0.9.0: importing has no side effects.
     assert registered == []
-    default, compat = module.register_parked_profiles()
-    assert [p.name for p in registered] == ["antigravity-acp", "antigravity-acp-mcp"]
-    return module, default, compat
+    default = module.register_parked_profiles()
+    # One created profile; the compat ids are aliases on it.
+    assert [p.name for p in registered] == ["antigravity-acp"]
+    assert "antigravity-acp-mcp" in default.aliases and "agy-mcp" in default.aliases
+    return module, default
 
 
 def _profile(monkeypatch, behaviour: dict):
-    module, default, _compat = _load_entry(monkeypatch)
+    module, default = _load_entry(monkeypatch)
     for var in ("HERMES_ANTIGRAVITY_ACP_MCP_COMMAND", "HERMES_ANTIGRAVITY_ACP_COMMAND"):
         monkeypatch.delenv(var, raising=False)
     profile = default
@@ -144,7 +146,7 @@ def test_discovery_closes_the_probe_session(monkeypatch, tmp_path):
 
 
 def test_ttl_override_is_sane(monkeypatch):
-    module, _default, _compat = _load_entry(monkeypatch)
+    module, _default = _load_entry(monkeypatch)
     monkeypatch.delenv("HERMES_ANTIGRAVITY_ACP_MCP_DISCOVERY_TTL_SECONDS", raising=False)
     assert module._discovery_ttl() == module._DISCOVERY_TTL_DEFAULT_SECONDS
     monkeypatch.setenv("HERMES_ANTIGRAVITY_ACP_MCP_DISCOVERY_TTL_SECONDS", "not-a-number")

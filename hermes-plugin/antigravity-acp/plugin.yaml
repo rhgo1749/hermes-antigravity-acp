@@ -7,11 +7,12 @@ author: rhgo1749
 # v0.21.6 passes `hermes plugins validate --install-deps` and the strict
 # provider-seam tests. Raise only with a new floor-gate run; never guess.
 requires_hermes: ">=0.21.6"
-# Registered surface, verified against the validate capability probe: this
-# plugin registers exactly three model-provider profiles and nothing else —
-# `antigravity-acp` (default; Parked-MCP engine), `antigravity-acp-mcp`
-# (compatibility id; same engine), and `antigravity-acp-replay` (Replay
-# engine, explicit alternative).
+# Registered surface, verified against the validate capability probe: a
+# default install creates exactly one model-provider profile —
+# `antigravity-acp` (default; Parked-MCP engine).  The historical
+# `antigravity-acp-mcp`/`agy-mcp` ids are aliases on it (resolution without
+# creation).  `antigravity-acp-replay` (Replay engine) registers only when the
+# installer-written launch_config.json declares it in `extra_providers`.
 provides_tools: []
 provides_hooks: []
 provides_middleware: []

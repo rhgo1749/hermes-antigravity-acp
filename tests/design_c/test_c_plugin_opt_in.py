@@ -1,20 +1,26 @@
-"""Single-plugin dual-engine registration contract for the 0.9.0 surface.
+"""Single-plugin dual-engine registration contract.
 
-Since plugin 0.9.0 the Parked-MCP engine (``parked/``) and the Replay engine
-(flat modules) ship in ONE plugin tree and register three disjoint profiles:
-``antigravity-acp`` (default, Parked-MCP), ``antigravity-acp-mcp``
-(compatibility id, same engine), and ``antigravity-acp-replay`` (Replay).
+The Parked-MCP engine (``parked/``) and the Replay engine (flat modules) ship
+in ONE plugin tree.  A default install CREATES exactly one provider profile,
+``antigravity-acp`` (default, Parked-MCP); the historical
+``antigravity-acp-mcp``/``agy-mcp`` ids are aliases on it (resolution without
+creation).  ``antigravity-acp-replay`` (Replay) registers only when the
+installer-written ``launch_config.json`` declares it in ``extra_providers``.
 """
 
 from __future__ import annotations
 
 import ast
 import importlib.util
+import json
 import re
+import shutil
 import sys
 import types
 from pathlib import Path
 from typing import Any
+
+import pytest
 
 from ._support import PLUGIN_DIR, ROOT
 
@@ -129,7 +135,7 @@ def test_parked_tree_passes_public_hygiene_scan() -> None:
         assert forbidden_mux not in text, f"personal mux reference in {path.name}"
 
 
-def test_single_plugin_registers_three_disjoint_profiles(monkeypatch) -> None:
+def test_default_install_creates_one_profile_with_compat_aliases(monkeypatch) -> None:
     original_pkg = sys.modules.get("antigravity_acp_mcp")
     registered: list[Any] = []
 
@@ -151,41 +157,35 @@ def test_single_plugin_registers_three_disjoint_profiles(monkeypatch) -> None:
         _load_isolated_plugin(acp_pkg, DEFAULT_PLUGIN_DIR)
 
         assert sys.modules.get("antigravity_acp_mcp") is original_pkg
-        assert len(registered) == 3
-        by_name = {profile.name: profile for profile in registered}
-        assert set(by_name) == {
-            "antigravity-acp-replay",
-            "antigravity-acp",
-            "antigravity-acp-mcp",
-        }
-        replay = by_name["antigravity-acp-replay"]
-        default = by_name["antigravity-acp"]
-        compat = by_name["antigravity-acp-mcp"]
+        assert [profile.name for profile in registered] == ["antigravity-acp"]
+        default = registered[0]
 
-        # The public default identity moved to the Parked-MCP engine; the
-        # historical aliases followed it.
+        # The public default identity is the Parked-MCP engine; the historical
+        # aliases followed it, and the compatibility ids are aliases too
+        # (resolution without separately-created providers).
         assert set(default.aliases) == {
             "antigravity-cli",
             "agy",
             "antigravity",
             "agy-acp",
             "antigravity-official-acp",
+            "antigravity-acp-mcp",
+            "agy-mcp",
         }
         assert default.base_url == "acp://antigravity"
         assert default.fallback_models == ()
         assert default.supports_vision is True
         assert default.auth_type == "external_process"
 
-        # Compatibility surface unchanged for existing opt-in users.
-        assert compat.aliases == ("agy-mcp",)
-        assert compat.base_url == "acp://antigravity-mcp"
-
-        # Replay stays explicitly selectable, never a silent fallback.
+        # Replay stays explicitly selectable (never a silent fallback), but
+        # without an install-time declaration it is built, not registered.
+        replay = getattr(sys.modules[acp_pkg], "antigravity_acp_replay")
+        assert replay.name == "antigravity-acp-replay"
         assert set(replay.aliases) == {"agy-replay", "antigravity-replay"}
 
-        # Profile identity surfaces are pairwise disjoint: no name or alias
+        # Engine identity surfaces are pairwise disjoint: no name or alias
         # may resolve to two engines.
-        surfaces = [{profile.name, *profile.aliases} for profile in registered]
+        surfaces = [{profile.name, *profile.aliases} for profile in (*registered, replay)]
         for i in range(len(surfaces)):
             for j in range(i + 1, len(surfaces)):
                 assert surfaces[i].isdisjoint(surfaces[j]), (i, j)
@@ -218,6 +218,83 @@ def test_single_plugin_registers_three_disjoint_profiles(monkeypatch) -> None:
         for mod_name in list(sys.modules):
             if mod_name == acp_pkg or mod_name.startswith(acp_pkg + "."):
                 sys.modules.pop(mod_name, None)
+
+
+def _load_plugin_from_copy(
+    monkeypatch, tmp_path: Path, config: dict[str, Any] | None, package_name: str
+) -> list[Any]:
+    """Import a copy of the plugin tree with an installer-written launch config."""
+    plugin_dir = tmp_path / "plugin"
+    shutil.copytree(DEFAULT_PLUGIN_DIR, plugin_dir, ignore=shutil.ignore_patterns("__pycache__"))
+    if config is not None:
+        (plugin_dir / "launch_config.json").write_text(
+            json.dumps(config, sort_keys=True), encoding="utf-8"
+        )
+    registered: list[Any] = []
+
+    class StubProviderProfile:
+        def __init__(self, **kwargs: Any) -> None:
+            for key, value in kwargs.items():
+                setattr(self, key, value)
+
+    providers_mod = types.ModuleType("providers")
+    providers_mod.register_provider = registered.append  # type: ignore[attr-defined]
+    providers_base_mod = types.ModuleType("providers.base")
+    providers_base_mod.ProviderProfile = StubProviderProfile  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "providers", providers_mod)
+    monkeypatch.setitem(sys.modules, "providers.base", providers_base_mod)
+
+    try:
+        _load_isolated_plugin(package_name, plugin_dir)
+    except BaseException:
+        sys.modules.pop(package_name, None)
+        raise
+    return registered
+
+
+def test_replay_registers_only_under_explicit_declaration(monkeypatch, tmp_path) -> None:
+    registered = _load_plugin_from_copy(
+        monkeypatch,
+        tmp_path,
+        {"extra_providers": ["antigravity-acp-replay"]},
+        "_isolated_declared_acp",
+    )
+    try:
+        assert [profile.name for profile in registered] == [
+            "antigravity-acp-replay",
+            "antigravity-acp",
+        ]
+    finally:
+        sys.modules.pop("_isolated_declared_acp", None)
+
+
+def test_legacy_launch_config_still_launches_default_only(monkeypatch, tmp_path) -> None:
+    registered = _load_plugin_from_copy(
+        monkeypatch,
+        tmp_path,
+        {"process_command": "/legacy/launcher", "process_args": ["--pin"]},
+        "_isolated_legacy_acp",
+    )
+    try:
+        assert [profile.name for profile in registered] == ["antigravity-acp"]
+        assert registered[0].process_command == "/legacy/launcher"
+        assert registered[0].process_args == ("--pin",)
+    finally:
+        sys.modules.pop("_isolated_legacy_acp", None)
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        # An alias id is not a creatable provider.
+        {"extra_providers": ["antigravity-acp-mcp"]},
+        {"extra_providers": ["not-a-provider"]},
+        {"unknown_key": []},
+    ],
+)
+def test_launch_config_fails_closed(monkeypatch, tmp_path, config) -> None:
+    with pytest.raises(RuntimeError):
+        _load_plugin_from_copy(monkeypatch, tmp_path, config, "_isolated_bad_acp")
 
 
 def test_default_official_command_prefers_user_bin_then_path_then_name(monkeypatch, tmp_path) -> None:

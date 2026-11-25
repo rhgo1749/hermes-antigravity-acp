@@ -495,14 +495,9 @@ def _load_installed_provider(monkeypatch, provider_path: Path):
     module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, name, module)
     spec.loader.exec_module(module)
-    # 0.9.0: one plugin, three profiles (Replay explicit id, Parked-MCP
-    # default public identity, Parked-MCP compatibility id).
-    assert [prof.name for prof in registered] == [
-        "antigravity-acp-replay",
-        "antigravity-acp",
-        "antigravity-acp-mcp",
-    ]
-    assert registered[0] is module.antigravity_acp_replay
+    # One plugin, one created profile (Parked-MCP default public
+    # identity; compat ids are aliases, Replay needs an explicit declaration).
+    assert [prof.name for prof in registered] == ["antigravity-acp"]
     return module
 
 
@@ -565,7 +560,7 @@ def _declared_surface_violations(manifest_text: str) -> list[str]:
 
     The plugin-catalog contract (catalog rules 11-13) and historical reference criterion 3
     require this plugin's registered surface to stay pinned: exactly the
-    three model-provider profiles of 0.9.0 and NOTHING else: every ``provides_*`` list, any ``commands``/``skills``
+    single model-provider profile a default install creates and NOTHING else: every ``provides_*`` list, any ``commands``/``skills``
     declaration, and every ``/quota`` tool/skill reference (the personal
     usage-quota surface stays unshipped and its telemetry stays
     ``status='unavailable'``) are violations, as is a ``requires_env`` entry

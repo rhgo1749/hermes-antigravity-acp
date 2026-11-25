@@ -257,10 +257,10 @@ def test_vanilla_upstream_default_profile_seam_builds_parked_client(monkeypatch,
     assert profile.name == "antigravity-acp"
     assert profile.__class__.__module__.endswith("parked._plugin_entry")
     assert isinstance(profile, module.ProviderProfile)
-    # The compatibility id resolves to the same engine class, distinct instance.
+    # The compatibility id is an alias: it resolves to the same profile
+    # instance, not to a separately-created provider.
     compat = providers.get_provider_profile("antigravity-acp-mcp")
-    assert compat is not profile
-    assert compat.__class__ is profile.__class__
+    assert compat is profile
 
     direct_client = profile.create_client(
         api_key="antigravity-acp",

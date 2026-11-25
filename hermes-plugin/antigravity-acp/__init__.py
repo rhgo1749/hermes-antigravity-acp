@@ -84,33 +84,55 @@ def _default_official_command() -> str:
     return "antigravity-acp-official"
 
 
-def _stored_launch_config() -> tuple[str | None, tuple[str, ...]]:
-    """Load a legacy launch configuration preserved by the profile installer."""
+_REPLAY_PROVIDER_ID = "antigravity-acp-replay"
+_KNOWN_EXTRA_PROVIDERS = frozenset({_REPLAY_PROVIDER_ID})
+
+
+def _stored_launch_config() -> tuple[str | None, tuple[str, ...], frozenset[str]]:
+    """Load the installer-written launch configuration (optional per field).
+
+    ``extra_providers`` is the explicit install-time declaration: provider ids
+    beyond the single default that this install asked to create.  A default
+    install writes nothing here, so only ``antigravity-acp`` is registered.
+    """
     path = Path(__file__).with_name("launch_config.json")
     if path.is_symlink():
         raise RuntimeError("Refusing a symlinked Antigravity launch configuration")
     try:
         raw_config = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        return None, ()
+        return None, (), frozenset()
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise RuntimeError("Antigravity launch configuration is unreadable") from exc
     if not isinstance(raw_config, dict):
         raise RuntimeError("Antigravity launch configuration must be an object")
     config = cast(dict[str, object], raw_config)
+    unknown = set(config) - {"process_command", "process_args", "extra_providers"}
+    if unknown:
+        raise RuntimeError("Antigravity launch configuration has unknown keys")
     command = config.get("process_command")
-    args = config.get("process_args")
+    args = config.get("process_args", [])
+    extra = config.get("extra_providers", [])
+    if command is not None and (not isinstance(command, str) or not command):
+        raise RuntimeError("Antigravity launch configuration is invalid")
     if (
-        not isinstance(command, str)
-        or not command
-        or not isinstance(args, list)
+        not isinstance(args, list)
         or any(not isinstance(arg, str) for arg in args)
+        or not isinstance(extra, list)
+        or any(not isinstance(item, str) for item in extra)
     ):
         raise RuntimeError("Antigravity launch configuration is invalid")
-    return command, tuple(cast(list[str], args))
+    extra_ids = frozenset(cast(list[str], extra))
+    if not extra_ids <= _KNOWN_EXTRA_PROVIDERS:
+        raise RuntimeError("Antigravity launch configuration names an unknown provider")
+    return (
+        cast(str, command) if command is not None else None,
+        tuple(cast(list[str], args)),
+        extra_ids,
+    )
 
 
-_STORED_PROCESS_COMMAND, _STORED_PROCESS_ARGS = _stored_launch_config()
+_STORED_PROCESS_COMMAND, _STORED_PROCESS_ARGS, _EXTRA_PROVIDERS = _stored_launch_config()
 
 
 def _rate_limit_retries() -> int:
@@ -362,12 +384,19 @@ antigravity_acp_replay = AntigravityACPProfile(
     fallback_models=(),
 )
 
-register_provider(antigravity_acp_replay)
+# Explicit install-time creation only: the Replay engine profile is built
+# unconditionally (import introspection stays stable) but registered only when
+# launch_config.json declared it.  A default install creates just the
+# Parked-MCP default below.
+if _REPLAY_PROVIDER_ID in _EXTRA_PROVIDERS:
+    register_provider(antigravity_acp_replay)
 
 # Default engine switch (0.9.0): the Parked-MCP engine takes the public
-# ``antigravity-acp`` identity (and keeps the ``antigravity-acp-mcp``
-# compatibility id).  The Replay profile above is the explicit alternative.
-# Neither engine ever retries a side-effecting tool execution on the other.
+# ``antigravity-acp`` identity.  It is the only profile a default
+# install creates; the historical ``antigravity-acp-mcp``/``agy-mcp`` ids are
+# aliases on it, and the Replay profile above registers only under an explicit
+# install-time declaration.  Neither engine ever retries a side-effecting tool
+# execution on the other.
 from .parked._plugin_entry import register_parked_profiles  # noqa: E402
 
 register_parked_profiles(

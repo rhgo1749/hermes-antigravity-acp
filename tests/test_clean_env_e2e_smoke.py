@@ -379,11 +379,7 @@ def _load_provider(monkeypatch, provider_path: Path, name: str):
     module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, name, module)
     spec.loader.exec_module(module)
-    assert [p.name for p in registered] == [
-        "antigravity-acp-replay",
-        "antigravity-acp",
-        "antigravity-acp-mcp",
-    ] and registered[0] is module.antigravity_acp_replay  # provider registration itself
+    assert [p.name for p in registered] == ["antigravity-acp"]  # provider registration itself
     return module
 
 

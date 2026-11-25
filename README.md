@@ -612,9 +612,8 @@ Since plugin 0.9.0 one plugin package carries both engines:
 
 | Provider id | Engine | Source | Notes |
 |---|---|---|---|
-| `antigravity-acp` | Parked-MCP (default) | `hermes-plugin/antigravity-acp/parked/` | Public identity; aliases `antigravity-cli`, `agy`, `antigravity`, `agy-acp`, `antigravity-official-acp`; marker `base_url` `acp://antigravity` |
-| `antigravity-acp-mcp` | Parked-MCP | same `parked/` subpackage | Compatibility id (alias `agy-mcp`) kept so pre-0.9.0 `model.provider: antigravity-acp-mcp` settings keep resolving; marker `base_url` `acp://antigravity-mcp` |
-| `antigravity-acp-replay` | Replay | parent package flat modules (`client.py` et al.) | The pre-0.9.0 default engine, explicitly selectable; not deprecated and not removed |
+| `antigravity-acp` | Parked-MCP (default) | `hermes-plugin/antigravity-acp/parked/` | Public identity and the only profile a default install creates; aliases `antigravity-cli`, `agy`, `antigravity`, `agy-acp`, `antigravity-official-acp`, plus compatibility aliases `antigravity-acp-mcp`, `agy-mcp` so pre-0.9.0 `model.provider: antigravity-acp-mcp` settings keep resolving without a separately-created provider; marker `base_url` `acp://antigravity` |
+| `antigravity-acp-replay` | Replay | parent package flat modules (`client.py` et al.) | The pre-0.9.0 default engine; registers only when the installer-written `launch_config.json` declares `extra_providers: ["antigravity-acp-replay"]` (explicit install-time creation); not deprecated and not removed |
 
 The Parked-MCP engine parks Hermes tool calls behind a per-session loopback
 Streamable-HTTP MCP endpoint instead of letting the ACP server run native

@@ -26,7 +26,8 @@ def test_process_args_pin_official_wrapper_contract() -> None:
 def test_provider_label_does_not_imply_official_hermes_tier(monkeypatch) -> None:
     # The public ``antigravity-acp`` identity is carried by the Parked-MCP
     # default engine since 0.9.0; the Replay engine keeps an explicit id.
-    profile = getattr(_load_plugin(monkeypatch), "_registered_profiles")[1]
+    # A default install registers only this one profile.
+    profile = getattr(_load_plugin(monkeypatch), "_registered_profiles")[0]
     assert profile.name == "antigravity-acp"
     assert profile.display_name == "Antigravity ACP"
     assert "Google's official ACP" in profile.description
@@ -242,15 +243,10 @@ def _load_plugin(monkeypatch):
     module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, module_name, module)
     spec.loader.exec_module(module)
-    # 0.9.0: one plugin registers three profiles — the Replay engine under an
-    # explicit id, then the Parked-MCP default (public identity) and its
-    # compatibility id.  Order is the registration order of the plugin entry.
-    assert [p.name for p in registered] == [
-        "antigravity-acp-replay",
-        "antigravity-acp",
-        "antigravity-acp-mcp",
-    ]
-    assert registered[0] is module.antigravity_acp_replay
+    # A default install creates exactly one profile — the Parked-MCP
+    # default (public identity).  Replay registers only under an explicit
+    # launch_config.json declaration; the compat ids are aliases on default.
+    assert [p.name for p in registered] == ["antigravity-acp"]
     setattr(module, "_registered_profiles", registered)
     return module
 
@@ -270,11 +266,14 @@ def test_profile_builds_standalone_client_without_core_acp_module(monkeypatch, t
 
 
 def test_profile_preserves_legacy_provider_aliases(monkeypatch) -> None:
-    # The legacy aliases follow the public identity onto the default engine.
-    default = getattr(_load_plugin(monkeypatch), "_registered_profiles")[1]
+    # The legacy aliases follow the public identity onto the default engine,
+    # and the compatibility ids are aliases on it too.
+    default = getattr(_load_plugin(monkeypatch), "_registered_profiles")[0]
     assert "antigravity-cli" in default.aliases
     assert "agy" in default.aliases
     assert "antigravity" in default.aliases
+    assert "antigravity-acp-mcp" in default.aliases
+    assert "agy-mcp" in default.aliases
 
 
 def test_create_client_repairs_falsy_runtime_launch_metadata(monkeypatch) -> None:
