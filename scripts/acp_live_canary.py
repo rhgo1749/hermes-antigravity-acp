@@ -469,6 +469,19 @@ def _teardown_verdict(exited: list[bool]) -> str:
     return "pass" if all(exited) else "fail"
 
 
+def _cancel_verdict(probe: dict[str, Any]) -> str:
+    """P3: a completion that raced ahead of cancel() lost the verification
+    opportunity (inconclusive); a still-in-flight request that completed
+    despite cancel(), or was never interrupted, is a real failure."""
+    if not probe.get("prompt_issued") or probe.get("raced_completion"):
+        return "inconclusive"
+    if (probe.get("thread_alive")
+            or not probe.get("session_cancel_sent")
+            or probe.get("thread_outcome") in (None, "returned")):
+        return "fail"
+    return "pass"
+
+
 class CanaryTimeout(Exception):
     """The parked run exceeded its wall-clock --timeout budget."""
 
@@ -1399,6 +1412,12 @@ def run_parked(args, module, recorder: FrameRecorder, evidence_dir: Path,
             and entry["frame"].get("method") == method
         ]
 
+    def server_prompt_usage(request_id: Any) -> dict[str, Any] | None:
+        """The server's own usage report for one session/prompt result."""
+        response = frame_by_id("in", request_id)
+        raw = ((response or {}).get("result") or {}).get("usage")
+        return raw if isinstance(raw, dict) else None
+
     def frame_by_id(direction: str, request_id: Any) -> dict[str, Any] | None:
         if request_id is None:
             return None
@@ -1417,7 +1436,9 @@ def run_parked(args, module, recorder: FrameRecorder, evidence_dir: Path,
     signal.setitimer(signal.ITIMER_REAL, max(1.0, float(args.timeout)))
     try:
         try:
-            messages = [{"role": "user", "content": args.prompt}]
+            # Fixed synthetic prompts only (see the --prompt/--follow-up
+            # preflight refusal): evidence files never carry user data.
+            messages = [{"role": "user", "content": PARKED_PROMPT}]
             first = client.chat.completions.create(
                 model=args.model, messages=messages,
                 tools=[dict(PARKED_CANARY_TOOL)], stream=False,
@@ -1482,8 +1503,7 @@ def run_parked(args, module, recorder: FrameRecorder, evidence_dir: Path,
                 verdicts["parked_tool_round"] = "inconclusive"
             verdicts["plain_response"] = "pass" if final_text.strip() else "fail"
 
-            follow_text = (args.follow_up if args.follow_up is not None
-                           else PARKED_FOLLOW_UP_PROMPT)
+            follow_text = PARKED_FOLLOW_UP_PROMPT
             turn1_messages = (messages + [assistant_row, *tool_rows]
                               if assistant_row is not None else list(messages))
             follow_messages = turn1_messages + [
@@ -1509,53 +1529,73 @@ def run_parked(args, module, recorder: FrameRecorder, evidence_dir: Path,
                 "pass" if follow_up["same_session_no_new"] else "fail"
             )
 
-            # Usage contract (#87): distinguish server report anomaly from engine
-            # contract success (rejecting anomalous usage is PASS).
-            usage = getattr(third, "usage", None)
-            turn1_usage = getattr(turn1_completion, "usage", None)
+            # Usage contract (#87): judge EVERY turn independently.  A turn
+            # whose server report the engine accepted must be plausible; an
+            # anomalous report the engine rejected is contract success.  An
+            # anomalous report accepted on ANY turn is a breach, even when a
+            # later turn's report was correctly rejected.
             observations = getattr(third, "antigravity_usage_observations", None)
-            local_tokens = parked_usage.transcript_tokens(follow_messages)
             gate_rejection_logged = any(
                 "rejected" in line for line in engine_logs.messages)
-            reported_dict = None if usage is None else {
-                "prompt_tokens": getattr(usage, "prompt_tokens", None),
-                "completion_tokens": getattr(usage, "completion_tokens", None),
-                "total_tokens": getattr(usage, "total_tokens", None),
-            }
-            if usage is not None and local_tokens:
-                reported_in = getattr(usage, "prompt_tokens", None)
-                t1_in = getattr(turn1_usage, "prompt_tokens", None) if turn1_usage is not None else None
-                if not isinstance(reported_in, int):
-                    plausible = False
-                elif isinstance(t1_in, int):
-                    t1_local = parked_usage.transcript_tokens(turn1_messages)
-                    growth_ok, _, _ = parked_usage.reported_usage_growth_consistent(
-                        prev_reported=t1_in, reported=reported_in,
-                        prev_local=t1_local, local=local_tokens,
-                    )
-                    plausible = (
-                        parked_usage.first_turn_report_plausible(
-                            reported=t1_in, local=t1_local)
-                        and growth_ok
-                    )
-                else:
-                    plausible = parked_usage.first_turn_report_plausible(
-                        reported=reported_in, local=local_tokens)
-                server_report_status = "plausible" if plausible else "anomalous_accepted"
-                verdicts["usage_contract"] = "pass" if plausible else "fail"
-            elif usage is None and gate_rejection_logged:
+            prompt_ids = [entry["frame"].get("id")
+                          for entry in out_frames("session/prompt")][:2]
+            turn_locals = [parked_usage.transcript_tokens(messages),
+                           parked_usage.transcript_tokens(follow_messages)]
+            usage_turns: list[dict[str, Any]] = []
+            baseline = None  # (reported_in, local) of the last accepted report
+            usage_violation = False
+            for raw_usage, completion, local in zip(
+                    (server_prompt_usage(pid) for pid in prompt_ids),
+                    (turn1_completion, third), turn_locals):
+                accepted = getattr(completion, "usage", None) is not None
+                turn = {"server_reported": raw_usage is not None,
+                        "engine_accepted": accepted,
+                        "plausible": None}
+                if raw_usage is not None:
+                    reported_in = raw_usage.get("inputTokens")
+                    if not isinstance(reported_in, int) or not local:
+                        plausible = False
+                    elif baseline is None:
+                        plausible = parked_usage.first_turn_report_plausible(
+                            reported=reported_in, local=local)
+                    else:
+                        plausible, _, _ = parked_usage.reported_usage_growth_consistent(
+                            prev_reported=baseline[0], reported=reported_in,
+                            prev_local=baseline[1], local=local)
+                    turn["plausible"] = plausible
+                    if accepted:
+                        if not plausible:
+                            usage_violation = True
+                        baseline = (reported_in, local)
+                usage_turns.append(turn)
+            any_reported = any(t["server_reported"] for t in usage_turns)
+            any_rejected = any(t["server_reported"] and not t["engine_accepted"]
+                               for t in usage_turns)
+            if usage_violation:
+                server_report_status = "anomalous_accepted"
+                verdicts["usage_contract"] = "fail"
+            elif any_rejected:
                 server_report_status = "anomalous_rejected"
+                verdicts["usage_contract"] = "pass"
+            elif any_reported:
+                server_report_status = "plausible"
                 verdicts["usage_contract"] = "pass"
             else:
                 server_report_status = "unavailable"
                 verdicts["usage_contract"] = "inconclusive"
 
+            usage = getattr(third, "usage", None)
             summary["usage"] = {
-                "final_turn_reported": reported_dict,
+                "turns": usage_turns,
+                "final_turn_reported": None if usage is None else {
+                    "prompt_tokens": getattr(usage, "prompt_tokens", None),
+                    "completion_tokens": getattr(usage, "completion_tokens", None),
+                    "total_tokens": getattr(usage, "total_tokens", None),
+                },
                 "server_report_status": server_report_status,
                 "observations_present": bool(observations),
                 "observations": recorder._sanitize(observations, clean_text) if observations else None,
-                "local_estimate_tokens": local_tokens,
+                "local_estimate_tokens": turn_locals[-1],
                 "gate_rejection_logged": gate_rejection_logged,
                 "billing_claim": "none; server-reported figures are unverified telemetry",
             }
@@ -1709,19 +1749,18 @@ def run_parked(args, module, recorder: FrameRecorder, evidence_dir: Path,
             cancel_probe["prompt_issued"] = (
                 len(out_frames("session/prompt")) > prompts_before)
             if cancel_probe["prompt_issued"]:
-                client.cancel()
+                # A completion that finished before cancel() could be issued
+                # lost the verification opportunity; it is NOT a cancel
+                # failure.  Only a request still in flight at cancel time can
+                # fail the contract by completing anyway.
+                cancel_probe["raced_completion"] = not probe_thread.is_alive()
+                if not cancel_probe["raced_completion"]:
+                    client.cancel()
                 probe_thread.join(timeout=15.0)
             cancel_probe["session_cancel_sent"] = bool(out_frames("session/cancel"))
             cancel_probe["thread_outcome"] = thread_result.get("outcome")
             cancel_probe["thread_alive"] = probe_thread.is_alive()
-            if not cancel_probe["prompt_issued"]:
-                verdicts["cancel_path"] = "inconclusive"
-            elif (cancel_probe["thread_alive"]
-                    or not cancel_probe["session_cancel_sent"]
-                    or thread_result.get("outcome") in (None, "returned")):
-                verdicts["cancel_path"] = "fail"
-            else:
-                verdicts["cancel_path"] = "pass"
+            verdicts["cancel_path"] = _cancel_verdict(cancel_probe)
         except CanaryTimeout as exc:
             error = clean_text(f"{type(exc).__name__}: {exc}")[:400]
         except Exception as exc:  # noqa: BLE001 - the canary reports, never re-raises
@@ -1895,6 +1934,14 @@ def main() -> int:
                 "parked fake lane requires an explicit --command fake ACP "
                 "binary; the engine's env/launcher resolution is disabled in "
                 "this lane",
+                file=sys.stderr,
+            )
+            return 2
+        if args.prompt is not None or args.follow_up is not None:
+            print(
+                "--engine parked refuses --prompt/--follow-up: the parked "
+                "lane records only its fixed synthetic prompts, so arbitrary "
+                "user data never reaches the evidence files",
                 file=sys.stderr,
             )
             return 2

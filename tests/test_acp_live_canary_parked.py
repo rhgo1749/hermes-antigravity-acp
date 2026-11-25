@@ -199,16 +199,22 @@ while True:
                     else "TOOL_ROUND tools=" + ",".join(names) + " echo=" + echoed + leak)
             emit(chunk(text))
             usage = ({"inputTokens": 10_000_000, "outputTokens": 8, "totalTokens": 10_000_008}
-                     if SCENARIO == "parked_inflated_usage"
+                     if SCENARIO in ("parked_inflated_usage",
+                                     "parked_usage_turn1_bad_turn2_rejected")
                      else {"inputTokens": 40, "outputTokens": 8, "totalTokens": 48})
             res = {"stopReason": "end_turn", "usage": usage}
             res.update(extra)
             emit({"jsonrpc": "2.0", "id": rpc_id, "result": res})
         else:
             emit(chunk("FOLLOW_UP_ANSWER ping-42"))
-            usage = ({"inputTokens": 10_000_000, "outputTokens": 8, "totalTokens": 10_000_008}
-                     if SCENARIO == "parked_inflated_usage"
-                     else {"inputTokens": 60, "outputTokens": 10, "totalTokens": 70})
+            if SCENARIO == "parked_usage_turn1_bad_turn2_rejected":
+                usage = {"inputTokens": 20_000_000, "outputTokens": 8,
+                         "totalTokens": 20_000_008}
+            elif SCENARIO == "parked_inflated_usage":
+                usage = {"inputTokens": 10_000_000, "outputTokens": 8,
+                         "totalTokens": 10_000_008}
+            else:
+                usage = {"inputTokens": 60, "outputTokens": 10, "totalTokens": 70}
             emit({"jsonrpc": "2.0", "id": rpc_id, "result": {
                 "stopReason": "end_turn", "usage": usage}})
 """
@@ -466,6 +472,54 @@ def test_parked_anomalous_usage_accepted_fails_contract(canary, monkeypatch, tmp
     assert code == 1 and summary["overall"] == "fail"
     assert summary["usage"]["server_report_status"] == "anomalous_accepted"
     assert summary["verdicts"]["usage_contract"] == "fail"
+
+
+def test_parked_turn1_anomalous_accepted_turn2_rejected_fails_contract(
+        canary, monkeypatch, tmp_path):
+    """#87 boundary: an anomalous report accepted on turn 1 is a breach even
+    when the engine correctly rejects turn 2's report (no false PASS)."""
+    original_loader = canary.load_client_module
+
+    def spy_loader(repo):
+        module = original_loader(repo)
+        conv = importlib.import_module(module.__name__ + ".parked.conversation")
+        monkeypatch.setattr(conv, "first_turn_report_plausible", lambda **kwargs: True)
+        return module
+
+    monkeypatch.setattr(canary, "load_client_module", spy_loader)
+    code, summary, _, _, _, _ = _run_parked(
+        canary, monkeypatch, tmp_path, "parked_usage_turn1_bad_turn2_rejected")
+    assert code == 1 and summary["overall"] == "fail"
+    turns = summary["usage"]["turns"]
+    assert turns[0]["engine_accepted"] is True
+    assert turns[0]["plausible"] is False
+    assert turns[1]["engine_accepted"] is False
+    assert summary["usage"]["server_report_status"] == "anomalous_accepted"
+    assert summary["verdicts"]["usage_contract"] == "fail"
+
+
+@pytest.mark.parametrize("flag", ("--prompt", "--follow-up"))
+def test_parked_refuses_custom_prompts(canary, monkeypatch, tmp_path, flag):
+    """Parked records only its fixed synthetic prompts; user text is refused
+    at preflight so it never reaches the evidence files."""
+    monkeypatch.setattr(sys, "argv", _parked_argv(
+        tmp_path, "--fake-acp-only", "--command", str(tmp_path / "fake"),
+        flag, "arbitrary user data"))
+    assert canary.main() == 2
+    assert not (tmp_path / "evidence").exists()
+
+
+def test_parked_cancel_verdict_distinguishes_race_from_failure(canary):
+    base = {"prompt_issued": True, "raced_completion": False,
+            "thread_alive": False, "session_cancel_sent": True,
+            "thread_outcome": "CancelledError"}
+    assert canary._cancel_verdict(base) == "pass"
+    raced = dict(base, raced_completion=True, session_cancel_sent=False,
+                 thread_outcome="returned")
+    assert canary._cancel_verdict(raced) == "inconclusive"
+    assert canary._cancel_verdict(dict(base, thread_outcome="returned")) == "fail"
+    assert canary._cancel_verdict(dict(base, thread_alive=True)) == "fail"
+    assert canary._cancel_verdict(dict(base, prompt_issued=False)) == "inconclusive"
 
 
 def test_parked_timeout_bounds_run_and_reaps_child(canary, monkeypatch, tmp_path):
