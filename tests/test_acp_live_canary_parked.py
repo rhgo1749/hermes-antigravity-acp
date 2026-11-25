@@ -498,6 +498,54 @@ def test_parked_turn1_anomalous_accepted_turn2_rejected_fails_contract(
     assert summary["verdicts"]["usage_contract"] == "fail"
 
 
+def test_parked_plausible_usage_rejected_fails_contract(canary, monkeypatch, tmp_path):
+    """#87 boundary: the engine rejecting a PLAUSIBLE report is a contract
+    breach (false rejection), not a pass."""
+    original_loader = canary.load_client_module
+
+    def spy_loader(repo):
+        module = original_loader(repo)
+        conv = importlib.import_module(module.__name__ + ".parked.conversation")
+        monkeypatch.setattr(conv, "first_turn_report_plausible", lambda **kwargs: False)
+        return module
+
+    monkeypatch.setattr(canary, "load_client_module", spy_loader)
+    code, summary, _, _, _, _ = _run_parked(canary, monkeypatch, tmp_path, "parked_round")
+    assert code == 1 and summary["overall"] == "fail"
+    turns = summary["usage"]["turns"]
+    assert turns[0]["server_reported"] is True
+    assert turns[0]["engine_accepted"] is False
+    assert turns[0]["plausible"] is True
+    assert summary["usage"]["server_report_status"] == "plausible_rejected"
+    assert summary["verdicts"]["usage_contract"] == "fail"
+
+
+def test_parked_usage_verdict_decision_table(canary):
+    def turn(reported, accepted, plausible):
+        return {"server_reported": reported, "engine_accepted": accepted,
+                "plausible": plausible}
+    # normal accepted -> PASS
+    assert canary._usage_verdict([turn(True, True, True)]) == ("plausible", "pass")
+    # anomalous rejected -> PASS
+    assert canary._usage_verdict([turn(True, False, False)]) == ("anomalous_rejected", "pass")
+    # anomalous accepted -> FAIL
+    assert canary._usage_verdict([turn(True, True, False)]) == ("anomalous_accepted", "fail")
+    # normal rejected -> FAIL
+    assert canary._usage_verdict([turn(True, False, True)]) == ("plausible_rejected", "fail")
+    # nothing reported -> INCONCLUSIVE
+    assert canary._usage_verdict([turn(False, False, None)]) == ("unavailable", "inconclusive")
+    assert canary._usage_verdict([]) == ("unavailable", "inconclusive")
+    # any-turn breach poisons the whole run regardless of the other turn
+    assert canary._usage_verdict(
+        [turn(True, True, False), turn(True, False, False)]) == ("anomalous_accepted", "fail")
+    assert canary._usage_verdict(
+        [turn(True, False, False), turn(True, True, False)]) == ("anomalous_accepted", "fail")
+    assert canary._usage_verdict(
+        [turn(True, False, True), turn(True, True, True)]) == ("plausible_rejected", "fail")
+    assert canary._usage_verdict(
+        [turn(True, True, True), turn(True, False, False)]) == ("mixed", "pass")
+
+
 @pytest.mark.parametrize("flag", ("--prompt", "--follow-up"))
 def test_parked_refuses_custom_prompts(canary, monkeypatch, tmp_path, flag):
     """Parked records only its fixed synthetic prompts; user text is refused

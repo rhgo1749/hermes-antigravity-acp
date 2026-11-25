@@ -28,13 +28,13 @@ harness-owned MCP tool (`canary_echo`) plus a throwaway cancellation probe.
 4. **`follow_up_same_session`** — follow-up turn reuses the session without a
    second `session/new`.
 5. **`usage_contract`** — checks issue #87 per turn against
-   `parked.usage_contract`: each turn's server report (from the raw
-   `session/prompt` result) is judged independently — accepted reports must be
-   plausible, rejected ones are contract success. An anomalous report
-   accepted on ANY turn is `fail` (`anomalous_accepted`); all-accepted
-   plausible is `pass` (`plausible`); rejections without any accepted breach
-   are `pass` (`anomalous_rejected`); nothing reported is `inconclusive`
-   (`unavailable`). `billing_claim: none`.
+   `parked.usage_contract`, using the same transcript the engine's gate saw
+   (turn 1's local estimate includes the tool-round rows). Decision table per
+   reported turn: plausible+accepted → `pass`, anomalous+rejected → `pass`,
+   anomalous+accepted → `fail` (`anomalous_accepted`), plausible+rejected →
+   `fail` (`plausible_rejected`); nothing reported → `inconclusive`
+   (`unavailable`). A breach on any turn fails the whole run.
+   `billing_claim: none`.
 6. **`containment`** — verifies `disabledTools` prefix on `session/new` matches
    `NATIVE_TOOLS` and fails if any non-MCP `session/request_permission` is
    allowed. (Active native permission refusal is exercised by fake-ACP tests;

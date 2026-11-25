@@ -469,6 +469,25 @@ def _teardown_verdict(exited: list[bool]) -> str:
     return "pass" if all(exited) else "fail"
 
 
+def _usage_verdict(turns: list[dict[str, Any]]) -> tuple[str, str]:
+    """Decision table per reported turn: plausible+accepted and
+    anomalous+rejected are contract success; accepted-anomalous or
+    rejected-plausible on ANY turn is a breach (fail).  Nothing reported is
+    inconclusive."""
+    reported = [t for t in turns if t["server_reported"]]
+    if not reported:
+        return "unavailable", "inconclusive"
+    if any(not t["engine_accepted"] and t["plausible"] for t in reported):
+        return "plausible_rejected", "fail"
+    if any(t["engine_accepted"] and not t["plausible"] for t in reported):
+        return "anomalous_accepted", "fail"
+    if all(t["engine_accepted"] for t in reported):
+        return "plausible", "pass"
+    if all(not t["engine_accepted"] for t in reported):
+        return "anomalous_rejected", "pass"
+    return "mixed", "pass"
+
+
 def _cancel_verdict(probe: dict[str, Any]) -> str:
     """P3: a completion that raced ahead of cancel() lost the verification
     opportunity (inconclusive); a still-in-flight request that completed
@@ -1529,21 +1548,20 @@ def run_parked(args, module, recorder: FrameRecorder, evidence_dir: Path,
                 "pass" if follow_up["same_session_no_new"] else "fail"
             )
 
-            # Usage contract (#87): judge EVERY turn independently.  A turn
-            # whose server report the engine accepted must be plausible; an
-            # anomalous report the engine rejected is contract success.  An
-            # anomalous report accepted on ANY turn is a breach, even when a
-            # later turn's report was correctly rejected.
+            # Usage contract (#87): judge EVERY turn independently against
+            # the same gate the engine applies (turn 1's local estimate uses
+            # the full turn1_messages transcript, matching the resume the
+            # prompt result actually arrived on).  Any accepted/rejected vs
+            # plausible/anomalous mismatch on any turn fails the contract.
             observations = getattr(third, "antigravity_usage_observations", None)
             gate_rejection_logged = any(
                 "rejected" in line for line in engine_logs.messages)
             prompt_ids = [entry["frame"].get("id")
                           for entry in out_frames("session/prompt")][:2]
-            turn_locals = [parked_usage.transcript_tokens(messages),
+            turn_locals = [parked_usage.transcript_tokens(turn1_messages),
                            parked_usage.transcript_tokens(follow_messages)]
             usage_turns: list[dict[str, Any]] = []
             baseline = None  # (reported_in, local) of the last accepted report
-            usage_violation = False
             for raw_usage, completion, local in zip(
                     (server_prompt_usage(pid) for pid in prompt_ids),
                     (turn1_completion, third), turn_locals):
@@ -1564,25 +1582,9 @@ def run_parked(args, module, recorder: FrameRecorder, evidence_dir: Path,
                             prev_local=baseline[1], local=local)
                     turn["plausible"] = plausible
                     if accepted:
-                        if not plausible:
-                            usage_violation = True
                         baseline = (reported_in, local)
                 usage_turns.append(turn)
-            any_reported = any(t["server_reported"] for t in usage_turns)
-            any_rejected = any(t["server_reported"] and not t["engine_accepted"]
-                               for t in usage_turns)
-            if usage_violation:
-                server_report_status = "anomalous_accepted"
-                verdicts["usage_contract"] = "fail"
-            elif any_rejected:
-                server_report_status = "anomalous_rejected"
-                verdicts["usage_contract"] = "pass"
-            elif any_reported:
-                server_report_status = "plausible"
-                verdicts["usage_contract"] = "pass"
-            else:
-                server_report_status = "unavailable"
-                verdicts["usage_contract"] = "inconclusive"
+            server_report_status, verdicts["usage_contract"] = _usage_verdict(usage_turns)
 
             usage = getattr(third, "usage", None)
             summary["usage"] = {
