@@ -92,10 +92,16 @@ def _semantics_payload(tmp_path: Path) -> dict:
 # Growth-consistency gate (pure unit)
 
 
+def _load_contract(monkeypatch, tmp_path):
+    """The gate decisions moved to the shared single owner (parked/usage_contract)."""
+    _load_package(monkeypatch, tmp_path)
+    return importlib.import_module("antigravity_acp_canary.parked.usage_contract")
+
+
 def test_growth_gate_rejects_incident_replay(monkeypatch, tmp_path) -> None:
-    client, _ = _load_package(monkeypatch, tmp_path)
+    contract = _load_contract(monkeypatch, tmp_path)
     # 2026-11-23 incident: a ~3.2K local turn reported as ~499K growth.
-    ok, actual, expected = client._reported_usage_growth_consistent(
+    ok, actual, expected = contract.reported_usage_growth_consistent(
         prev_reported=119_000,
         reported=619_000,
         prev_local=30_000,
@@ -107,10 +113,10 @@ def test_growth_gate_rejects_incident_replay(monkeypatch, tmp_path) -> None:
 
 
 def test_growth_gate_accepts_legitimate_server_overhead(monkeypatch, tmp_path) -> None:
-    client, _ = _load_package(monkeypatch, tmp_path)
+    contract = _load_contract(monkeypatch, tmp_path)
     # Server adds its own per-turn records (reasoning/tool transcripts) the
     # local estimate never sees: several times the visible growth must pass.
-    ok, _, _ = client._reported_usage_growth_consistent(
+    ok, _, _ = contract.reported_usage_growth_consistent(
         prev_reported=150_000,
         reported=188_000,
         prev_local=120_000,
@@ -118,7 +124,7 @@ def test_growth_gate_accepts_legitimate_server_overhead(monkeypatch, tmp_path) -
     )
     assert ok is True
     # Edge of tolerance: exactly 8x growth passes.
-    ok, _, _ = client._reported_usage_growth_consistent(
+    ok, _, _ = contract.reported_usage_growth_consistent(
         prev_reported=10_000,
         reported=10_000 + 8 * (1_000 + 1),
         prev_local=10_000,
@@ -128,9 +134,9 @@ def test_growth_gate_accepts_legitimate_server_overhead(monkeypatch, tmp_path) -
 
 
 def test_growth_gate_accepts_negative_reanchor_within_slack(monkeypatch, tmp_path) -> None:
-    client, _ = _load_package(monkeypatch, tmp_path)
+    contract = _load_contract(monkeypatch, tmp_path)
     # Context rotation re-anchors both sides downward by a similar amount.
-    ok, _, _ = client._reported_usage_growth_consistent(
+    ok, _, _ = contract.reported_usage_growth_consistent(
         prev_reported=400_000,
         reported=120_000,
         prev_local=380_000,
@@ -139,7 +145,7 @@ def test_growth_gate_accepts_negative_reanchor_within_slack(monkeypatch, tmp_pat
     assert ok is True
     # A server that silently collapses while the transcript keeps growing is
     # rejected (divergence far beyond the flat slack).
-    ok, _, _ = client._reported_usage_growth_consistent(
+    ok, _, _ = contract.reported_usage_growth_consistent(
         prev_reported=400_000,
         reported=1_000,
         prev_local=380_000,
@@ -386,8 +392,8 @@ def test_guard_rejects_inflated_first_turn_without_seeding_baseline(
     Fresh session, one long ACP turn: the server folds every internal model
     call into ``inputTokens`` (~1.4M cumulative cache reads) while the real
     transcript is ~110K.  The growth gate has no baseline on turn one, so the
-    absolute level itself must be gated against the local estimate — exactly
-    what the parked engine (``_gate_turn_consumption``) already does.
+    absolute level itself must be gated against the local estimate — the same
+    decision the Parked-MCP engine makes, now owned by ``usage_contract``.
     """
     client, _ = _load_package(monkeypatch, tmp_path)
     affinity = "affinity-firstturn"

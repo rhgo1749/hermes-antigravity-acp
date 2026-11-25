@@ -120,7 +120,7 @@ def test_parked_tree_passes_public_hygiene_scan() -> None:
         for path in sorted(PLUGIN_DIR.rglob("*"))
         if path.is_file() and "__pycache__" not in path.relative_to(PLUGIN_DIR).parts
     ]
-    assert len(files) == 11  # 10 engine modules + package marker
+    assert len(files) == 12  # 10 engine modules + shared usage contract + package marker
     for path in files:
         text = path.read_text(encoding="utf-8")
         assert audit.scan_text(text) == [], f"secret rule triggered in {path.name}"

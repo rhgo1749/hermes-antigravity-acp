@@ -61,6 +61,8 @@ CANONICAL_PROVIDER_FILES = {
     "parked/parked_mcp.py",
     "parked/permission.py",
     "parked/session.py",
+    # Turn-usage validity contract shared by BOTH engines (issue #87 drift).
+    "parked/usage_contract.py",
 }
 
 # Personal-ops tokens that must never appear on the public distribution
@@ -117,7 +119,7 @@ def _deploy():
 def test_canonical_fileset_witness_matches_deployer_contract() -> None:
     deploy = _deploy()
     assert set(deploy.REQUIRED) == CANONICAL_PROVIDER_FILES
-    assert len(deploy.REQUIRED) == 22
+    assert len(deploy.REQUIRED) == 23
 
 
 _PROVIDER_PREFIX = "hermes-plugin/antigravity-acp/"

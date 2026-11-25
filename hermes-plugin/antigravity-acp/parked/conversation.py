@@ -35,6 +35,11 @@ from dataclasses import replace
 from typing import Any, TypeGuard
 
 from .acp_connection import AcpConnection, AcpError
+from .usage_contract import (
+    first_turn_report_plausible,
+    reported_usage_growth_consistent,
+    transcript_tokens,
+)
 from .matcher import (
     TurnView,
     IMAGE_PART_TYPES,
@@ -117,43 +122,13 @@ _CONTEXT_OBSERVATION_SOURCE = "acp.session/update:usage_update"
 _USAGE_OBSERVATION_SEMANTICS = ("usage_update.used is per-model-call consumption delta, not billing usage "
                                 "and not verified cumulative context occupancy; size is the context window")
 _USAGE_SCOPE_UNVERIFIED = "unverified_server_semantics"  # no runtime verdict store here: label honestly
-_USAGE_GROWTH_FACTOR = 8
-_USAGE_GROWTH_SLACK_TOKENS = 64_000
-_CJK_RANGES = (
-    (0x1100, 0x11FF), (0x2E80, 0x2FFF), (0x3040, 0x30FF), (0x3130, 0x318F),
-    (0x3400, 0x4DBF), (0x4E00, 0x9FFF), (0xAC00, 0xD7AF), (0xF900, 0xFAFF),
-    (0xFE30, 0xFE4F), (0xFF00, 0xFFDC), (0x20000, 0x3134F),
-)
+# Gate constants, tolerance, first-turn/growth decisions and the token
+# estimator live in ONE owner shared with the Replay engine:
+# ``usage_contract.py`` (issue #87 drift).  Do not re-fork them here.
 
 
 def _nonnegative_int(value: Any) -> TypeGuard[int]:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
-
-
-def _estimate_tokens(text: str) -> int:
-    """Conservative token estimate (CJK ~1 token/char, other ~1 token/3 chars); old-engine port."""
-    if not text:
-        return 0
-    cjk = sum(1 for ch in text if any(lo <= ord(ch) <= hi for lo, hi in _CJK_RANGES))
-    return cjk + (len(text) - cjk) // 3 + 1
-
-
-def _transcript_tokens(messages: list[dict[str, Any]]) -> int:
-    """Local estimate of the transcript this adapter grew; the gate's independent yardstick."""
-    total = 0
-    for msg in messages:
-        content = msg.get("content")
-        if isinstance(content, str):
-            total += _estimate_tokens(content)
-        elif isinstance(content, list):
-            for part in content:
-                if isinstance(part, dict) and isinstance(part.get("text"), str):
-                    total += _estimate_tokens(part["text"])
-        for call in msg.get("tool_calls") or []:
-            fn = call.get("function") if isinstance(call, dict) else None
-            if isinstance(fn, dict):
-                total += _estimate_tokens(str(fn.get("name") or "")) + _estimate_tokens(str(fn.get("arguments") or ""))
-    return total
 
 
 def _consumption_from_prompt_result(result: dict[str, Any]) -> dict[str, int] | None:
@@ -181,19 +156,6 @@ def _consumption_from_prompt_result(result: dict[str, Any]) -> dict[str, int] | 
     if usage.get("cachedReadTokens") is not None:
         out["cached_read_tokens"] = usage["cachedReadTokens"]
     return out
-
-
-def _reported_usage_growth_consistent(*, prev_reported: int, reported: int,
-                                      prev_local: int, local: int) -> tuple[bool, int, int]:
-    """Server-reported input growth must track the local transcript growth (old-engine port).
-
-    Tolerance is deliberately generous (8x plus a flat 64K slack): this gate rejects order-of-magnitude
-    divergence, not bookkeeping noise. Returns ``(ok, reported_growth, expected_growth)``.
-    """
-    expected = local - prev_local
-    actual = reported - prev_reported
-    tolerance = max(_USAGE_GROWTH_FACTOR * (abs(expected) + 1), _USAGE_GROWTH_SLACK_TOKENS)
-    return abs(actual - expected) <= tolerance, actual, expected
 
 
 class ProviderError(RuntimeError):
@@ -1087,20 +1049,20 @@ class Conversation:
         if consumption is None:
             return None
         reported = consumption["input_tokens"]
-        local = _transcript_tokens(messages)
+        local = transcript_tokens(messages)
         baseline = self._usage_baseline
         if baseline is None:
-            # First turn (or first after a restart): the old engine accepted unconditionally, so a server
-            # inflated from turn one could set a bogus baseline that every later turn then "agrees" with.
-            # Gate the absolute report against the local transcript estimate with the same divergence
-            # tolerance; a rejected first report leaves no baseline, so turn two is gated on its own.
-            if abs(reported - local) > max(_USAGE_GROWTH_FACTOR * (local + 1), _USAGE_GROWTH_SLACK_TOKENS):
+            # First turn (or first after a restart): gate the absolute report
+            # against the local transcript estimate (shared contract; the
+            # Replay engine skipped this and shipped issue #87).  A rejected
+            # first report leaves no baseline, so turn two is gated on its own.
+            if not first_turn_report_plausible(reported=reported, local=local):
                 logger.warning("acp-mcp: first-turn inputTokens %d rejected: diverges from local transcript "
                                "estimate %d beyond tolerance; Hermes falls back to its own estimate", reported, local)
                 return None
             self._usage_baseline = (reported, local)
             return consumption
-        ok, actual, expected = _reported_usage_growth_consistent(
+        ok, actual, expected = reported_usage_growth_consistent(
             prev_reported=baseline[0], reported=reported, prev_local=baseline[1], local=local)
         if ok:
             self._usage_baseline = (reported, local)

@@ -145,9 +145,9 @@ def test_usage_mapping_requires_all_totals():
 
 
 def test_transcript_estimate_counts_text_and_tool_calls():
-    from antigravity_acp_mcp.conversation import _transcript_tokens
-    empty = _transcript_tokens([])
-    grown = _transcript_tokens([
+    from antigravity_acp_mcp.usage_contract import transcript_tokens
+    empty = transcript_tokens([])
+    grown = transcript_tokens([
         {"role": "user", "content": "x" * 300},
         {"role": "assistant", "content": "", "tool_calls": [
             {"id": "1", "type": "function", "function": {"name": "some_tool", "arguments": '{"a": 1}'}}]},
