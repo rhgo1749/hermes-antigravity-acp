@@ -275,14 +275,20 @@ def test_replay_keeps_the_active_copy_of_a_repeated_system_message_full():
     assert "repeated in full later in this prompt" in history
 
 
-def test_usage_update_reaches_the_openai_completion(tmp_path):
+def test_usage_update_frames_are_never_billing_usage(tmp_path):
+    """Semantics split (issue #6 class): frames feed occupancy/telemetry channels, never ``completion.usage``."""
     from antigravity_acp_mcp.client import _completion
     conv, _ = make_conv(tmp_path, [[{"usage": {"used": 1200, "size": 1000000, "inputTokens": 900,
                                                "outputTokens": 40}}, {"text": "hi"}]])
     try:
         r = conv.run([SYS, {"role": "user", "content": "q"}], TOOLS, "m")
-        u = _completion(r, "m").usage
-        assert (u.prompt_tokens, u.completion_tokens, u.total_tokens) == (900, 40, 940)
+        c = _completion(r, "m")
+        assert c.usage is None  # no prompt-result breakdown -> Hermes' own estimate stands
+        occ = c.antigravity_context_occupancy
+        assert occ["used"] == 1200 and occ["size"] == 1000000
+        assert occ["is_billing_usage"] is False
+        assert occ["source"] == "acp.session/update:usage_update"
+        assert c.antigravity_frame_usage == {"input_tokens": 900, "output_tokens": 40}
     finally:
         conv.close()
 

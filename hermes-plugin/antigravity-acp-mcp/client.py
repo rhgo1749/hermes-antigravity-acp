@@ -13,7 +13,12 @@ from typing import Any
 
 from ._hermes_seam import _conversation_affinity, _DualModeCompletionCreate, completion_to_stream_chunks
 from .acp_connection import AcpConnection
-from .conversation import Conversation, Registry
+from .conversation import (
+    _CONTEXT_OCCUPANCY_SOURCE,
+    _USAGE_SCOPE_UNVERIFIED,
+    Conversation,
+    Registry,
+)
 
 ACP_MARKER_BASE_URL = "acp://antigravity-mcp"
 THINKING_ENV = "HERMES_ANTIGRAVITY_ACP_MCP_THINKING_LEVEL"  # low|medium|high|xhigh; overrides reasoning_effort
@@ -92,19 +97,38 @@ def _completion(result: dict, model: str) -> SimpleNamespace:
     message = SimpleNamespace(content=result["text"], tool_calls=tool_calls,
                               reasoning=result["reasoning"] or None, reasoning_content=result["reasoning"] or None,
                               reasoning_details=None)
-    return SimpleNamespace(choices=[SimpleNamespace(message=message, finish_reason=result["finish_reason"])],
-                           usage=_usage(result.get("usage")), model=model)
+    completion = SimpleNamespace(
+        choices=[SimpleNamespace(message=message, finish_reason=result["finish_reason"])],
+        usage=_usage(result.get("usage")), model=model)
+    # Separate honest channels (never billing): the latest context OCCUPANCY reading from usage_update
+    # frames, and the frames' own token fields as raw telemetry. Both are explicitly non-billing.
+    occupancy = result.get("context_occupancy")
+    completion.antigravity_context_occupancy = ({
+        "source": _CONTEXT_OCCUPANCY_SOURCE, "scope": _USAGE_SCOPE_UNVERIFIED,
+        "is_billing_usage": False, **occupancy} if occupancy else None)
+    completion.antigravity_frame_usage = result.get("frame_usage")
+    return completion
 
 
 def _usage(u: dict | None) -> SimpleNamespace | None:
-    """agy's usage_update (input/output tokens, or context ``used``) as OpenAI-style usage; None when agy sent none."""
+    """The gated ``session/prompt`` result breakdown as OpenAI-style usage; None when absent or rejected.
+
+    Deliberately has NO fallback to context ``used``: an occupancy snapshot reported as ``prompt_tokens``
+    turns every reader into an occupancy integrator (issue #6 class; #194 audit). None lets Hermes' own
+    estimate stand.
+    """
     if not u:
         return None
-    prompt = u.get("input_tokens", u.get("used"))
-    completion = u.get("output_tokens", 0)
-    if prompt is None:
+    prompt = u.get("input_tokens")
+    if not isinstance(prompt, int) or isinstance(prompt, bool):
         return None
-    return SimpleNamespace(prompt_tokens=prompt, completion_tokens=completion, total_tokens=prompt + completion)
+    completion = u.get("output_tokens") or 0
+    total = u.get("total_tokens")
+    ns = SimpleNamespace(prompt_tokens=prompt, completion_tokens=completion,
+                         total_tokens=total if isinstance(total, int) else prompt + completion)
+    if isinstance(u.get("cached_read_tokens"), int):
+        ns.prompt_tokens_details = SimpleNamespace(cached_tokens=u["cached_read_tokens"])
+    return ns
 
 
 class AntigravityAcpMcpClient:
