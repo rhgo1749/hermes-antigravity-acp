@@ -105,13 +105,17 @@ def degenerate(text: str) -> bool:
 
 
 # ---- usage semantics (ported from the old engine's verified contract; docs/acp-usage-telemetry.md) ----------
-# ACP ``usage_update`` frames carry context OCCUPANCY readings (``used``/``size``), not a per-request
-# consumption breakdown. Reporting them as ``prompt_tokens`` makes every Hermes reader integrate occupancy
-# snapshots as consumption (issue #6 class; #194 chain audit: 25.39M "tokens" that were an occupancy integral).
+# ACP ``usage_update`` frames carry per-model-call consumption DELTA observations (``used``/``size``) whose
+# server semantics are NOT verified — the canonical doc is explicit that ``used`` is not cumulative context
+# occupancy and never billing. Reporting them as ``prompt_tokens`` makes every Hermes reader integrate
+# frame snapshots as consumption (issue #6 class; #194 chain audit: 25.39M "tokens" that were a frame
+# integral), so they are exposed ONLY as an explicitly unverified observation channel.
 # ``completion.usage`` is fed ONLY by the server's own ``session/prompt`` result breakdown, and only after a
 # growth-consistency gate against this adapter's local transcript estimate (2026-11-23 incident: a ~31K
 # transcript reported as ~1.07M fired the Core compression gate twice early).
-_CONTEXT_OCCUPANCY_SOURCE = "acp.session/update:usage_update"
+_CONTEXT_OBSERVATION_SOURCE = "acp.session/update:usage_update"
+_USAGE_OBSERVATION_SEMANTICS = ("usage_update.used is per-model-call consumption delta, not billing usage "
+                                "and not verified cumulative context occupancy; size is the context window")
 _USAGE_SCOPE_UNVERIFIED = "unverified_server_semantics"  # no runtime verdict store here: label honestly
 _USAGE_GROWTH_FACTOR = 8
 _USAGE_GROWTH_SLACK_TOKENS = 64_000
@@ -155,24 +159,27 @@ def _transcript_tokens(messages: list[dict[str, Any]]) -> int:
 def _consumption_from_prompt_result(result: dict[str, Any]) -> dict[str, int] | None:
     """The server's own per-turn breakdown from the ``session/prompt`` result; None when absent/invalid.
 
-    Field mapping follows the old engine's contract: ``inputTokens`` -> input; ``outputTokens`` +
-    ``thoughtTokens`` -> output; ``totalTokens`` forwarded as reported; ``cachedReadTokens`` kept separate.
-    A frame carrying any present-but-invalid value is rejected whole.
+    Old-engine field contract (``_turn_usage_from_prompt_result``): ``inputTokens``, ``outputTokens`` and
+    ``totalTokens`` are REQUIRED nonnegative ints — a report missing any of them is rejected whole, never
+    patched with invented zeros or a locally summed total. ``thoughtTokens`` adds into output;
+    ``totalTokens`` is forwarded exactly as reported; ``cachedReadTokens`` stays separate.
     """
     usage = result.get("usage")
     if not isinstance(usage, dict):
         return None
-    fields = {k: usage.get(k) for k in
-              ("inputTokens", "outputTokens", "thoughtTokens", "totalTokens", "cachedReadTokens")
-              if k in usage}
-    if "inputTokens" not in fields or not all(_nonnegative_int(v) for v in fields.values()):
-        return None
-    out = {"input_tokens": fields["inputTokens"],
-           "output_tokens": (fields.get("outputTokens") or 0) + (fields.get("thoughtTokens") or 0)}
-    if "totalTokens" in fields:
-        out["total_tokens"] = fields["totalTokens"]
-    if "cachedReadTokens" in fields:
-        out["cached_read_tokens"] = fields["cachedReadTokens"]
+    required = ("inputTokens", "outputTokens", "totalTokens")
+    optional = ("thoughtTokens", "cachedReadTokens")
+    for name in required:
+        if not _nonnegative_int(usage.get(name)):
+            return None
+    for name in optional:
+        if usage.get(name) is not None and not _nonnegative_int(usage[name]):
+            return None
+    out = {"input_tokens": usage["inputTokens"],
+           "output_tokens": usage["outputTokens"] + (usage.get("thoughtTokens") or 0),
+           "total_tokens": usage["totalTokens"]}
+    if usage.get("cachedReadTokens") is not None:
+        out["cached_read_tokens"] = usage["cachedReadTokens"]
     return out
 
 
@@ -1033,6 +1040,21 @@ class Conversation:
                 if fu:
                     self.frame_usage = fu
 
+    def _usage_observation(self) -> dict[str, Any] | None:
+        """Latest ``usage_update`` frame readings as ONE explicitly-unverified observation channel.
+
+        Never billing: the canonical doc labels these per-call deltas semantically unverified, and this
+        adapter holds no runtime verdict store to promote them.
+        """
+        if not self.occupancy and not self.frame_usage:
+            return None
+        obs: dict[str, Any] = {"source": _CONTEXT_OBSERVATION_SOURCE, "scope": _USAGE_SCOPE_UNVERIFIED,
+                               "semantics": _USAGE_OBSERVATION_SEMANTICS, "is_billing_usage": False}
+        obs.update(self.occupancy or {})
+        if self.frame_usage:
+            obs["frame_tokens"] = dict(self.frame_usage)
+        return obs
+
     def _gate_turn_consumption(self, result: dict[str, Any],
                                messages: list[dict[str, Any]]) -> dict[str, int] | None:
         """Consumption for this turn: the prompt-result breakdown, gated on growth consistency.
@@ -1048,6 +1070,14 @@ class Conversation:
         local = _transcript_tokens(messages)
         baseline = self._usage_baseline
         if baseline is None:
+            # First turn (or first after a restart): the old engine accepted unconditionally, so a server
+            # inflated from turn one could set a bogus baseline that every later turn then "agrees" with.
+            # Gate the absolute report against the local transcript estimate with the same divergence
+            # tolerance; a rejected first report leaves no baseline, so turn two is gated on its own.
+            if abs(reported - local) > max(_USAGE_GROWTH_FACTOR * (local + 1), _USAGE_GROWTH_SLACK_TOKENS):
+                logger.warning("acp-mcp: first-turn inputTokens %d rejected: diverges from local transcript "
+                               "estimate %d beyond tolerance; Hermes falls back to its own estimate", reported, local)
+                return None
             self._usage_baseline = (reported, local)
             return consumption
         ok, actual, expected = _reported_usage_growth_consistent(
@@ -1120,8 +1150,7 @@ class Conversation:
                         self._retire("terminal-handout")  # caller ends on this tool (e.g. SubagentHandback)
                 return {"text": "".join(self.text), "reasoning": "".join(self.reasoning), "tool_calls": calls,
                         "finish_reason": "tool_calls", "usage": None,
-                        "context_occupancy": dict(self.occupancy) if self.occupancy else None,
-                        "frame_usage": dict(self.frame_usage) if self.frame_usage else None}
+                        "usage_observation": self._usage_observation()}
             if kind == "end":
                 self._drain_updates(gen)
                 if payload.stop_reason == "cancelled":
@@ -1142,8 +1171,7 @@ class Conversation:
                     self.usage = self._gate_turn_consumption(payload.result, messages)
                 return {"text": "".join(self.text), "reasoning": "".join(self.reasoning), "tool_calls": [],
                         "finish_reason": payload.finish_reason, "usage": dict(self.usage) if self.usage else None,
-                        "context_occupancy": dict(self.occupancy) if self.occupancy else None,
-                        "frame_usage": dict(self.frame_usage) if self.frame_usage else None}
+                        "usage_observation": self._usage_observation()}
             if kind == "guard-loop":
                 self._drain_updates(gen)
                 with self.lock:
@@ -1152,8 +1180,7 @@ class Conversation:
                     self.view = replace(view_after(messages), retired=True)
                 return {"text": GUARD_LOOP_TEXT, "reasoning": "", "tool_calls": [], "finish_reason": "stop",
                         "usage": None,
-                        "context_occupancy": dict(self.occupancy) if self.occupancy else None,
-                        "frame_usage": dict(self.frame_usage) if self.frame_usage else None}
+                        "usage_observation": self._usage_observation()}
             if kind == "foreign":
                 raise self._fail(gen, "native-tool", ProviderError("agy attempted a native tool; session cancelled"),
                                  drop_conn=True)

@@ -14,8 +14,7 @@ from typing import Any
 from ._hermes_seam import _conversation_affinity, _DualModeCompletionCreate, completion_to_stream_chunks
 from .acp_connection import AcpConnection
 from .conversation import (
-    _CONTEXT_OCCUPANCY_SOURCE,
-    _USAGE_SCOPE_UNVERIFIED,
+    _nonnegative_int,
     Conversation,
     Registry,
 )
@@ -100,33 +99,26 @@ def _completion(result: dict, model: str) -> SimpleNamespace:
     completion = SimpleNamespace(
         choices=[SimpleNamespace(message=message, finish_reason=result["finish_reason"])],
         usage=_usage(result.get("usage")), model=model)
-    # Separate honest channels (never billing): the latest context OCCUPANCY reading from usage_update
-    # frames, and the frames' own token fields as raw telemetry. Both are explicitly non-billing.
-    occupancy = result.get("context_occupancy")
-    completion.antigravity_context_occupancy = ({
-        "source": _CONTEXT_OCCUPANCY_SOURCE, "scope": _USAGE_SCOPE_UNVERIFIED,
-        "is_billing_usage": False, **occupancy} if occupancy else None)
-    completion.antigravity_frame_usage = result.get("frame_usage")
+    # One honest observation channel (never billing): the latest usage_update frame readings, explicitly
+    # labelled semantically-unverified per docs/acp-usage-telemetry.md — NOT a verified occupancy claim.
+    obs = result.get("usage_observation")
+    completion.antigravity_usage_observations = obs
     return completion
 
 
 def _usage(u: dict | None) -> SimpleNamespace | None:
     """The gated ``session/prompt`` result breakdown as OpenAI-style usage; None when absent or rejected.
 
-    Deliberately has NO fallback to context ``used``: an occupancy snapshot reported as ``prompt_tokens``
-    turns every reader into an occupancy integrator (issue #6 class; #194 audit). None lets Hermes' own
-    estimate stand.
+    All three totals must be present (the old-engine required-field contract); nothing is invented here
+    and there is NO fallback to frame ``used``. None lets Hermes' own estimate stand.
     """
     if not u:
         return None
-    prompt = u.get("input_tokens")
-    if not isinstance(prompt, int) or isinstance(prompt, bool):
+    prompt, completion, total = u.get("input_tokens"), u.get("output_tokens"), u.get("total_tokens")
+    if not all(_nonnegative_int(v) for v in (prompt, completion, total)):
         return None
-    completion = u.get("output_tokens") or 0
-    total = u.get("total_tokens")
-    ns = SimpleNamespace(prompt_tokens=prompt, completion_tokens=completion,
-                         total_tokens=total if isinstance(total, int) else prompt + completion)
-    if isinstance(u.get("cached_read_tokens"), int):
+    ns = SimpleNamespace(prompt_tokens=prompt, completion_tokens=completion, total_tokens=total)
+    if _nonnegative_int(u.get("cached_read_tokens")):
         ns.prompt_tokens_details = SimpleNamespace(cached_tokens=u["cached_read_tokens"])
     return ns
 

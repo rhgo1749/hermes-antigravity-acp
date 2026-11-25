@@ -276,7 +276,7 @@ def test_replay_keeps_the_active_copy_of_a_repeated_system_message_full():
 
 
 def test_usage_update_frames_are_never_billing_usage(tmp_path):
-    """Semantics split (issue #6 class): frames feed occupancy/telemetry channels, never ``completion.usage``."""
+    """Semantics split (issue #6 class): frames feed ONE unverified observation channel, never ``completion.usage``."""
     from antigravity_acp_mcp.client import _completion
     conv, _ = make_conv(tmp_path, [[{"usage": {"used": 1200, "size": 1000000, "inputTokens": 900,
                                                "outputTokens": 40}}, {"text": "hi"}]])
@@ -284,11 +284,13 @@ def test_usage_update_frames_are_never_billing_usage(tmp_path):
         r = conv.run([SYS, {"role": "user", "content": "q"}], TOOLS, "m")
         c = _completion(r, "m")
         assert c.usage is None  # no prompt-result breakdown -> Hermes' own estimate stands
-        occ = c.antigravity_context_occupancy
-        assert occ["used"] == 1200 and occ["size"] == 1000000
-        assert occ["is_billing_usage"] is False
-        assert occ["source"] == "acp.session/update:usage_update"
-        assert c.antigravity_frame_usage == {"input_tokens": 900, "output_tokens": 40}
+        obs = c.antigravity_usage_observations
+        assert obs["used"] == 1200 and obs["size"] == 1000000
+        assert obs["is_billing_usage"] is False
+        assert obs["source"] == "acp.session/update:usage_update"
+        assert obs["scope"] == "unverified_server_semantics"
+        assert "not billing usage" in obs["semantics"]  # never a verified-occupancy claim
+        assert obs["frame_tokens"] == {"input_tokens": 900, "output_tokens": 40}
     finally:
         conv.close()
 
