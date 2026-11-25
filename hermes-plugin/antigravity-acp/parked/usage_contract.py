@@ -83,10 +83,22 @@ def reported_usage_growth_consistent(
 
 
 def estimate_tokens(text: str) -> int:
-    """Conservative token estimate (CJK ~1 token/char, other ~1 token/3 chars)."""
+    """Conservative token estimate (CJK ~1 token/char, other ~1 token/3 chars).
+
+    Explicit loop with an early break: this runs on every prompt build in both
+    engines' hot paths, and the generator/`any()` form measured ~2.6-2.9x
+    slower on long transcripts (external review of PR #89, timeit on 330K
+    chars).  Outputs are identical; do not "simplify" back to a comprehension.
+    """
     if not text:
         return 0
-    cjk = sum(1 for ch in text if any(lo <= ord(ch) <= hi for lo, hi in _CJK_RANGES))
+    cjk = 0
+    for ch in text:
+        code = ord(ch)
+        for lo, hi in _CJK_RANGES:
+            if lo <= code <= hi:
+                cjk += 1
+                break
     return cjk + (len(text) - cjk) // 3 + 1
 
 

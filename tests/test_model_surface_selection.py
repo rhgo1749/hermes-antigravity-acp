@@ -112,8 +112,8 @@ MODEL_GROUP = {
 }
 ARGON_GROUP = {
     "id": "model_family_b", "category": "model", "type": "select",
-    "currentValue": "gemini-4-argon",
-    "options": [{"value": "gemini-4-argon", "name": "Gemini 4 Argon"}],
+    "currentValue": "fake-model-c",
+    "options": [{"value": "fake-model-c", "name": "Fake Model C"}],
 }
 THINKING_GROUP = {
     "id": "thinking_level", "category": "thought_level", "type": "select",
@@ -249,16 +249,16 @@ def test_models_split_across_two_config_groups_are_offered_and_selectable(
         cwd=str(tmp_path),
     )
     listed = client.list_models(timeout_seconds=10)
-    assert "gemini-4-argon" in listed, f"second config group was not offered: {listed}"
+    assert "fake-model-c" in listed, f"second config group was not offered: {listed}"
     client.chat.completions.create(
-        model="gemini-4-argon",
+        model="fake-model-c",
         messages=[{"role": "user", "content": "hi"}], timeout=10,
     )
     rows = _selections(record)
     assert any(
         row["method"] == "session/set_config_option"
         and row["params"].get("configId") == "model_family_b"
-        and row["params"].get("value") == "gemini-4-argon"
+        and row["params"].get("value") == "fake-model-c"
         for row in rows
     ), f"second family did not select through its own group: {rows}"
 
