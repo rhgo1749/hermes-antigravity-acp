@@ -379,7 +379,11 @@ def _load_provider(monkeypatch, provider_path: Path, name: str):
     module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, name, module)
     spec.loader.exec_module(module)
-    assert registered == [module.antigravity_acp]  # provider registration itself
+    assert [p.name for p in registered] == [
+        "antigravity-acp-replay",
+        "antigravity-acp",
+        "antigravity-acp-mcp",
+    ] and registered[0] is module.antigravity_acp_replay  # provider registration itself
     return module
 
 
@@ -469,9 +473,9 @@ def test_provider_registration_and_model_listing_work_without_quota_skill(
         "HERMES_ANTIGRAVITY_ACP_LIMIT_STATE_FILE", str(tmp_path / "acp-limits.json")
     )
     # The profile resolves the launcher this installer actually installed.
-    assert str(env.launcher) == str(provider.antigravity_acp.process_command)
+    assert str(env.launcher) == str(provider.antigravity_acp_replay.process_command)
 
-    client = provider.antigravity_acp.create_client()
+    client = provider.antigravity_acp_replay.create_client()
     # Scope the canary to the provider's documented credential-free fallback
     # allowlist. Hosts where Hermes' own ``tools`` package happens to be
     # importable route through Hermes' credential-aware env policy instead,
@@ -497,6 +501,15 @@ def test_provider_registration_and_model_listing_work_without_quota_skill(
 
 
 @pytest.mark.skipif(os.name == "nt", reason="fake ACP archive is a POSIX test executable")
+def _provider_snapshot(provider_dir):
+    """Recursive relpath->bytes snapshot (0.9.0 trees nest under parked/)."""
+    return {
+        str(child.relative_to(provider_dir)): child.read_bytes()
+        for child in sorted(provider_dir.rglob("*"))
+        if child.is_file()
+    }
+
+
 def test_catalog_provider_path_a_composes_with_official_server_path_b(
     tmp_path, monkeypatch, capsys
 ):
@@ -514,6 +527,7 @@ def test_catalog_provider_path_a_composes_with_official_server_path_b(
     # Hermes core's installer-owned record and the catalog sidecar.
     env.provider_dir.mkdir(parents=True)
     for name in deployer.REQUIRED:
+        (env.provider_dir / name).parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(PLUGIN_SOURCE / name, env.provider_dir / name)
     (env.provider_dir / deployer.CATALOG_SIDECAR).write_text(
         json.dumps({"name": "antigravity-acp-provider", "pin": "0" * 40}) + "\n",
@@ -531,13 +545,13 @@ def test_catalog_provider_path_a_composes_with_official_server_path_b(
         }) + "\n",
         encoding="utf-8",
     )
-    before = {p.name: p.read_bytes() for p in env.provider_dir.iterdir()}
+    before = _provider_snapshot(env.provider_dir)
     assert deployer.classify_provider_target(env.provider_dir)[0] == "catalog"
 
     # Path B through the combined script installs the server beside it with
     # zero writes to the catalog tree (it is current, so it is a no-op).
     assert env.install() == 0
-    assert {p.name: p.read_bytes() for p in env.provider_dir.iterdir()} == before
+    assert _provider_snapshot(env.provider_dir) == before
     assert env.status() == 0
     assert "provider_registered=available" in capsys.readouterr().out
     assert env.verify() == 0
@@ -547,7 +561,7 @@ def test_catalog_provider_path_a_composes_with_official_server_path_b(
     assert env.delete() == 2
     refused = capsys.readouterr().err
     assert "hermes plugins remove" in refused
-    assert {p.name: p.read_bytes() for p in env.provider_dir.iterdir()} == before
+    assert _provider_snapshot(env.provider_dir) == before
 
     # Documented Path B recovery: server-only uninstall leaves plugin state
     # entirely alone.
@@ -555,7 +569,7 @@ def test_catalog_provider_path_a_composes_with_official_server_path_b(
     assert removed
     assert not (env.prefix / env.installer.official_installer.VERSION).exists()
     assert not env.launcher.exists()
-    assert {p.name: p.read_bytes() for p in env.provider_dir.iterdir()} == before
+    assert _provider_snapshot(env.provider_dir) == before
 
     # Provider registration + listing ride on the catalog bytes themselves.
     env.install()  # reinstall the server for listing
@@ -564,7 +578,7 @@ def test_catalog_provider_path_a_composes_with_official_server_path_b(
     monkeypatch.setenv(
         "HERMES_ANTIGRAVITY_ACP_LIMIT_STATE_FILE", str(tmp_path / "cat-limits.json")
     )
-    models = provider.antigravity_acp.fetch_models(timeout=15.0)
+    models = provider.antigravity_acp_replay.fetch_models(timeout=15.0)
     assert models is not None
     assert list(models) == list(_FAKE_MODELS)
     assert _auth_attempts(env.rows()) == []
@@ -888,7 +902,7 @@ def test_evidence_classes_are_separated_and_real_inference_stays_unexercised(
         encoding="utf-8",
     )
     module = _load_provider(monkeypatch, PLUGIN_SOURCE, "clean_env_smoke_turn_provider")
-    client = module.antigravity_acp.create_client(
+    client = module.antigravity_acp_replay.create_client(
         command=sys.executable, args=[str(script)], acp_cwd=str(tmp_path), rate_limit_retries=0
     )
     completion = client.chat.completions.create(

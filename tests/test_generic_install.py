@@ -87,7 +87,11 @@ def _load_installed_provider(monkeypatch, provider_path: Path):
     module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, name, module)
     spec.loader.exec_module(module)
-    assert registered == [module.antigravity_acp]
+    assert [p.name for p in registered] == [
+        "antigravity-acp-replay",
+        "antigravity-acp",
+        "antigravity-acp-mcp",
+    ] and registered[0] is module.antigravity_acp_replay
     return module
 
 
@@ -170,7 +174,7 @@ def test_clean_vanilla_install_and_provider_registration(monkeypatch, tmp_path, 
     assert installer.provider_installer.verify(home) == []
 
     provider = _load_installed_provider(monkeypatch, plugin)
-    client = provider.antigravity_acp.create_client()
+    client = provider.antigravity_acp_replay.create_client()
     assert client._acp_command == str(bin_dir / installer._launcher_name())
     assert client._acp_args == []
     # R7 (historical reference rework-r4): the generic install is NOT banned — the clean
@@ -242,6 +246,15 @@ def test_installer_rejects_symlinked_hermes_home(monkeypatch, tmp_path):
         installer.install(linked_home, tmp_path / "opt", tmp_path / "custom-bin")
 
 
+def _tree_snapshot(root):
+    """Recursive relpath->bytes snapshot (0.9.0 trees nest under parked/)."""
+    return {
+        str(child.relative_to(root)): child.read_bytes()
+        for child in sorted(root.rglob("*"))
+        if child.is_file()
+    }
+
+
 def _seed_outdated_provider_tree(plugin, deployer) -> None:
     plugin.mkdir(parents=True)
     (plugin / "plugin.yaml").write_text(
@@ -250,6 +263,7 @@ def _seed_outdated_provider_tree(plugin, deployer) -> None:
     )
     for name in deployer.REQUIRED:
         if name != "plugin.yaml":
+            (plugin / name).parent.mkdir(parents=True, exist_ok=True)
             (plugin / name).write_text("# old provider " + name + "\n", encoding="utf-8")
     (plugin / deployer.INSTALL_PROVENANCE_FILE).write_text(
         json.dumps({"managed_by": deployer.STANDALONE_MANAGED_BY}) + "\n",
@@ -281,7 +295,7 @@ def test_generic_install_refuses_before_any_write_when_a_late_profile_carries_an
     overlay = zeta / "portfolio_policy.py"
     overlay.write_text("# live private opt-in overlay\n", encoding="utf-8")
     overlay_sha_before = hashlib.sha256(overlay.read_bytes()).hexdigest()
-    alpha_before = {child.name: child.read_bytes() for child in alpha.iterdir()}
+    alpha_before = _tree_snapshot(alpha)
     assert [label for label, _ in deployer.homes(home)] == ["default", "alpha", "zeta"]
 
     with pytest.raises(ValueError, match="unmanaged file") as excinfo:
@@ -292,7 +306,7 @@ def test_generic_install_refuses_before_any_write_when_a_late_profile_carries_an
     # created for any target — including the profile that sorts before the
     # overlay-bearing one and the default home (which had no provider yet).
     assert not (home / "plugins" / "model-providers").exists()
-    assert {child.name: child.read_bytes() for child in alpha.iterdir()} == alpha_before
+    assert _tree_snapshot(alpha) == alpha_before
     assert hashlib.sha256(overlay.read_bytes()).hexdigest() == overlay_sha_before
     assert not (home / "plugin-backups").exists()
 
@@ -368,7 +382,7 @@ register_provider(antigravity_acp)
     # preserved pin/launch settings; the public tree simply has no policy.
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "neutral-home"))
     provider = _load_installed_provider(monkeypatch, plugin)
-    client = provider.antigravity_acp.create_client()
+    client = provider.antigravity_acp_replay.create_client()
     assert client._acp_command == "antigravity-acp-mux"
     assert client._acp_args == ["--uid="]
     client_module = sys.modules[provider.__name__ + ".client"]
@@ -382,7 +396,7 @@ register_provider(antigravity_acp)
     # tests/test_portfolio_safety_hotfix.py.
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     overridden = _load_installed_provider(monkeypatch, plugin)
-    overridden.antigravity_acp.create_client()
+    overridden.antigravity_acp_replay.create_client()
     assert sys.modules[overridden.__name__ + ".client"].policy_overlays == ()
 
 

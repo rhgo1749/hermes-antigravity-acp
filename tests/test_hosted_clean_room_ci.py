@@ -302,12 +302,25 @@ def test_probe_contains_no_authentication_code_path() -> None:
 
 def test_probe_selection_expectations_match_the_plugin_source() -> None:
     plugin = (ROOT / "hermes-plugin" / "antigravity-acp" / "__init__.py").read_text()
+    parked = (
+        ROOT / "hermes-plugin" / "antigravity-acp" / "parked" / "_plugin_entry.py"
+    ).read_text()
     probe = _probe_source()
-    assert 'display_name="Antigravity ACP"' in plugin
+    # 0.9.0: the default identity (display "Antigravity ACP") is the Parked-MCP
+    # engine; the Replay engine carries the "(Replay engine)" display that the
+    # probe pins for its live auth-boundary flow.
+    assert 'display_name="Antigravity ACP"' in parked
+    assert 'display_name="Antigravity ACP (Replay engine)"' in plugin
     assert 'DISPLAY_NAME = "Antigravity ACP"' in probe
-    assert 'BASE_URL = "acp://antigravity"' in probe and 'base_url="acp://antigravity"' in plugin
+    assert 'REPLAY_DISPLAY_NAME = "Antigravity ACP (Replay engine)"' in probe
+    assert (
+        'BASE_URL = "acp://antigravity"' in probe
+        and 'base_url="acp://antigravity"' in plugin
+        and 'base_url="acp://antigravity"' in parked
+    )
     assert 'AUTH_TYPE = "external_process"' in probe
     assert 'auth_type="external_process"' in plugin
+    assert 'auth_type="external_process"' in parked
 
 
 def test_probe_records_only_fingerprints_for_the_model_boundary() -> None:

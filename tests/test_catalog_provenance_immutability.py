@@ -107,6 +107,7 @@ def _seed_catalog_provider(home: Path, *, with_metadata: bool = True) -> Path:
     target = _provider_target(home)
     target.mkdir(parents=True)
     for name in deploy.REQUIRED:
+        (target / name).parent.mkdir(parents=True, exist_ok=True)
         (target / name).write_bytes(_catalog_bytes(name))
     (target / deploy.CATALOG_SIDECAR).write_text(
         json.dumps(
@@ -258,6 +259,7 @@ def test_unverified_upgrade_attempt_is_an_ownership_refusal(tmp_path):
     other_source = tmp_path / "other-source"
     other_source.mkdir()
     for name in deploy.REQUIRED:
+        (other_source / name).parent.mkdir(parents=True, exist_ok=True)
         (other_source / name).write_bytes(f"# newer from elsewhere {name}\n".encode())
     before = _snapshot(home)
 
@@ -304,6 +306,7 @@ def test_malformed_provenance_marker_fails_closed(tmp_path):
     target.mkdir(parents=True)
     for name in deploy.REQUIRED:
         body = "name: antigravity-acp-provider\n" if name == "plugin.yaml" else ""
+        (target / name).parent.mkdir(parents=True, exist_ok=True)
         (target / name).write_bytes(f"{body}# pre-existing provider {name}\n".encode())
     (target / deploy.INSTALL_PROVENANCE_FILE).write_text("not json {{{", encoding="utf-8")
     before = _snapshot(home)
@@ -521,6 +524,7 @@ def test_legacy_pre_marker_install_with_installer_artifacts_remains_updatable(tm
     )
     for name in deploy.REQUIRED:
         if name != "plugin.yaml":
+            (target / name).parent.mkdir(parents=True, exist_ok=True)
             (target / name).write_bytes(f"# old provider {name}\n".encode())
     # A legacy installer-exclusive artifact: genuine pre-marker installs from
     # the pinned-server era carried at least one of these. (An opt-in private
@@ -549,6 +553,7 @@ def test_pre_marker_install_bytes_not_matching_any_verified_release_refused(tmp_
     )
     for name in deploy.REQUIRED:
         if name != "plugin.yaml":
+            (target / name).parent.mkdir(parents=True, exist_ok=True)
             (target / name).write_bytes(f"# old provider {name}\n".encode())
     kind, reason = deploy.classify_provider_target(target)
     assert kind == "ambiguous"
@@ -568,6 +573,7 @@ def _catalog_shaped_tree(home: Path) -> Path:
     )
     for name in deploy.REQUIRED:
         if name != "plugin.yaml":
+            (target / name).parent.mkdir(parents=True, exist_ok=True)
             (target / name).write_bytes(b"# foreign catalog-compatible body " + name.encode() + b"\n")
     return target
 
@@ -639,6 +645,7 @@ def test_pre_marker_tree_matching_a_verified_release_lineage_stays_updatable(
             if name == "plugin.yaml"
             else b"# verified prior release body " + name.encode() + b"\n"
         )
+        (target / name).parent.mkdir(parents=True, exist_ok=True)
         (target / name).write_bytes(body)
         lineage[name] = hashlib.sha256(body).hexdigest()
     monkeypatch.setitem(deploy.PRE_MARKER_LINEAGE_SETS, "test-release", lineage)
@@ -837,7 +844,11 @@ def _load_installed_provider(monkeypatch, provider_path: Path):
     module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, name, module)
     spec.loader.exec_module(module)
-    assert registered == [module.antigravity_acp]
+    assert [p.name for p in registered] == [
+        "antigravity-acp-replay",
+        "antigravity-acp",
+        "antigravity-acp-mcp",
+    ] and registered[0] is module.antigravity_acp_replay
     return module
 
 
@@ -861,7 +872,7 @@ def test_plugin_import_never_downloads_or_self_updates(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_ANTIGRAVITY_ACP_COMMAND", str(launcher))
 
     provider = _load_installed_provider(monkeypatch, plugin)
-    provider.antigravity_acp.create_client()
+    provider.antigravity_acp_replay.create_client()
 
     # static guard: the shipped provider source has no installer/download hooks
     source_text = "".join(

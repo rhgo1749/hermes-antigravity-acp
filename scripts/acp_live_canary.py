@@ -651,7 +651,16 @@ def load_client_module(repo_root: Path):
     providers.register_provider = registered.append
     providers_base = types.ModuleType("providers.base")
     providers_base.ProviderProfile = FakeProviderProfile
-    sys.modules.setdefault("providers", providers)
+    # The fake registry is only needed while the plugin package is exec'd.
+    # A surrounding pytest process may already have imported the real
+    # ``providers`` package; overwriting it without restoring leaks the fake
+    # into ``sys.modules`` and breaks every later test that imports the real
+    # registry (e.g. the vanilla seam tests).
+    shadowed = {
+        name: module
+        for name, module in sys.modules.items()
+        if name == "providers" or name.startswith("providers.")
+    }
     sys.modules["providers"] = providers
     sys.modules["providers.base"] = providers_base
 
@@ -659,14 +668,22 @@ def load_client_module(repo_root: Path):
     for name in list(sys.modules):
         if name == module_name or name.startswith(module_name + "."):
             del sys.modules[name]
-    spec = importlib.util.spec_from_file_location(
-        module_name, plugin_dir / "__init__.py",
-        submodule_search_locations=[str(plugin_dir)],
-    )
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
+    try:
+        spec = importlib.util.spec_from_file_location(
+            module_name, plugin_dir / "__init__.py",
+            submodule_search_locations=[str(plugin_dir)],
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+    finally:
+        for name in [
+            name for name in sys.modules
+            if name == "providers" or name.startswith("providers.")
+        ]:
+            del sys.modules[name]
+        sys.modules.update(shadowed)
     return module
 
 
@@ -1250,7 +1267,7 @@ def main() -> int:
     logging.getLogger().addHandler(collector)
     logging.getLogger().setLevel(logging.INFO)
 
-    client = module.antigravity_acp.create_client(
+    client = module.antigravity_acp_replay.create_client(
         command=args.command, args=[], acp_cwd=cwd, rate_limit_retries=0,
     )
     client_module = sys.modules[module.__name__ + ".client"]

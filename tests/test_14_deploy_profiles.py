@@ -39,6 +39,7 @@ def _source(tmp_path: Path) -> Path:
     src = tmp_path / "src" / "antigravity-acp"
     src.mkdir(parents=True, exist_ok=True)
     for name in REQUIRED:
+        (src / name).parent.mkdir(parents=True, exist_ok=True)
         if name == "plugin.yaml":
             (src / name).write_text(_plugin_yaml("0.4.8"))
         else:
@@ -61,6 +62,7 @@ def _home(tmp_path: Path) -> tuple[Path, dict[str, Path]]:
         (target / "plugin.yaml").write_text(_plugin_yaml("0.4.0"))
         for name in REQUIRED:
             if name != "plugin.yaml":
+                (target / name).parent.mkdir(parents=True, exist_ok=True)
                 (target / name).write_text(f"# old {name}\n")
         # Ownership evidence of a genuine pre-marker installer deploy (the
         # post-historical reference gate refuses canonical trees with no provable provenance).

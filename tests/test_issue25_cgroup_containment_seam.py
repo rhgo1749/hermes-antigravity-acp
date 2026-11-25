@@ -529,7 +529,7 @@ def test_spawn_handshake_failure_falls_back_to_unknown(tmp_path, monkeypatch):
     monkeypatch.setattr(
         pkg_cgc.Containment, "begin", classmethod(lambda cls: handle)
     )
-    client = package.antigravity_acp.create_client(
+    client = package.antigravity_acp_replay.create_client(
         command=sys.executable, args=["-c", "import time; time.sleep(300)"],
         acp_cwd=str(tmp_path),
     )

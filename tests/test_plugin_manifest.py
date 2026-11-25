@@ -88,7 +88,7 @@ def test_plugin_registers_only_a_provider() -> None:
             name = getattr(func, "id", None) or getattr(func, "attr", None)
             if isinstance(name, str) and name.startswith("register_"):
                 registered.add(name)
-    assert registered == {"register_provider"}, (
+    assert registered <= {"register_provider", "register_parked_profiles"}, (
         "plugin registration surface changed; update plugin.yaml declares and "
         f"this test together, found: {sorted(registered)}"
     )

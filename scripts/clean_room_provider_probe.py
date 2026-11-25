@@ -38,6 +38,7 @@ sys.path.insert(0, str(REPO / "scripts"))
 import install_acp  # noqa: E402  (stdlib-only closure: redaction contract)
 
 DISPLAY_NAME = "Antigravity ACP"
+REPLAY_DISPLAY_NAME = "Antigravity ACP (Replay engine)"
 BASE_URL = "acp://antigravity"
 AUTH_TYPE = "external_process"
 LAUNCHER_NAME = "antigravity-acp-official"
@@ -68,22 +69,46 @@ def main() -> int:
 
     import providers
 
-    profile = providers.get_provider_profile("antigravity-acp")
-    if profile is None:
+    # 0.9.0 identity split: the DEFAULT id ``antigravity-acp`` is the Parked-MCP
+    # engine; the Replay engine — whose client surface this probe exercises
+    # live (list_models against the official binary, zero credentials) — keeps
+    # the explicit ``antigravity-acp-replay`` id.  Both identities must be
+    # discovered from the HERMES_HOME projection; the live auth-boundary flow
+    # runs on the Replay profile.
+    default_profile = providers.get_provider_profile("antigravity-acp")
+    replay_profile = providers.get_provider_profile("antigravity-acp-replay")
+    if default_profile is None or replay_profile is None:
         print("PROBE|selection outcome=fail reason=profile-not-discovered")
         return 1
-    assert profile is not None
-    module = sys.modules.get(type(profile).__module__)
+    assert default_profile is not None and replay_profile is not None
+    default_module = sys.modules.get(type(default_profile).__module__)
+    default_module_file = str(getattr(default_module, "__file__", "") or "")
+    module = sys.modules.get(type(replay_profile).__module__)
     module_file = str(getattr(module, "__file__", "") or "")
     expected_module = (
         Path(hermes_home) / "plugins" / "model-providers" / "antigravity-acp" / "__init__.py"
     )
+    expected_default_module = (
+        Path(hermes_home)
+        / "plugins"
+        / "model-providers"
+        / "antigravity-acp"
+        / "parked"
+        / "_plugin_entry.py"
+    )
     checks = {
-        "profile_class": type(profile).__name__ == "AntigravityACPProfile",
-        "display_name": profile.display_name == DISPLAY_NAME,
-        "base_url": profile.base_url == BASE_URL,
-        "auth_type": profile.auth_type == AUTH_TYPE,
-        "native_command": str(profile.process_command) == expected_launcher,
+        "default_profile_class": type(default_profile).__name__ == "AntigravityAcpMcpProfile",
+        "default_display_name": default_profile.display_name == DISPLAY_NAME,
+        "default_base_url": default_profile.base_url == BASE_URL,
+        "default_auth_type": default_profile.auth_type == AUTH_TYPE,
+        "default_served_from_hermes_home": (
+            Path(default_module_file).resolve() == expected_default_module.resolve()
+        ),
+        "profile_class": type(replay_profile).__name__ == "AntigravityACPProfile",
+        "display_name": replay_profile.display_name == REPLAY_DISPLAY_NAME,
+        "base_url": replay_profile.base_url == BASE_URL,
+        "auth_type": replay_profile.auth_type == AUTH_TYPE,
+        "native_command": str(replay_profile.process_command) == expected_launcher,
         "served_from_hermes_home": (
             Path(module_file).resolve() == expected_module.resolve()
         ),
@@ -93,11 +118,11 @@ def main() -> int:
         print("PROBE|FAIL reason=selection-field-divergence")
         return 1
 
-    client = profile.create_client(
+    client = replay_profile.create_client(
         api_key="antigravity-acp",
-        base_url=profile.base_url,
-        command=profile.process_command,
-        args=list(profile.process_args),
+        base_url=replay_profile.base_url,
+        command=replay_profile.process_command,
+        args=list(replay_profile.process_args),
     )
     assert client is not None
     class_ok = client.__class__.__name__ == "AntigravityACPClient" and not any(
@@ -140,7 +165,7 @@ def main() -> int:
     finally:
         client.close()
 
-    floor = profile.fetch_models(timeout=25.0)
+    floor = replay_profile.fetch_models(timeout=25.0)
     print(
         "PROBE|picker_floor fetch_models_none="
         f"{floor is None} count_if_list={0 if floor is None else len(floor)}"

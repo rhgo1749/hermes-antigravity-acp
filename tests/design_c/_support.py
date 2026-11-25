@@ -11,7 +11,7 @@ from antigravity_acp_mcp.acp_connection import AcpConnection
 from antigravity_acp_mcp.conversation import Conversation
 
 ROOT = Path(__file__).resolve().parents[2]
-PLUGIN_DIR = ROOT / "hermes-plugin" / "antigravity-acp-mcp"
+PLUGIN_DIR = ROOT / "hermes-plugin" / "antigravity-acp" / "parked"
 FAKE_ACP = str(Path(__file__).with_name("fake_acp.py"))
 FAKE_AGY = str(Path(__file__).with_name("fake_agy.py"))
 

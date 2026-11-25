@@ -331,17 +331,17 @@ class AntigravityACPProfile(ProviderProfile):
         return rows or None
 
 
-antigravity_acp = AntigravityACPProfile(
-    name="antigravity-acp",
+antigravity_acp_replay = AntigravityACPProfile(
+    name="antigravity-acp-replay",
     aliases=(
-        "antigravity-cli",
-        "agy",
-        "antigravity",
-        "agy-acp",
-        "antigravity-official-acp",
+        "agy-replay",
+        "antigravity-replay",
     ),
-    display_name="Antigravity ACP",
-    description="Google Antigravity through Google's official ACP v1 stdio server",
+    display_name="Antigravity ACP (Replay engine)",
+    description=(
+        "Google Antigravity through Google's official ACP v1 stdio server; "
+        "Replay engine (explicit alternative since 0.9.0)"
+    ),
     api_mode="chat_completions",
     env_vars=(),
     base_url="acp://antigravity",
@@ -362,4 +362,15 @@ antigravity_acp = AntigravityACPProfile(
     fallback_models=(),
 )
 
-register_provider(antigravity_acp)
+register_provider(antigravity_acp_replay)
+
+# Default engine switch (0.9.0): the Parked-MCP engine takes the public
+# ``antigravity-acp`` identity (and keeps the ``antigravity-acp-mcp``
+# compatibility id).  The Replay profile above is the explicit alternative.
+# Neither engine ever retries a side-effecting tool execution on the other.
+from .parked._plugin_entry import register_parked_profiles  # noqa: E402
+
+register_parked_profiles(
+    stored_process_command=_STORED_PROCESS_COMMAND,
+    stored_process_args=_STORED_PROCESS_ARGS,
+)

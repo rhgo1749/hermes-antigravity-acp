@@ -191,7 +191,7 @@ class AcpHarness:
             str(self.dir / "fake_acp_server.py"),
             str(log_path), str(pid_path), str(prompt_delay), str(handshake_delay),
         ]
-        client = self.module.antigravity_acp.create_client(
+        client = self.module.antigravity_acp_replay.create_client(
             command=sys.executable, args=args, acp_cwd=str(self.dir),
             rate_limit_retries=0)
         return client, log_path, pid_path
@@ -508,7 +508,7 @@ def _client_mux_setup(agy, tmp_path: Path, tag: str, prompt_delay: float):
             else:
                 os.environ[key] = value
 
-    client = agy.module.antigravity_acp.create_client(
+    client = agy.module.antigravity_acp_replay.create_client(
         command="/bin/sh",
         args=[str(REPO / "scripts" / "antigravity-acp-mux")],
         acp_cwd=str(agy.dir),

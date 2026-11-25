@@ -244,7 +244,7 @@ def test_parent_and_sibling_children_keep_disjoint_native_continuations(
     module = _load_client(monkeypatch, tmp_path)
     client_mod = importlib.import_module(f"{module.__name__}.client")
     monkeypatch.setattr(client_mod, "_read_par_pin", lambda: str(par))
-    client = module.antigravity_acp.create_client(
+    client = module.antigravity_acp_replay.create_client(
         command=sys.executable,
         args=[str(PLUGIN_DIR.parents[1] / "scripts" / "antigravity-acp-mux.py")],
         acp_cwd=str(tmp_path),
@@ -377,7 +377,7 @@ def test_nested_delegated_child_uses_its_own_identity_not_inherited_keys(
     module = _load_client(monkeypatch, tmp_path)
     client_mod = importlib.import_module(f"{module.__name__}.client")
     monkeypatch.setattr(client_mod, "_read_par_pin", lambda: str(par))
-    client = module.antigravity_acp.create_client(
+    client = module.antigravity_acp_replay.create_client(
         command=sys.executable,
         args=[str(PLUGIN_DIR.parents[1] / "scripts" / "antigravity-acp-mux.py")],
         acp_cwd=str(tmp_path),
@@ -627,7 +627,7 @@ def test_concurrent_same_prompt_siblings_never_share_affinity_or_frontier(
     monkeypatch.setattr(client_mod, "_read_par_pin", lambda: str(par))
 
     def fresh_client():
-        return module.antigravity_acp.create_client(
+        return module.antigravity_acp_replay.create_client(
             command=sys.executable,
             args=[str(PLUGIN_DIR.parents[1] / "scripts" / "antigravity-acp-mux.py")],
             acp_cwd=str(tmp_path),

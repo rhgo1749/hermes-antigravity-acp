@@ -73,7 +73,7 @@ def _load_client(monkeypatch, *, args: list[str], cwd: str):
     module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, module_name, module)
     spec.loader.exec_module(module)
-    return module, module.antigravity_acp.create_client(
+    return module, module.antigravity_acp_replay.create_client(
         command=sys.executable, args=args, acp_cwd=cwd
     )
 

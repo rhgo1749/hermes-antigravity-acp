@@ -30,3 +30,6 @@ deployment-artifacts/
 .local-deploy/
 dist/
 build/
+
+# Local git worktrees (review/integration scratch).
+.worktrees/

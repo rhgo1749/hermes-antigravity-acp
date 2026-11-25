@@ -597,13 +597,44 @@ the standing NO-GO boundary.
 ## Hermes provider plugin
 
 `hermes-plugin/antigravity-acp/` is a standalone Hermes model-provider plugin.
-It registers exactly one model-provider profile — no tools, hooks, middleware,
-or commands — and replaces the old local `agy stream-json` transport with the
+It registers exactly three model-provider profiles — no tools, hooks,
+middleware, or commands — spanning two execution engines (see "Engines"
+below), and replaces the old local `agy stream-json` transport with the
 official ACP wire while preserving Hermes as the owner of its own tool loop.
-The plugin supplies its own `AntigravityACPClient` through Hermes' public
+The plugin supplies its own clients through Hermes' public
 `ProviderProfile.create_client()` seam; it does **not** subclass
 `agent.copilot_acp_client.CopilotACPClient` and does not require a private
 Hermes fork or ACP-specific core patches.
+
+### Engines: Parked-MCP (default) and Replay (selectable)
+
+Since plugin 0.9.0 one plugin package carries both engines:
+
+| Provider id | Engine | Source | Notes |
+|---|---|---|---|
+| `antigravity-acp` | Parked-MCP (default) | `hermes-plugin/antigravity-acp/parked/` | Public identity; aliases `antigravity-cli`, `agy`, `antigravity`, `agy-acp`, `antigravity-official-acp`; marker `base_url` `acp://antigravity` |
+| `antigravity-acp-mcp` | Parked-MCP | same `parked/` subpackage | Compatibility id (alias `agy-mcp`) kept so pre-0.9.0 `model.provider: antigravity-acp-mcp` settings keep resolving; marker `base_url` `acp://antigravity-mcp` |
+| `antigravity-acp-replay` | Replay | parent package flat modules (`client.py` et al.) | The pre-0.9.0 default engine, explicitly selectable; not deprecated and not removed |
+
+The Parked-MCP engine parks Hermes tool calls behind a per-session loopback
+Streamable-HTTP MCP endpoint instead of letting the ACP server run native
+tools; it was authored by Nanako0129 (MIT-licensed) as the opt-in sibling
+plugin `hermes-plugin/antigravity-acp-mcp` (issues #81/#82/#83) and moved
+into `parked/` when it became the default. Its security boundaries and the
+M3 lost-response correlation contract are specified in
+[`docs/design-c-opt-in.md`](docs/design-c-opt-in.md).
+
+**Selection rule: the engine is chosen solely by the provider id in the
+profile config** (`model.provider`). There is no automatic engine fallback:
+neither engine ever retries a side-effecting tool execution on the other, in
+any failure mode (timeout, transport loss, child death). Switching engines is
+an explicit config change. Launcher resolution is shared and precedence-
+ordered: explicit `command=`, then `HERMES_ANTIGRAVITY_ACP_MCP_COMMAND`,
+then `HERMES_ANTIGRAVITY_ACP_COMMAND`, then the profile default launcher.
+Authentication, MUX packaging, and live model discovery behave identically
+for both ids; the Replay engine additionally keeps `login.py`/`setup_status`
+helpers. The default-switch release is planned for plugin v0.9.0; it is not
+published by the switch PR itself.
 
 Runtime contracts live in [`docs/provider-runtime.md`](docs/provider-runtime.md):
 the ACP session flow, model-attribution fail-closed rules, durable ACP

@@ -49,6 +49,18 @@ CANONICAL_PROVIDER_FILES = {
     "request_trace.py",
     "hermes_compat.py",
     "login.py",
+    # Parked-MCP default engine (plugin 0.9.0): nested managed subtree.
+    "parked/__init__.py",
+    "parked/_hermes_seam.py",
+    "parked/_plugin_entry.py",
+    "parked/_upstream.py",
+    "parked/acp_connection.py",
+    "parked/client.py",
+    "parked/conversation.py",
+    "parked/matcher.py",
+    "parked/parked_mcp.py",
+    "parked/permission.py",
+    "parked/session.py",
 }
 
 # Personal-ops tokens that must never appear on the public distribution
@@ -105,7 +117,7 @@ def _deploy():
 def test_canonical_fileset_witness_matches_deployer_contract() -> None:
     deploy = _deploy()
     assert set(deploy.REQUIRED) == CANONICAL_PROVIDER_FILES
-    assert len(deploy.REQUIRED) == 11
+    assert len(deploy.REQUIRED) == 22
 
 
 _PROVIDER_PREFIX = "hermes-plugin/antigravity-acp/"
@@ -159,6 +171,7 @@ def _seed_standalone_target(home: Path) -> Path:
     target = home / "plugins" / "model-providers" / _deploy().PROVIDER
     target.mkdir(parents=True)
     for name in CANONICAL_PROVIDER_FILES:
+        (target / name).parent.mkdir(parents=True, exist_ok=True)
         if name == "plugin.yaml":
             (target / name).write_text(
                 "name: antigravity-acp-provider\nkind: model-provider\nversion: 0.4.0\n",
@@ -189,7 +202,11 @@ def test_generic_deploy_refuses_before_any_write_when_a_tree_carries_overlays(tm
     (target / "personal_note.txt").write_text("not installer state\n", encoding="utf-8")
     launch = {"process_command": "antigravity-acp-official", "process_args": ["--uid="]}
     (target / deploy.LAUNCH_CONFIG_FILE).write_text(json.dumps(launch) + "\n", encoding="utf-8")
-    before = {child.name: child.read_bytes() for child in target.iterdir()}
+    before = {
+        child.relative_to(target).as_posix(): child.read_bytes()
+        for child in target.rglob("*")
+        if child.is_file()
+    }
 
     with pytest.raises(ValueError, match="unmanaged file") as excinfo:
         deploy.install(deploy.SOURCE, home, apply=True, all_profiles=False)
@@ -200,7 +217,11 @@ def test_generic_deploy_refuses_before_any_write_when_a_tree_carries_overlays(tm
 
     # Nothing was mutated anywhere: the live tree is byte-identical and no
     # staging or backup roots were created.
-    assert {child.name: child.read_bytes() for child in target.iterdir()} == before
+    assert {
+        child.relative_to(target).as_posix(): child.read_bytes()
+        for child in target.rglob("*")
+        if child.is_file()
+    } == before
     assert not (home / "plugin-backups").exists()
     assert deploy.verify(home) == []
 
@@ -472,7 +493,14 @@ def _load_installed_provider(monkeypatch, provider_path: Path):
     module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, name, module)
     spec.loader.exec_module(module)
-    assert registered == [module.antigravity_acp]
+    # 0.9.0: one plugin, three profiles (Replay explicit id, Parked-MCP
+    # default public identity, Parked-MCP compatibility id).
+    assert [prof.name for prof in registered] == [
+        "antigravity-acp-replay",
+        "antigravity-acp",
+        "antigravity-acp-mcp",
+    ]
+    assert registered[0] is module.antigravity_acp_replay
     return module
 
 
@@ -507,7 +535,11 @@ def test_clean_single_account_install_ships_no_personal_ops_surface(monkeypatch,
     ) == 0
 
     provider = home / "plugins" / "model-providers" / "antigravity-acp"
-    shipped = {child.name for child in provider.iterdir() if child.is_file()}
+    shipped = {
+        child.relative_to(provider).as_posix()
+        for child in provider.rglob("*")
+        if child.is_file() and "__pycache__" not in child.relative_to(provider).parts
+    }
     assert shipped == CANONICAL_PROVIDER_FILES | {"install-provenance.json"}
     assert not (provider / "portfolio_policy.py").exists()
     # Nothing personal was created in the user-chosen home.
@@ -516,7 +548,7 @@ def test_clean_single_account_install_ships_no_personal_ops_surface(monkeypatch,
 
     # The provider resolves to exactly one official ACP launcher instance.
     module = _load_installed_provider(monkeypatch, provider)
-    client = module.antigravity_acp.create_client()
+    client = module.antigravity_acp_replay.create_client()
     assert client._acp_command == str(launcher)
     assert client._acp_args == []
     client_module = sys.modules[module.__name__ + ".client"]
@@ -530,8 +562,8 @@ def _declared_surface_violations(manifest_text: str) -> list[str]:
     """Fail-closed structural witness for the plugin's declared surface.
 
     The plugin-catalog contract (catalog rules 11-13) and historical reference criterion 3
-    require this plugin to register exactly one model-provider profile and
-    NOTHING else: every ``provides_*`` list, any ``commands``/``skills``
+    require this plugin's registered surface to stay pinned: exactly the
+    three model-provider profiles of 0.9.0 and NOTHING else: every ``provides_*`` list, any ``commands``/``skills``
     declaration, and every ``/quota`` tool/skill reference (the personal
     usage-quota surface stays unshipped and its telemetry stays
     ``status='unavailable'``) are violations, as is a ``requires_env`` entry
@@ -619,11 +651,18 @@ def test_shipped_package_carries_no_quota_tool_or_skill_manifest(tmp_path) -> No
         if source.is_file():
             target = tmp_path / source.name
             target.write_bytes(source.read_bytes())
+        elif source.is_dir() and (source / "__init__.py").exists():
+            # Managed subpackage (parked/): the shipped-package witness must
+            # cover its sources too, not just the flat top level.
+            staged = tmp_path / source.name
+            staged.mkdir(parents=True, exist_ok=True)
+            for nested in sorted(source.glob("*.py")):
+                (staged / nested.name).write_bytes(nested.read_bytes())
     (tmp_path / "plugin.yaml").write_bytes((PLUGIN_DIR / "plugin.yaml").read_bytes())
     manifest_text = (tmp_path / "plugin.yaml").read_text(encoding="utf-8")
     assert _declared_surface_violations(manifest_text) == []
     combined = "\n".join(
-        path.read_text(encoding="utf-8") for path in tmp_path.glob("*.py") if path.is_file()
+        path.read_text(encoding="utf-8") for path in tmp_path.rglob("*.py") if path.is_file()
     )
     assert "/quota" not in combined
     assert "register_tool" not in combined

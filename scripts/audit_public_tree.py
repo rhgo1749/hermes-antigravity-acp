@@ -69,6 +69,21 @@ PUBLIC_PROVIDER_FILES = frozenset(
         "request_trace.py",
         "hermes_compat.py",
         "login.py",
+        # 0.9.0: the Parked-MCP default engine lives under parked/ and is
+        # part of the canonical public provider fileset (mirrored by
+        # scripts/deploy_hermes_profiles.REQUIRED and
+        # tests/test_public_distribution_surface.CANONICAL_PROVIDER_FILES).
+        "parked/__init__.py",
+        "parked/_hermes_seam.py",
+        "parked/_plugin_entry.py",
+        "parked/_upstream.py",
+        "parked/acp_connection.py",
+        "parked/client.py",
+        "parked/conversation.py",
+        "parked/matcher.py",
+        "parked/parked_mcp.py",
+        "parked/permission.py",
+        "parked/session.py",
     }
 )
 PUBLIC_CLOSURE_FILES = frozenset(
