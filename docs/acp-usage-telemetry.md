@@ -56,6 +56,38 @@ telemetry. Nothing here is an invoice, a quota reading, or a context-occupancy
 claim; the scope label is the static `unverified_server_semantics` for every
 identity (the behavioral-verdict ladder that used to promote it is retired):
 
+### Two different data classes — what is kept, what is lost
+
+- **Prompt-result usage** (the `usage` object inside the `session/prompt`
+  RESULT: `inputTokens`/`outputTokens`/`thoughtTokens`/`cachedReadTokens`/
+  `totalTokens`) is DISCARDED by both engines: only `stopReason` is read from
+  the result; the numeric breakdown is parsed nowhere, stored nowhere, and
+  exported nowhere (the parked engine's former parser was deleted as dead
+  code with #102). This is the cumulative-consumption class that poisoned
+  Core's occupancy anchor (S1–S4); its loss is intentional and it must never
+  be re-admitted into any path reaching `completion.usage`.
+- **`usage_update` frames** (per-model-call `used`/`size` observations
+  streamed as `session/update` notifications) are KEPT, per engine:
+  - Replay: `context_occupancy` + `turn_consumption` on the completion's
+    `antigravity_usage_telemetry` attribute, plus durable `usage_totals` in
+    `cache/antigravity-acp-sessions.json` (below).
+  - Parked-MCP: the completion's `antigravity_usage_observations` attribute
+    (latest occupancy reading plus frame token fields), explicitly
+    unverified; nothing is persisted to disk by the parked engine.
+- **Core `/usage` and downstream token statistics**: because
+  `completion.usage` is `None`, Core's `record_response_usage` takes its
+  usage-less path and records NO per-model usage rows for ACP turns; session
+  token totals stay at their schema defaults. `/usage` and any report built
+  on those rows therefore show zero token consumption for ACP sessions —
+  honestly zero, where before #102 they carried inflated sums (S2: 6.03M
+  cache-read tokens on a ~140K-token transcript). Rendering "this provider
+  reports no billing usage" distinctly from "this session consumed nothing"
+  is a downstream reporting concern, not a provider-boundary one (see
+  Downstream ownership).
+
+No new telemetry system was introduced: every kept field rides the
+pre-existing attributes and state file above.
+
 - `context_occupancy` in `antigravity_usage_telemetry`: the latest valid
   in-turn frame reading (`used`/`size`), `is_billing_usage: false`.
 - `turn_consumption`: sum of valid nonzero frames observed inside the
@@ -114,7 +146,9 @@ responses (Core's usage-less path never touches it) and keeps matching while
 the transcript prefix is stable. Already-tainted live sessions therefore need
 a gateway/process restart (or a natural re-anchor) at rollout — no silent
 database rewrite is performed. This is pinned by
-`test_existing_tainted_anchor_survives_usage_less_turns` in the upstream lane.
+`test_tainted_anchor_persists_through_real_usage_less_recording` in the
+upstream lane, which drives Core's real `record_response_usage` for both the
+poisoning turn and the later usage-less turns.
 
 ## Validation strategy: CI vs live canary
 
@@ -163,27 +197,25 @@ an endurance test:
   anchor lifecycle across restarts. Treat those as NOT RUN unless separately
   executed.
 
-## Downstream ownership and correlation
+## Downstream ownership
 
 This repository owns only the provider-boundary attribute and the fake-ACP
-contract tests. It does not change or deploy Hermes Core, Hermes GitHub Kanban
-(HGK), installed PAR files, user profiles, databases, or running services.
+contract tests. It does not change or deploy Hermes Core, installed PAR
+files, user profiles, databases, or running services.
 
-- Hermes Core owns extraction and persistence of the response-level metadata.
-  It must preserve provider/model identity and an explicit unavailable status
-  rather than normalize missing request usage to numeric zero.
-- HGK owns reporting. It should consume the explicit status, exclude
-  `unavailable` from numeric token totals, and render it as unavailable.
-  Context occupancy may be displayed separately and must not enter billing
-  totals.
+- Hermes Core owns extraction and persistence of the response-level
+  metadata. It must preserve provider/model identity and an explicit
+  unavailable status rather than normalize missing request usage to numeric
+  zero, and it owns how its own usage recording, session rows, and reporting
+  surfaces interpret a provider that reports no billing usage.
 - The adapter supplies provider/model plus opaque ACP session/turn
-  correlations. Core/HGK own profile, board, task, run, and worker-session
-  attribution from the scheduler/worker execution context; those IDs are not
+  correlations. Downstream attribution (profiles, tasks, runs, worker
+  sessions) comes from the caller's execution context; those IDs are not
   inferable from ACP's prompt protocol and must not be fabricated here.
 
-`tests/fixtures/acp-usage-hgk-boundary.json` documents the observed Core/HGK
-seam (synthetic hashes; not an execution test of Core or HGK). Their owners
-must add executable persistence/reporting regressions in their own repos.
+Downstream consumers that need persistence or reporting regressions for the
+"provider reports no billing usage" case must add executable tests in their
+own repositories; this repository pins only the provider-side boundary.
 
 ## Credential-free quick run
 

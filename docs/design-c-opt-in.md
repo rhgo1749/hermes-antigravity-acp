@@ -42,14 +42,14 @@ Runtime launcher resolution checks environment overrides in strict precedence or
 | `HERMES_ANTIGRAVITY_ACP_MCP_THINKING_LEVEL` | Thinking level override | One of `low`, `medium`, `high`, `xhigh`; overrides Hermes `reasoning_effort` |
 | `HERMES_ANTIGRAVITY_ACP_MCP_DISCOVERY_TTL_SECONDS` | Live model-discovery cache TTL | Bounds the `session/new` model-surface probe cache |
 
-## Shared Turn-Usage Contract Module
+## Shared Usage-Observation Contract Module
 
-`hermes-plugin/antigravity-acp/parked/usage_contract.py` lives under `parked/` for a bootstrap reason only (the design_c test lane loads this subpackage standalone as `antigravity_acp_mcp` and must not import from the parent package), but it is **shared contract, not parked-private policy**: it is the single owner of the turn-usage validity rules (tolerance constants, context-window ceiling check, first-turn absolute gate, growth-consistency gate, token estimator) that BOTH engines enforce — Parked-MCP via `parked/conversation.py` and Replay via the parent `client.py`, which imports it as `.parked.usage_contract`.
+`hermes-plugin/antigravity-acp/parked/usage_contract.py` lives under `parked/` for a bootstrap reason only (the design_c test lane loads this subpackage standalone as `antigravity_acp_mcp` and must not import from the parent package), but it is **shared contract, not parked-private policy**: since issue #102 it is the single owner of the ACP usage-observation validity rules (`usage_update` frame validation, nonnegative-number parsing, token estimator) used by BOTH engines — Parked-MCP via `parked/conversation.py` and Replay via the parent `client.py`, which imports it as `.parked.usage_contract`. The magnitude gates that used to live here (growth factor, first-turn plausibility, context-window ceiling) were retired with #102: `completion.usage` is pinned to `None` in both engines, so no server-reported consumption sum can reach Core's occupancy anchor and no threshold policy has anything left to police.
 
 Maintenance consequences:
 
-- When syncing `parked/` with upstream Parked-MCP sources (the `hermes-plugin/antigravity-acp-mcp` lineage, issues #81/#82/#83), `usage_contract.py` and both engines' imports of it must be **preserved**; dropping or forking it re-creates the drift class of issue #87 (the Replay engine shipped without the first-turn gate because the contract lived only in the parked engine).
-- Neither engine may redefine these constants or reimplement these decisions locally; `tests/test_usage_contract_single_owner.py` fails the build when one does.
+- When syncing `parked/` with upstream Parked-MCP sources (the `hermes-plugin/antigravity-acp-mcp` lineage, issues #81/#82/#83), `usage_contract.py` and both engines' imports of it must be **preserved**; dropping or forking it re-creates the drift class of issue #87 (the two engines shipped divergent usage policy because the contract lived in only one engine).
+- Neither engine may redefine these rules or reimplement these decisions locally; `tests/test_usage_contract_single_owner.py` fails the build when one does, and pins the retired gate names so a magnitude gate cannot be silently re-admitted.
 
 ## Security and Isolation Boundaries
 

@@ -127,33 +127,6 @@ def _nonnegative_int(value: Any) -> TypeGuard[int]:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
-def _consumption_from_prompt_result(result: dict[str, Any]) -> dict[str, int] | None:
-    """The server's own per-turn breakdown from the ``session/prompt`` result; None when absent/invalid.
-
-    Old-engine field contract (``_turn_usage_from_prompt_result``): ``inputTokens``, ``outputTokens`` and
-    ``totalTokens`` are REQUIRED nonnegative ints — a report missing any of them is rejected whole, never
-    patched with invented zeros or a locally summed total. ``thoughtTokens`` adds into output;
-    ``totalTokens`` is forwarded exactly as reported; ``cachedReadTokens`` stays separate.
-    """
-    usage = result.get("usage")
-    if not isinstance(usage, dict):
-        return None
-    required = ("inputTokens", "outputTokens", "totalTokens")
-    optional = ("thoughtTokens", "cachedReadTokens")
-    for name in required:
-        if not _nonnegative_int(usage.get(name)):
-            return None
-    for name in optional:
-        if usage.get(name) is not None and not _nonnegative_int(usage[name]):
-            return None
-    out = {"input_tokens": usage["inputTokens"],
-           "output_tokens": usage["outputTokens"] + (usage.get("thoughtTokens") or 0),
-           "total_tokens": usage["totalTokens"]}
-    if usage.get("cachedReadTokens") is not None:
-        out["cached_read_tokens"] = usage["cachedReadTokens"]
-    return out
-
-
 class ProviderError(RuntimeError):
     """Typed failure surfaced to Hermes; text never carries child stderr bytes."""
 

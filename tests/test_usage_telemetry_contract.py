@@ -6,10 +6,7 @@ Deterministic unit + fixture-contract coverage for the provider-side
 - the bridge copies the attribute unchanged onto StreamChunks (stream parity
   without widening generic OpenAI usage fields),
 - usage_update occupancy remains latest-valid per turn while all valid used
-  deltas accumulate only for an explicit Hermes session,
-- the downstream Core/HGK boundary fixture documents the sessions-default
-  zero/unknown projection and keeps the worker_session_id-missing class
-  separate, without executing Hermes Core or HGK code.
+  deltas accumulate only for an explicit Hermes session.
 
 Fake subprocess / pure units only: no credentials, no Google binary.
 """
@@ -26,7 +23,6 @@ from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 PLUGIN_DIR = ROOT / "hermes-plugin" / "antigravity-acp"
-FIXTURE_PATH = ROOT / "tests" / "fixtures" / "acp-usage-hgk-boundary.json"
 
 
 def _load_client_module(monkeypatch, tmp_path: Path):
@@ -624,46 +620,3 @@ def test_context_occupancy_requires_active_turn_and_valid_numbers(monkeypatch, t
         client._capture_context_occupancy(update, stats)
     assert "context_occupancy" not in stats
 
-
-def test_downstream_boundary_fixture_documents_known_zero_projection() -> None:
-    """Reproducible boundary shape for the Core/HGK owners (historical reference).
-
-    Hermes Core exits its usage recording before any per-model row exists when
-    ``usage is None``; the sessions row then carries schema defaults (0 tokens,
-    NULL billing provider). HGK's local_usage fallback treats those defaults as
-    known usage and renders ``unknown/<model>: 0``. This fixture pins the exact
-    boundary JSON that both owners must regress in their own repositories; it
-    does not execute Core or HGK and does not modify either.
-    """
-    fixture = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
-    provider = fixture["provider_response"]
-    assert provider["usage"] is None
-    telemetry = provider["antigravity_usage_telemetry"]
-    assert telemetry["schema_id"] == "antigravity-acp-usage-v1"
-    assert telemetry["status"] == "unavailable"
-    assert telemetry["context_occupancy"] is None
-
-    core = fixture["hermes_core_state"]
-    assert core["session_model_usage_rows"] == []
-    assert core["sessions_row_defaults"] == {
-        "input_tokens": 0, "output_tokens": 0, "billing_provider": None,
-    }
-
-    # HGK fallback projection: with no per-model rows, sessions defaults are
-    # accepted as known usage -> zero-token unknown provider display.
-    projection = fixture["hgk_local_usage_projection"]
-    defaults = core["sessions_row_defaults"]
-    provider_label = defaults["billing_provider"] or "unknown"
-    assert projection == {
-        "model_key": f"{provider_label}/{telemetry['model']}",
-        "input_tokens": defaults["input_tokens"],
-        "output_tokens": defaults["output_tokens"],
-        "total_tokens": defaults["input_tokens"] + defaults["output_tokens"],
-    }
-
-    # The worker_session_id-missing run-attribution class stays separate from
-    # ACP usage absence and must never be folded into usage reporting.
-    attribution = fixture["run_attribution_diagnostic"]
-    assert attribution["class"] == "worker_session_id_missing"
-    assert attribution["observed_runs"] == 173
-    assert attribution["independent_of_acp_usage_unavailability"] is True

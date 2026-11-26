@@ -776,33 +776,248 @@ def test_credential_free_namespace_snapshot_covers_installed_core() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Issue #102: Core occupancy-anchor boundary (S1-S4 regressions, C1/C2 controls)
+# Issue #102: Core occupancy-anchor boundary — FULL DATA PATH
 # ---------------------------------------------------------------------------
 #
-# These run against the UNMODIFIED Hermes runtime (this lane's whole point) and
-# judge the boundary the plugin feeds: ``agent._usage_anchor`` ->
-# ``anchored_context_tokens`` -> ``_preflight_request_tokens`` — the occupancy
-# figure Core's preflight-compaction gate consumes.  They deliberately assert
-# the numbers Core's gate sees, not Core's internal threshold comparison.
+# Full-path regressions for the production incident class.  Every test here
+# drives the same chain production drove:
+#
+#     ACP server (fake) -> shipped plugin engine (Replay / Parked-MCP)
+#       -> completion -> Core record_response_usage -> normalize_usage
+#       -> capture/set_usage_anchor -> _preflight_request_tokens
+#       -> ContextCompressor.should_compress
+#
+# Fixtures are the measured final-turn ``session/prompt`` usage reports of
+# the four contaminated production sessions (issue #102 incident table),
+# paired with synthetic transcripts of the published durable-transcript
+# sizes.  The RED test replays the PRE-#102 engine completion shape through
+# Core's real recording path; the GREEN tests drive the SHIPPED engines
+# end to end.  No test injects numbers into Core internals directly.
 
-# Production S4 (session 20261126_204625): the server's prompt-result usage
-# reported inputTokens=0, cachedReadTokens=861,529, output+thoughts=17,306
-# against a ~57K-character durable transcript.  Hermes normalize_usage folds
-# cache reads into prompt_tokens, so the pre-#102 plugin handed Core a
-# prompt_tokens=861,529 report and Core anchored 878,896 -> premature compaction.
-_S4_PROMPT_TOKENS = 861_529
-_S4_COMPLETION_TOKENS = 17_306
+# name: (inputTokens, outputTokens, thoughtTokens, cachedReadTokens,
+#        transcript messages, transcript chars)
+_INCIDENTS = {
+    "S1": (5_373, 20_178, 0, 1_148_804, 143, 380_000),
+    "S2": (5_656, 47_331, 0, 6_028_410, 324, 560_000),
+    "S3": (2_087, 31_559, 0, 2_332_129, 385, 1_020_000),
+    "S4": (0, 306, 17_000, 861_529, 89, 227_000),
+}
+
+_FAKE_AGY = Path(__file__).resolve().parent / "design_c" / "fake_agy.py"
+
+_INCIDENT_ACP_SERVER = r"""import json
+import sys
 
 
-def _s4_transcript() -> list[dict]:
-    """A durable transcript of the S4 session's shape: ~57K characters of
-    ordinary multi-turn content (well under 100K tokens by any estimator)."""
-    messages: list[dict] = []
-    chunk = "s4 session transcript body with routine engineering discussion. " * 4  # ~300 chars
-    for turn in range(48):
-        messages.append({"role": "user", "content": f"question {turn}: {chunk}"})
-        messages.append({"role": "assistant", "content": f"answer {turn}: {chunk}"})
-    return messages
+def emit(payload):
+    sys.stdout.write(json.dumps(payload) + "\n")
+    sys.stdout.flush()
+
+
+USAGE = json.loads(sys.argv[1])
+
+
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    params = message.get("params") or {}
+    request_id = message.get("id")
+    if method == "initialize":
+        emit({"jsonrpc": "2.0", "id": request_id, "result": {
+            "protocolVersion": 1,
+            "agentInfo": {"name": "antigravity-acp", "title": "Google Antigravity",
+                          "version": "1.5.2"},
+        }})
+    elif method in ("session/new", "session/resume"):
+        emit({"jsonrpc": "2.0", "id": request_id, "result": {
+            "sessionId": params.get("sessionId") or "incident-native",
+            "configOptions": [{"id": "model", "category": "model",
+                               "currentValue": "model-a",
+                               "options": [{"value": "model-a"}]}],
+        }})
+    elif method in ("session/set_config_option", "session/set_model"):
+        emit({"jsonrpc": "2.0", "id": request_id, "result": {}})
+    elif method == "session/prompt":
+        emit({"jsonrpc": "2.0", "id": request_id, "result": {
+            "stopReason": "end_turn", "usage": USAGE,
+        }})
+"""
+
+
+def _incident_wire(name: str) -> dict:
+    inp, out, thought, cached, _, _ = _INCIDENTS[name]
+    wire = {"inputTokens": inp, "outputTokens": out,
+            "totalTokens": inp + out + thought + cached,
+            "cachedReadTokens": cached}
+    if thought:
+        wire["thoughtTokens"] = thought
+    return wire
+
+
+def _incident_transcript(name: str) -> list:
+    _, _, _, _, n_msgs, n_chars = _INCIDENTS[name]
+    per = max(1, n_chars // n_msgs)
+    filler = "routine multi-turn engineering transcript body. "
+    body = (filler * (per // len(filler) + 1))[:per]
+    return [
+        {"role": "user" if i % 2 == 0 else "assistant",
+         "content": f"turn {i}: {body}"}
+        for i in range(n_msgs)
+    ]
+
+
+def _core_agent():
+    """Minimal agent surface accepted by ``record_response_usage`` across
+    every supported Core era (v0.21.6 floor, stable baseline, main), with a
+    fresh compression gate at the S4 production configuration (window
+    1,048,576 @ 0.7 -> threshold 734,003; ``config_context_length`` keeps
+    resolution credential-free)."""
+    from types import SimpleNamespace
+    return SimpleNamespace(
+        _usage_anchor=None, _turn_base_usage_anchor=None, tools=None,
+        api_mode="chat_completions", provider="antigravity-acp",
+        model="fake-model-a", base_url="",
+        context_compressor=ContextCompressor(
+            model="fake-model-a", threshold_percent=0.7,
+            config_context_length=1_048_576, quiet_mode=True),
+        session_api_calls=0, quiet_mode=True, log_prefix="",
+        verbose_logging=False, platform="cli",
+        _vprint=lambda *a, **k: None, _safe_print=lambda *a, **k: None,
+        _ensure_db_session=lambda: None,
+        _session_db=None, session_id=None, _persist_disabled=True,
+        _session_db_created=False, _turn_route_task="", client=None,
+        session_prompt_tokens=0, session_completion_tokens=0,
+        session_total_tokens=0, session_input_tokens=0,
+        session_output_tokens=0, session_cache_read_tokens=0,
+        session_cache_write_tokens=0, session_reasoning_tokens=0,
+        session_estimated_cost_usd=0.0, session_cost_status=None,
+        session_cost_source=None,
+    )
+
+
+def _record(agent, completion, messages):
+    """Core's REAL response-usage recording path (the agent loop's own
+    fold function): normalize_usage -> anchor capture -> session totals."""
+    from agent.turn_usage import record_response_usage
+    return record_response_usage(
+        agent, completion, messages=messages, api_call_count=1,
+        api_duration=0.1, compression_attempts=0, max_compression_attempts=3)
+
+
+def _legacy_completion(wire: dict):
+    """The PRE-#102 engine completion shape: the prompt-result consumption
+    sum copied into ``usage`` verbatim (witnessed on the pre-fix tree with
+    the S4 payload: prompt_tokens=0, cached=861,529, total=878,835)."""
+    from types import SimpleNamespace
+    return SimpleNamespace(
+        id="chatcmpl-legacy", provider=None,
+        usage=SimpleNamespace(
+            prompt_tokens=wire["inputTokens"],
+            completion_tokens=wire["outputTokens"] + wire.get("thoughtTokens", 0),
+            total_tokens=wire["totalTokens"],
+            prompt_tokens_details=SimpleNamespace(
+                cached_tokens=wire["cachedReadTokens"])))
+
+
+def _replay_completion(incident: str, monkeypatch, tmp_path):
+    """Drive the SHIPPED Replay engine against a server reporting the
+    incident's prompt-result usage; return its completion."""
+    script = tmp_path / f"fake_{incident}_prompt_usage_acp.py"
+    script.write_text(_INCIDENT_ACP_SERVER, encoding="utf-8")
+    client_module = _load_client(monkeypatch, tmp_path)
+    client = client_module.AntigravityACPClient(
+        command=sys.executable,
+        args=[str(script), json.dumps(_incident_wire(incident))],
+        acp_cwd=str(tmp_path), rate_limit_retries=0,
+    )
+    return client.chat.completions.create(
+        model="model-a",
+        messages=[{"role": "user", "content": f"{incident} probe"}],
+        timeout=10,
+    )
+
+
+def _parked_completion(incident: str, monkeypatch, tmp_path):
+    """Drive the SHIPPED Parked-MCP engine (the deployed default) against
+    the design_c fake ACP server reporting the incident's prompt-result
+    usage; return its completion."""
+    client_module = _load_client(monkeypatch, tmp_path)
+    parked = importlib.import_module(client_module.__package__ + ".parked.client")
+    behaviour = json.dumps({"script": [[
+        {"text": "ok"},
+        {"result_usage": _incident_wire(incident)},
+    ]]})
+    client = parked.AntigravityAcpMcpClient(
+        acp_command=sys.executable, acp_args=[str(_FAKE_AGY), behaviour])
+    return client.chat.completions.create(
+        model="model-a",
+        messages=[{"role": "user", "content": f"{incident} probe"}],
+        timeout=30,
+    )
+
+
+@pytest.mark.parametrize("incident", sorted(_INCIDENTS))
+def test_incident_usage_through_real_recording_path_poisons_gate(incident):
+    """RED (full path): the pre-#102 completion shape, fed through Core's
+    REAL record_response_usage, forms an occupancy anchor from the
+    consumption sum and fires Core's own compression gate against the true
+    transcript — the production premature-compaction mechanism, reproduced
+    through the recording path rather than by injecting numbers."""
+    wire = _incident_wire(incident)
+    messages = _incident_transcript(incident)
+    agent = _core_agent()
+    rough = estimate_request_tokens_rough(messages, system_prompt="")
+    _record(agent, _legacy_completion(wire), messages)
+    assert agent._usage_anchor is not None
+    assert agent._usage_anchor["prompt_tokens"] >= wire["cachedReadTokens"]
+    preflight = _preflight_request_tokens(agent, messages, "")
+    assert preflight > 5 * rough  # anchored figure is real usage + delta, never deferred
+    assert agent.context_compressor.should_compress(preflight)  # premature fire
+    assert not agent.context_compressor.should_compress(rough)  # truth: never fires
+
+
+@pytest.mark.parametrize("incident", sorted(_INCIDENTS))
+@pytest.mark.parametrize("engine", ["replay", "parked"])
+def test_shipped_engines_never_poison_core_recording(incident, engine, monkeypatch, tmp_path):
+    """GREEN (full path): both shipped engines, fed the exact incident
+    reports, produce completions that Core's REAL record_response_usage
+    treats as usage-less: no anchor is formed, preflight falls back to the
+    transcript estimate, and the compression gate never fires early."""
+    completion = (_replay_completion if engine == "replay" else _parked_completion)(
+        incident, monkeypatch, tmp_path)
+    messages = _incident_transcript(incident)
+    agent = _core_agent()
+    _record(agent, completion, messages)
+    assert agent._usage_anchor is None
+    rough = estimate_request_tokens_rough(messages, system_prompt="")
+    preflight = _preflight_request_tokens(agent, messages, "")
+    assert preflight <= rough * 1.05  # the local estimate governs
+    assert not agent.context_compressor.should_compress(preflight)
+
+
+def test_tainted_anchor_persists_through_real_usage_less_recording(monkeypatch, tmp_path):
+    """Lifecycle (full path, documented operational consequence): an anchor
+    formed from a pre-#102 completion is NOT cleared by later usage-less
+    recordings — Core's real record_response_usage usage-less path never
+    touches it, so the gate keeps firing early until restart or re-anchor.
+    This is the basis for the restart-on-deploy requirement; no silent DB
+    rewrite is performed anywhere."""
+    wire = _incident_wire("S4")
+    messages = _incident_transcript("S4")
+    agent = _core_agent()
+    _record(agent, _legacy_completion(wire), messages)
+    tainted = agent._usage_anchor
+    assert tainted is not None
+    # Post-#102 steady state: the SHIPPED Replay engine's usage-less completion.
+    _record(agent, _replay_completion("S4", monkeypatch, tmp_path), messages)
+    assert agent._usage_anchor is tainted  # same object: never replaced
+    preflight = _preflight_request_tokens(agent, messages, "")
+    assert preflight >= wire["cachedReadTokens"]
+    assert agent.context_compressor.should_compress(preflight)  # still fires early
+    # Appending turns keeps the anchor matching (prefix fingerprint stable),
+    # so the inflation is not self-healing within the session.
+    grown = messages + [{"role": "user", "content": "one more routine question"}]
+    assert anchored_context_tokens(grown, tainted) is not None
 
 
 def _preflight_agent(anchor):
@@ -824,96 +1039,6 @@ def _core_compressor() -> ContextCompressor:
         config_context_length=1_048_576,
         quiet_mode=True,
     )
-
-
-def test_s4_consumption_report_at_core_boundary_inflates_preflight():
-    """RED witness (S4): IF a consumption sum reaches Core's anchor capture —
-    the pre-#102 plugin behavior — Core trusts it absolutely and the
-    preflight occupancy inflates ~15x over the transcript, the exact premature-
-    compaction trigger observed in production.  This is the damage site the
-    plugin-side suppression exists to protect."""
-    messages = _s4_transcript()
-    rough = estimate_request_tokens_rough(messages, system_prompt="")
-    assert rough < 100_000  # the real occupancy of the S4 session
-    anchor = capture_usage_anchor(_S4_PROMPT_TOKENS, _S4_COMPLETION_TOKENS, messages)
-    assert anchor is not None
-    preflight = _preflight_request_tokens(_preflight_agent(anchor), messages, "")
-    assert preflight >= _S4_PROMPT_TOKENS  # anchored figure is never deferred
-    assert preflight > 5 * rough  # inflated occupancy drives premature compaction
-    # Core's OWN compression gate fires on the contaminated figure and would
-    # never fire on the true occupancy: premature compaction, by construction.
-    compressor = _core_compressor()
-    assert compressor.should_compress(preflight)
-    assert not compressor.should_compress(rough)
-
-
-def test_plugin_completion_cannot_seed_core_anchor(monkeypatch, tmp_path):
-    """GREEN (S1-S4, Replay engine through the real plugin client): a server
-    reporting the exact S4 breakdown yields a completion that FAILS Core's
-    usage-ingestion gate (``hasattr(response, 'usage') and response.usage``),
-    so record_response_usage takes its usage-less path, capture_usage_anchor
-    is never reached, and the preflight occupancy is the transcript estimate."""
-    script = tmp_path / "fake_s4_prompt_usage_acp.py"
-    script.write_text(
-        r"""import json
-import sys
-
-
-def emit(payload):
-    sys.stdout.write(json.dumps(payload) + "\n")
-    sys.stdout.flush()
-
-
-for line in sys.stdin:
-    message = json.loads(line)
-    method = message.get("method")
-    params = message.get("params") or {}
-    request_id = message.get("id")
-    if method == "initialize":
-        emit({"jsonrpc": "2.0", "id": request_id, "result": {
-            "protocolVersion": 1,
-            "agentInfo": {"name": "antigravity-acp", "title": "Google Antigravity",
-                          "version": "1.5.2"},
-        }})
-    elif method in ("session/new", "session/resume"):
-        emit({"jsonrpc": "2.0", "id": request_id, "result": {
-            "sessionId": params.get("sessionId") or "s4-native",
-            "configOptions": [{"id": "model", "category": "model",
-                               "currentValue": "model-a",
-                               "options": [{"value": "model-a"}]}],
-        }})
-    elif method in ("session/set_config_option", "session/set_model"):
-        emit({"jsonrpc": "2.0", "id": request_id, "result": {}})
-    elif method == "session/prompt":
-        emit({"jsonrpc": "2.0", "id": request_id, "result": {
-            "stopReason": "end_turn",
-            "usage": {"inputTokens": 0, "outputTokens": 306, "thoughtTokens": 17_000,
-                      "totalTokens": 878_835, "cachedReadTokens": 861_529},
-        }})
-""",
-        encoding="utf-8",
-    )
-    client_module = _load_client(monkeypatch, tmp_path)
-    client = client_module.AntigravityACPClient(
-        command=sys.executable, args=[str(script)], acp_cwd=str(tmp_path),
-        rate_limit_retries=0,
-    )
-    messages = _s4_transcript()
-    response = client.chat.completions.create(
-        model="model-a",
-        messages=[{"role": "user", "content": "s4 probe"}],
-        timeout=10,
-    )
-    # Core's ingestion gate (agent/turn_usage.py record_response_usage):
-    # falsy here => usage-less path, no capture_usage_anchor, anchor untouched.
-    assert not (hasattr(response, "usage") and response.usage)
-    agent = _preflight_agent(None)
-    rough = estimate_request_tokens_rough(messages, system_prompt="")
-    preflight = _preflight_request_tokens(agent, messages, "")
-    assert preflight <= rough * 1.5  # estimate governs; no 861K anchor exists
-    assert preflight < 100_000
-    # The premature-compaction condition is gone at Core's own gate.
-    assert not _core_compressor().should_compress(preflight)
 
 
 def test_needed_compaction_still_fires_without_anchor_c1():
@@ -946,28 +1071,3 @@ def test_needed_compaction_still_fires_with_valid_anchor_c2():
     preflight = _preflight_request_tokens(_preflight_agent(anchor), big, "")
     assert preflight >= rough
     assert _core_compressor().should_compress(preflight)
-
-
-def test_existing_tainted_anchor_survives_usage_less_turns():
-    """Lifecycle (documented operational consequence, per issue #102):
-    completion.usage=None only prevents NEW anchors.  An in-memory anchor
-    captured before the fix is NOT cleared by usage-less responses — Core's
-    usage-less path never touches it.  Already-tainted live sessions need a
-    process restart (or natural re-anchor); no silent DB rewrite is performed.
-    This test pins that contract so ops docs and reality cannot drift."""
-    messages = _s4_transcript()
-    tainted = capture_usage_anchor(_S4_PROMPT_TOKENS, _S4_COMPLETION_TOKENS, messages)
-    assert tainted is not None
-    # Simulate one usage-less turn (the post-#102 steady state): Core's
-    # record_response_usage returns before any anchor call, so the anchor
-    # object is simply never replaced.
-    agent = _preflight_agent(tainted)
-    preflight = _preflight_request_tokens(agent, messages, "")
-    assert preflight >= _S4_PROMPT_TOKENS  # stale inflation persists
-    # The stale anchor keeps Core's gate firing early until restart/re-anchor:
-    # this is why deployment requires a gateway restart for live sessions.
-    assert _core_compressor().should_compress(preflight)
-    # Appending turns keeps the anchor matching (prefix fingerprint stable),
-    # so the inflation is not self-healing within the session.
-    grown = messages + [{"role": "user", "content": "one more routine question"}]
-    assert anchored_context_tokens(grown, tainted) is not None
