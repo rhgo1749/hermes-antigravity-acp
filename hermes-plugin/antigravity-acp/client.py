@@ -82,7 +82,9 @@ from .bridge import (
 from .parked.usage_contract import (
     estimate_tokens,
     first_turn_report_plausible,
+    report_within_context_limit,
     reported_usage_growth_consistent,
+    valid_context_limit,
 )
 
 
@@ -2260,6 +2262,35 @@ _TURN_USAGE_BASELINE_LOCK = threading.Lock()
 # The gate DECISIONS themselves are shared with the Parked-MCP engine in
 # ``parked/usage_contract.py`` — this engine keeps only the state plumbing.
 _TURN_USAGE_BASELINES: dict[str, tuple[int, int]] = {}
+# affinity_key -> (effective_model, confirmed context-window limit).
+_CONVERSATION_CONTEXT_LIMITS: dict[str, tuple[str, int]] = {}
+
+
+def _resolve_conversation_context_limit(
+    *,
+    affinity_key: str,
+    effective_model: str,
+    observed_size: Any = None,
+) -> int | None:
+    """Track the confirmed active-model context window per conversation.
+
+    Persists across turns that omit ``usage_update`` and clears immediately
+    when ``effective_model`` changes so a prior model's limit never caps a
+    newly selected model.
+    """
+    model_key = str(effective_model or "").strip()
+    observed = valid_context_limit(observed_size)
+    with _TURN_USAGE_BASELINE_LOCK:
+        cached = _CONVERSATION_CONTEXT_LIMITS.get(affinity_key)
+        if observed is not None:
+            _CONVERSATION_CONTEXT_LIMITS[affinity_key] = (model_key, observed)
+            return observed
+        if cached is not None:
+            cached_model, cached_limit = cached
+            if cached_model == model_key:
+                return cached_limit
+            _CONVERSATION_CONTEXT_LIMITS.pop(affinity_key, None)
+        return None
 
 
 def _guard_reported_turn_usage(
@@ -2268,8 +2299,9 @@ def _guard_reported_turn_usage(
     server_identity: str,
     turn_usage: Any,
     native_tokens: int,
+    context_limit: Any = None,
 ) -> Any:
-    """Reject server-reported turn usage that diverges from local growth.
+    """Reject server-reported turn usage that exceeds context window or diverges from local growth.
 
     Always-on safety gate for the Core compression trigger: it protects every
     server identity (verified or not) regardless of version.  A rejected turn
@@ -2280,6 +2312,19 @@ def _guard_reported_turn_usage(
     """
     reported = int(getattr(turn_usage, "prompt_tokens", 0) or 0)
     identity = str(server_identity or "")
+    if not report_within_context_limit(reported=reported, context_limit=context_limit):
+        if identity:
+            conversation_registry.record_semantics_evidence(identity, ok=False)
+        conversation_registry.note_usage_frame("dropped_inflated_turn_usage")
+        limit = valid_context_limit(context_limit)
+        logger.warning(
+            "Antigravity ACP reported inputTokens %d rejected: exceeds active model context window %s "
+            "(identity=%s); Core falls back to its own token estimate for compression this turn.",
+            reported,
+            limit if limit is not None else context_limit,
+            identity or "unknown",
+        )
+        return None
     # One critical section per turn: baseline lookup, gate decision, and
     # re-seed are atomic, so two same-affinity requests can never both pass
     # their own gate and clobber each other's baseline (a split lookup/seed
@@ -4854,6 +4899,16 @@ class AntigravityACPClient:
                 # own token estimate instead of compacting against an
                 # inflated number (2026-11-23 incident: 31K transcript
                 # reported as 1.07M, two premature compactions).
+                context_occupancy = session_result.get("context_occupancy")
+                resolved_context_limit = _resolve_conversation_context_limit(
+                    affinity_key=affinity_key,
+                    effective_model=str(session_result.get("effective_model") or model or ""),
+                    observed_size=(
+                        context_occupancy.get("size")
+                        if isinstance(context_occupancy, dict)
+                        else None
+                    ),
+                )
                 reported_turn_usage = session_result.get("turn_usage")
                 if reported_turn_usage is not None:
                     session_result["turn_usage"] = _guard_reported_turn_usage(
@@ -4863,6 +4918,7 @@ class AntigravityACPClient:
                         ),
                         turn_usage=reported_turn_usage,
                         native_tokens=native_tokens,
+                        context_limit=resolved_context_limit,
                     )
     
             native_reasoning_details = _native_tool_reasoning_details(native_activity)

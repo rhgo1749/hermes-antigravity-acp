@@ -111,6 +111,11 @@ def new_session(
 
     conn.attach_session(session.session_id, on_update, gate.decide)
     if model or thinking:
+        while True:
+            try:
+                session.updates.get_nowait()
+            except queue.Empty:
+                break
         select_model(conn, session.session_id, result, model or "", thinking)
     return session
 

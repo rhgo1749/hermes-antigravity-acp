@@ -44,7 +44,7 @@ Runtime launcher resolution checks environment overrides in strict precedence or
 
 ## Shared Turn-Usage Contract Module
 
-`hermes-plugin/antigravity-acp/parked/usage_contract.py` lives under `parked/` for a bootstrap reason only (the design_c test lane loads this subpackage standalone as `antigravity_acp_mcp` and must not import from the parent package), but it is **shared contract, not parked-private policy**: it is the single owner of the turn-usage validity rules (tolerance constants, first-turn absolute gate, growth-consistency gate, token estimator) that BOTH engines enforce — Parked-MCP via `parked/conversation.py` and Replay via the parent `client.py`, which imports it as `.parked.usage_contract`.
+`hermes-plugin/antigravity-acp/parked/usage_contract.py` lives under `parked/` for a bootstrap reason only (the design_c test lane loads this subpackage standalone as `antigravity_acp_mcp` and must not import from the parent package), but it is **shared contract, not parked-private policy**: it is the single owner of the turn-usage validity rules (tolerance constants, context-window ceiling check, first-turn absolute gate, growth-consistency gate, token estimator) that BOTH engines enforce — Parked-MCP via `parked/conversation.py` and Replay via the parent `client.py`, which imports it as `.parked.usage_contract`.
 
 Maintenance consequences:
 

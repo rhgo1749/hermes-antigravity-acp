@@ -37,8 +37,10 @@ from typing import Any, TypeGuard
 from .acp_connection import AcpConnection, AcpError
 from .usage_contract import (
     first_turn_report_plausible,
+    report_within_context_limit,
     reported_usage_growth_consistent,
     transcript_tokens,
+    valid_context_limit,
 )
 from .matcher import (
     TurnView,
@@ -694,6 +696,8 @@ class Conversation:
         self.occupancy: dict[str, int] | None = None  # usage_update used/size: occupancy reading, never billing
         self.frame_usage: dict[str, int] | None = None  # usage_update token fields: telemetry only
         self._usage_baseline: tuple[int, int] | None = None  # (accepted reported input, local estimate)
+        self._context_limit: int | None = None  # confirmed context window for the active model
+        self._context_limit_model: str = ""
         self.images = _Images()  # image numbering of the current ACP session
         self._seen_sys_msgs: set[str] = set()  # sha256 of large <system-message> blocks already sent in this session
         self.fence = fence or "TOOL-OUTPUT-" + secrets.token_hex(4)  # unguessable to tool output, stable across replays
@@ -749,6 +753,11 @@ class Conversation:
             logger.info("acp-mcp turn: %s%s", decision.kind, f" ({why})" if why else "")
             if decision.kind == "guest":
                 return {"guest": True}
+            if decision.kind != "resume_held":
+                active_model = str(model or "").strip()
+                if active_model != self._context_limit_model:
+                    self._context_limit = None
+                    self._context_limit_model = active_model
             self.owner_token = token
             if decision.kind == "resume_held":
                 gen = self.gen
@@ -925,6 +934,16 @@ class Conversation:
         self.text, self.reasoning, self.usage = [], [], None
         self.occupancy, self.frame_usage = None, None
         self.last_activity = time.monotonic()
+        leftover: list[dict[str, Any]] = []
+        while True:
+            try:
+                stale = session.updates.get_nowait()
+            except queue.Empty:
+                break
+            if stale.get("sessionUpdate") != "usage_update":
+                leftover.append(stale)
+        for item in leftover:
+            session.updates.put(item)
 
         def worker() -> None:
             try:
@@ -1013,6 +1032,11 @@ class Conversation:
                         occ[key] = int(val)
                 if occ:
                     self.occupancy = occ
+                limit = valid_context_limit(u.get("size"))
+                if limit is not None:
+                    with self.lock:
+                        if self.gen == gen:
+                            self._context_limit = limit
                 fu: dict[str, int] = dict(self.frame_usage or {})
                 for src_k, dst_k in (("inputTokens", "input_tokens"), ("outputTokens", "output_tokens"),
                                      ("input_tokens", "input_tokens"), ("output_tokens", "output_tokens")):
@@ -1038,8 +1062,10 @@ class Conversation:
         return obs
 
     def _gate_turn_consumption(self, result: dict[str, Any],
-                               messages: list[dict[str, Any]]) -> dict[str, int] | None:
-        """Consumption for this turn: the prompt-result breakdown, gated on growth consistency.
+                               messages: list[dict[str, Any]],
+                               *,
+                               context_limit: Any = None) -> dict[str, int] | None:
+        """Consumption for this turn: the prompt-result breakdown, gated on window cap & growth consistency.
 
         A rejected report yields ``None`` so Hermes falls back to its own token estimate instead of
         compacting against a number this adapter cannot vouch for; the last trusted baseline is kept,
@@ -1049,6 +1075,16 @@ class Conversation:
         if consumption is None:
             return None
         reported = consumption["input_tokens"]
+        effective_limit = getattr(self, "_context_limit", None) if context_limit is None else context_limit
+        if not report_within_context_limit(reported=reported, context_limit=effective_limit):
+            limit = valid_context_limit(effective_limit)
+            logger.warning(
+                "acp-mcp: reported inputTokens %d rejected: exceeds active model context window %s; "
+                "Hermes falls back to its own token estimate this turn",
+                reported,
+                limit if limit is not None else effective_limit,
+            )
+            return None
         local = transcript_tokens(messages)
         baseline = self._usage_baseline
         if baseline is None:

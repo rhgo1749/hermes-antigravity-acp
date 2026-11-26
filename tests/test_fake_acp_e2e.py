@@ -2136,3 +2136,121 @@ def test_provider_through_mux_to_fake_server_owner_routing(monkeypatch, tmp_path
     assert "native session GC disabled" in selection
     assert "session-gc expired" not in selection
     assert "owner-records" in selection
+
+
+
+def test_window_cap_e2e_persists_per_model_and_isolates_model_switches(
+    monkeypatch, tmp_path
+) -> None:
+    """Issue #99 E2E (Replay): usage_update.size enforces the active model's window cap across
+    usage-less turns, ignores pre-selection default frames, and clears on model switches.
+    """
+    script = tmp_path / "fake_window_cap_acp.py"
+    state_file = tmp_path / "fake_window_cap_state.json"
+    script.write_text(
+        f"STATE_FILE = {str(state_file)!r}\n"
+        + r"""import json
+import pathlib
+import sys
+
+def emit(payload):
+    sys.stdout.write(json.dumps(payload) + "\n")
+    sys.stdout.flush()
+
+def update(payload):
+    emit({"jsonrpc": "2.0", "method": "session/update", "params": {"update": payload}})
+
+state_path = pathlib.Path(STATE_FILE)
+if state_path.exists():
+    _st = json.loads(state_path.read_text(encoding="utf-8"))
+else:
+    _st = {"current_model": "fake-model-a", "prompt_count": 0}
+current_model = _st["current_model"]
+prompt_count = _st["prompt_count"]
+
+for line in sys.stdin:
+    msg = json.loads(line)
+    method = msg.get("method")
+    params = msg.get("params") or {}
+    rid = msg.get("id")
+    if method == "initialize":
+        emit({"jsonrpc": "2.0", "id": rid, "result": {
+            "protocolVersion": 1,
+            "agentInfo": {"name": "antigravity-acp", "title": "Fake", "version": "1.5.2"},
+            "agentCapabilities": {"sessionCapabilities": {"resume": {}}},
+        }})
+    elif method in ("session/new", "session/resume"):
+        sid = params.get("sessionId") or f"win-sess-{prompt_count + 1}"
+        # Emit a default-model placeholder before set_model runs: if set_model
+        # switches to fake-model-b, this 10_000 size must NOT bleed into it.
+        update({"sessionUpdate": "usage_update", "used": 0, "size": 10_000})
+        emit({"jsonrpc": "2.0", "id": rid, "result": {
+            "sessionId": sid,
+            "models": {
+                "currentModelId": current_model,
+                "availableModels": [
+                    {"modelId": "fake-model-a", "name": "Fake A"},
+                    {"modelId": "fake-model-b", "name": "Fake B"},
+                ],
+            },
+        }})
+    elif method == "session/set_model":
+        current_model = params.get("modelId") or current_model
+        state_path.write_text(json.dumps({"current_model": current_model, "prompt_count": prompt_count}), encoding="utf-8")
+        emit({"jsonrpc": "2.0", "id": rid, "result": {}})
+    elif method == "session/prompt":
+        prompt_count += 1
+        state_path.write_text(json.dumps({"current_model": current_model, "prompt_count": prompt_count}), encoding="utf-8")
+        update({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": f"reply-{prompt_count}"}})
+        if prompt_count == 1:
+            # Turn 1 (fake-model-a): emits real window 20_000, NO result.usage (issue #99 intermittent unavailability)
+            update({"sessionUpdate": "usage_update", "used": 500, "size": 20_000})
+            emit({"jsonrpc": "2.0", "id": rid, "result": {"stopReason": "end_turn"}})
+        elif prompt_count == 2:
+            # Turn 2 (fake-model-a): NO usage_update frame; proportional inflated result.usage (25_000 > 20_000)
+            emit({"jsonrpc": "2.0", "id": rid, "result": {
+                "stopReason": "end_turn",
+                "usage": {"inputTokens": 25_000, "outputTokens": 10, "totalTokens": 25_010},
+            }})
+        elif prompt_count == 3:
+            # Turn 3 (fake-model-a): plausible report within 20_000
+            emit({"jsonrpc": "2.0", "id": rid, "result": {
+                "stopReason": "end_turn",
+                "usage": {"inputTokens": 8_000, "outputTokens": 10, "totalTokens": 8_010},
+            }})
+        elif prompt_count == 4:
+            # Turn 4 (switched to fake-model-b): NO usage_update after set_model;
+            # must ignore both fake-model-a's cached 20_000 AND session/new's pre-selection 10_000.
+            emit({"jsonrpc": "2.0", "id": rid, "result": {
+                "stopReason": "end_turn",
+                "usage": {"inputTokens": 25_000, "outputTokens": 10, "totalTokens": 25_010},
+            }})
+""",
+        encoding="utf-8",
+    )
+    client = _load_client(
+        monkeypatch,
+        command=sys.executable,
+        args=[str(script)],
+        cwd=str(tmp_path),
+    )
+    client_mod = importlib.import_module("antigravity_acp_fake_e2e.client")
+    client_mod._TURN_USAGE_BASELINES.clear()
+    if hasattr(client_mod, "_CONVERSATION_CONTEXT_LIMITS"):
+        client_mod._CONVERSATION_CONTEXT_LIMITS.clear()
+
+    msgs = [{"role": "user", "content": "hello turn 1"}]
+    r1 = client.chat.completions.create(model="fake-model-a", messages=msgs)
+    assert r1.usage is None
+
+    msgs.extend([{"role": "assistant", "content": r1.choices[0].message.content}, {"role": "user", "content": "turn 2"}])
+    r2 = client.chat.completions.create(model="fake-model-a", messages=msgs)
+    assert r2.usage is None
+
+    msgs.extend([{"role": "assistant", "content": r2.choices[0].message.content}, {"role": "user", "content": "turn 3"}])
+    r3 = client.chat.completions.create(model="fake-model-a", messages=msgs)
+    assert r3.usage is not None and r3.usage.prompt_tokens == 8_000
+
+    msgs.extend([{"role": "assistant", "content": r3.choices[0].message.content}, {"role": "user", "content": "turn 4"}])
+    r4 = client.chat.completions.create(model="fake-model-b", messages=msgs)
+    assert r4.usage is not None and r4.usage.prompt_tokens == 25_000

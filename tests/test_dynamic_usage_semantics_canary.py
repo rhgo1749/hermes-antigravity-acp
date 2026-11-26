@@ -71,6 +71,7 @@ def _load_package(monkeypatch, tmp_path: Path):
     client = importlib.import_module(module_name + ".client")
     conversation_state = importlib.import_module(module_name + ".conversation_state")
     client._TURN_USAGE_BASELINES.clear()
+    client._CONVERSATION_CONTEXT_LIMITS.clear()
     return client, conversation_state
 
 
@@ -450,3 +451,74 @@ def test_guard_without_identity_never_earns_verdicts(monkeypatch, tmp_path) -> N
     payload = _state_payload(tmp_path)
     assert "usage_semantics_verdicts" not in payload
     assert "usage_semantics_verdicts" not in _semantics_payload(tmp_path)
+
+
+def test_guard_rejects_window_overflow_on_later_turn_demotes_canary_and_keeps_baseline(
+    monkeypatch, tmp_path
+) -> None:
+    """Issue #99 replay: proportional later-turn inflation under 8x must fail window cap."""
+    client, conversation_state = _load_package(monkeypatch, tmp_path)
+    registry = conversation_state.ConversationStateRegistry()
+    for _ in range(5):
+        registry.record_semantics_evidence(FAKE_IDENTITY, ok=True)
+    assert registry.semantics_verdict(FAKE_IDENTITY) == "behaviorally_verified"
+
+    affinity = "affinity-issue-99"
+    first = SimpleNamespace(prompt_tokens=154_735)
+    assert (
+        client._guard_reported_turn_usage(
+            affinity_key=affinity,
+            server_identity=FAKE_IDENTITY,
+            turn_usage=first,
+            native_tokens=150_000,
+            context_limit=1_048_576,
+        )
+        is first
+    )
+
+    for idx, inflated_value in enumerate((1_077_303, 2_610_753, 6_164_316, 11_227_431), start=1):
+        rejected = client._guard_reported_turn_usage(
+            affinity_key=affinity,
+            server_identity=FAKE_IDENTITY,
+            turn_usage=SimpleNamespace(prompt_tokens=inflated_value),
+            native_tokens=600_000,
+            context_limit=1_048_576,
+        )
+        assert rejected is None
+        assert client._TURN_USAGE_BASELINES[affinity] == (154_735, 150_000)
+        assert _state_payload(tmp_path)["usage_drop_counters"]["dropped_inflated_turn_usage"] == idx
+
+    assert registry.semantics_verdict(FAKE_IDENTITY) == "unverified"
+    entry = _semantics_payload(tmp_path)["usage_semantics_verdicts"][FAKE_IDENTITY]
+    assert entry["rejected_turns"] == 4
+
+    # Subsequent valid turn under the same window is still accepted against (154_735, 150_000).
+    valid_later = SimpleNamespace(prompt_tokens=620_000)
+    assert (
+        client._guard_reported_turn_usage(
+            affinity_key=affinity,
+            server_identity=FAKE_IDENTITY,
+            turn_usage=valid_later,
+            native_tokens=610_000,
+            context_limit=1_048_576,
+        )
+        is valid_later
+    )
+    assert client._TURN_USAGE_BASELINES[affinity] == (620_000, 610_000)
+
+
+def test_guard_rejects_window_overflow_on_first_turn_without_seeding(
+    monkeypatch, tmp_path
+) -> None:
+    client, _ = _load_package(monkeypatch, tmp_path)
+    affinity = "affinity-issue-99-first"
+    rejected = client._guard_reported_turn_usage(
+        affinity_key=affinity,
+        server_identity=FAKE_IDENTITY,
+        turn_usage=SimpleNamespace(prompt_tokens=1_077_303),
+        native_tokens=500_000,
+        context_limit=1_048_576,
+    )
+    assert rejected is None
+    assert affinity not in client._TURN_USAGE_BASELINES
+    assert _state_payload(tmp_path)["usage_drop_counters"]["dropped_inflated_turn_usage"] == 1
