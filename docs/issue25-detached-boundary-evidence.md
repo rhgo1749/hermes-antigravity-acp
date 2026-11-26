@@ -54,7 +54,7 @@ teardown's reachability boundary, nothing about vendor intent.
 ## 3. Live read-only vendor evidence (no signals, no restarts)
 
 Snapshot 2026-11-17 21:21:27 KST, `/proc` reads only (raw dump:
-`/opt/data/cache/scratch/g25-detached-live.txt`, sha256 prefix
+`$HERMES_HOME/cache/scratch/g25-detached-live.txt`, sha256 prefix
 `183612ddcde35f49`; fleet is dynamic — a later reviewer snapshot of
 7 trees / 16 descendants / 0 detached is consistent, not contradictory):
 

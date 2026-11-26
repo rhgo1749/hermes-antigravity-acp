@@ -18,14 +18,14 @@ No live process was signalled, no vendor binary executed, no GitHub mutation.
 | identity | value |
 | --- | --- |
 | canonical source | main `37828b1`, `scripts/acp_mux.py` sha256 `231ffda9…`, 120267 B |
-| deployed launcher | `/opt/data/.local/bin/antigravity-acp-mux` sha256 `4aa93a25…` |
-| deployed mux body | `/opt/data/.local/bin/antigravity-acp-mux.py` sha256 `5b665c5b…`, 25741 B (2026-11-13 build) |
+| deployed launcher | `$HERMES_HOME/.local/bin/antigravity-acp-mux` sha256 `4aa93a25…` |
+| deployed mux body | `$HERMES_HOME/.local/bin/antigravity-acp-mux.py` sha256 `5b665c5b…`, 25741 B (2026-11-13 build) |
 | lease code in deployed | **absent** (`_LaneLease`/`pass_fds`/`_lane_lease` grep count = 0) |
 
 The deployed mux matches no recent main commit for this file; it predates
 F2/F3. Consequence: every live lane runs with **no lease fd at all** — a
 read-only `/proc/*/fd` scan found **zero** holders of any production lease
-file (`/opt/data/.hermes/cache/acp-mux-state.json.leases/` contains one
+file (`$HERMES_HOME/.hermes/cache/acp-mux-state.json.leases/` contains one
 stale file, unheld). F3's coverage claims are therefore untestable against
 the deployed fleet; GC remains off, which is the only reason this is not
 actively dangerous.

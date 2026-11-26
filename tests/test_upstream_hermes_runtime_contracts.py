@@ -999,9 +999,11 @@ def test_tainted_anchor_persists_through_real_usage_less_recording(monkeypatch, 
     """Lifecycle (full path, documented operational consequence): an anchor
     formed from a pre-#102 completion is NOT cleared by later usage-less
     recordings — Core's real record_response_usage usage-less path never
-    touches it, so the gate keeps firing early until restart or re-anchor.
-    This is the basis for the restart-on-deploy requirement; no silent DB
-    rewrite is performed anywhere."""
+    touches it, so the gate keeps firing early until the transcript
+    fingerprint breaks or a verified-usage provider re-anchors the session.
+    A restart is not a reset: Core persists the anchor on the session row
+    (model_config._usage_anchor) and restores it while the fingerprint
+    matches. No silent DB rewrite is performed anywhere."""
     wire = _incident_wire("S4")
     messages = _incident_transcript("S4")
     agent = _core_agent()

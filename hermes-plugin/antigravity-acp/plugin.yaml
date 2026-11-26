@@ -1,6 +1,6 @@
 name: antigravity-acp-provider
 kind: model-provider
-version: 0.9.0
+version: 0.9.3
 description: Google Antigravity through Google's official ACP server (Parked-MCP default engine; Replay engine selectable)
 author: rhgo1749
 # Compatibility floor proven by CI (catalog-floor-gate job): official Hermes

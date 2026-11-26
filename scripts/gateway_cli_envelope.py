@@ -149,7 +149,9 @@ def main() -> None:
         raise PermissionError("verified_container_required")
     provider_origin = ProviderOrigin(plugin, plugin.parents[2], core, owned_root=root)
     dependency_roots = [Path(sys.prefix).resolve(), Path(sys.base_prefix).resolve()]
-    protected = [Path("/opt/data").resolve(), Path("/home/hermes").resolve()]
+    # The live Hermes home is env-pinned via HERMES_HOME (standard ~/.hermes fallback).
+    hermes_home = Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes")).resolve()
+    protected = [hermes_home, Path.home().resolve()]
     allowed = [root, core, *dependency_roots]
 
     def path_of(value, dir_fd=None) -> Path | None:

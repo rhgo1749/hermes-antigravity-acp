@@ -143,9 +143,13 @@ only. No prompt text, raw native IDs, credentials, or vendor payloads.
 `completion.usage=None` prevents NEW anchors only. An in-memory
 `agent._usage_anchor` captured before this fix is NOT cleared by usage-less
 responses (Core's usage-less path never touches it) and keeps matching while
-the transcript prefix is stable. Already-tainted live sessions therefore need
-a gateway/process restart (or a natural re-anchor) at rollout — no silent
-database rewrite is performed. This is pinned by
+the transcript prefix is stable. A restart is also NOT a reset: Core persists
+the anchor on the session row (`model_config._usage_anchor`) and restores it
+into a resumed session whenever the durable transcript still matches its
+fingerprint, so a tainted anchor survives gateway/process restarts and keeps
+firing the compression gate early until the fingerprint breaks (compaction,
+splice, or rewind) or a verified-usage provider re-anchors the session. No
+silent database rewrite is performed by this release. This is pinned by
 `test_tainted_anchor_persists_through_real_usage_less_recording` in the
 upstream lane, which drives Core's real `record_response_usage` for both the
 poisoning turn and the later usage-less turns.

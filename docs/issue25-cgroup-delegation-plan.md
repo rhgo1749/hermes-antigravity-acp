@@ -24,8 +24,8 @@ Container (`hermes`, this workspace):
 | `/proc/self/cgroup` (PID 1 and shell) | `0::/` — **private cgroup namespace** (ns inode `4026534423`) |
 | `/proc/self/status` caps | `CapEff=0000000000000000` (gateway runs as uid 1000, zero caps) |
 | `/.dockerenv` | present — Docker container |
-| image init tree | s6-overlay; `/etc/cont-init.d/{01-hermes-setup,015-supervise-perms,02-reconcile-profiles}`; `01-hermes-setup` execs `/opt/hermes/docker/stage2-hook.sh` (root stage). **No user-extensible root-stage hook** (no run-parts from `/opt/data`), and **no cgroup handling anywhere** in `/opt/hermes/docker/*.sh` |
-| `/opt/data` bind | operator host bind-mount directory (ext4 rw) |
+| image init tree | s6-overlay; `/etc/cont-init.d/{01-hermes-setup,015-supervise-perms,02-reconcile-profiles}`; `01-hermes-setup` execs `/opt/hermes/docker/stage2-hook.sh` (root stage). **No user-extensible root-stage hook** (no run-parts from `$HERMES_HOME`), and **no cgroup handling anywhere** in `/opt/hermes/docker/*.sh` |
+| `$HERMES_HOME` bind | operator host bind-mount directory (ext4 rw) |
 
 Host (operator's workstation, via read-only probe; docker socket not readable by the
 devspace-agent service account — least privilege, expected):
@@ -155,7 +155,7 @@ Compose diff (production, the ONLY service change):
 
 ```yaml
      HERMES_ANTIGRAVITY_ACP_EXECUTION_MODE: "trusted-coding"
-     HERMES_ANTIGRAVITY_ACP_WORKSPACE: "/ws"
+     HERMES_ANTIGRAVITY_ACP_WORKSPACE: "/workspace"
 +    HERMES_ANTIGRAVITY_ACP_CGROUP_ROOT: "/sys/fs/cgroup/acp-delegate"
 ```
 
@@ -203,7 +203,7 @@ mounted READ-ONLY from production, never copied: the isolation rule
 targets mutable state, and Block D attests both mounts are ro. Everything
 else (state.db, sessions, profiles, cron) regenerates at boot; verified by
 booting the same image
-with an empty `/opt/data` (2026-11-18 probe: all s6 services started).
+with an empty `$HERMES_HOME` (2026-11-18 probe: all s6 services started).
 The plugin dir is built from the reviewed seam PLUS the production
 deployment artifact `launch_config.json` (the mux `process_command`
 override; untracked in git, present in the installed plugin tree): without

@@ -117,8 +117,10 @@ def mounts_for(repo: Path, core: Path) -> list[Path]:
     candidates = [repo, core, Path(sys.prefix), Path(sys.base_prefix), Path("/usr/bin"), Path("/usr/lib")]
     candidates += [p for p in (Path("/usr/lib64"), Path("/usr/share/git-core"), Path("/usr/share/zoneinfo")) if p.exists()]
     result: list[Path] = []
+    hermes_home = Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes")).resolve()
+    blocked = {Path.home().resolve(), Path("/home"), Path("/var/run"), hermes_home}
     for path in sorted(set(p.resolve(strict=True) for p in candidates), key=lambda p: len(p.parts)):
-        if path == Path("/") or path in {Path.home(), Path("/home"), Path("/opt/data"), Path("/var/run")}:
+        if path == Path("/") or path in blocked:
             raise ValueError("unsafe_mount")
         if not any(path.is_relative_to(parent) for parent in result):
             result.append(path)

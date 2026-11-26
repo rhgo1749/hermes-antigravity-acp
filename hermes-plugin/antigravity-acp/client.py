@@ -3587,9 +3587,10 @@ def _rotation_threshold(model: str | None = None) -> int:
 def _resolve_acp_working_directory(explicit_cwd: str | None) -> str:
     """Use Hermes' scoped workdir before the process-wide launch directory.
 
-    A gateway may be launched from /ws/hermes-agent while a delegated reviewer is
-    scoped to /ws/projects/<repo>.  The native ACP session must use that same
-    workdir for file permissions and relative operations.
+    A gateway may be launched from one working directory while a delegated
+    reviewer is scoped to a different repository checkout.  The native ACP
+    session must use that same workdir for file permissions and relative
+    operations.
 
     The former ``HERMES_ANTIGRAVITY_ACP_WORKSPACE`` operator pin belonged to the
     removed trusted-coding auto-approval and is no longer read; the session cwd
