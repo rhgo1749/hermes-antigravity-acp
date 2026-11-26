@@ -230,3 +230,142 @@ def test_window_cap_rejects_first_turn_overflow_without_seeding_baseline(tmp_pat
         assert conv._usage_baseline is None
     finally:
         conv.close()
+
+
+
+def test_corrupt_usage_update_frame_does_not_set_or_overwrite_context_limit(tmp_path):
+    """Whole-frame validity: a usage_update with invalid used/size never sets or overwrites _context_limit,
+    while a valid partial frame (size without used) is accepted."""
+    from antigravity_acp_mcp.client import _completion
+    conv, _ = make_conv(tmp_path, [
+        # Turn 1: corrupt used with valid size=20_000 -> frame rejected whole, no cap set -> 25_000 accepted (under 8x)
+        [{"usage": {"used": "bogus", "size": 20_000}},
+         {"result_usage": {"inputTokens": 25_000, "outputTokens": 5, "totalTokens": 25_005}},
+         {"text": "one"}],
+        # Turn 2: valid frame establishes 20_000 cap
+        [{"usage": {"used": 500, "size": 20_000}}, {"text": "two"}],
+        # Turn 3: corrupt frame with size=100_000 + size=0 must NOT overwrite trusted 20_000 cap -> 25_000 rejected
+        [{"usage": {"used": -1, "size": 100_000}},
+         {"usage": {"used": True, "size": 200_000}},
+         {"usage": {"used": 600, "size": 0}},
+         {"result_usage": {"inputTokens": 25_000, "outputTokens": 5, "totalTokens": 25_005}},
+         {"text": "three"}],
+        # Turn 4: valid partial frame (size only, no used) updates cap to 30_000 -> 25_000 accepted
+        [{"usage": {"size": 30_000}},
+         {"result_usage": {"inputTokens": 25_000, "outputTokens": 5, "totalTokens": 25_005}},
+         {"text": "four"}],
+    ])
+    msgs = [SYS, {"role": "user", "content": "q1"}]
+    try:
+        r1 = conv.run(msgs, TOOLS, "fake-model-a")
+        assert _completion(r1, "fake-model-a").usage.prompt_tokens == 25_000
+        assert conv._context_limit is None
+        msgs = _run_turn(conv, msgs, "one")
+        msgs.append({"role": "user", "content": "q2"})
+        conv.run(msgs, TOOLS, "fake-model-a")
+        assert conv._context_limit == 20_000
+        msgs = _run_turn(conv, msgs, "two")
+        msgs.append({"role": "user", "content": "q3"})
+        r3 = conv.run(msgs, TOOLS, "fake-model-a")
+        assert _completion(r3, "fake-model-a").usage is None
+        assert conv._context_limit == 20_000
+        msgs = _run_turn(conv, msgs, "three")
+        msgs.append({"role": "user", "content": "q4"})
+        r4 = conv.run(msgs, TOOLS, "fake-model-a")
+        assert _completion(r4, "fake-model-a").usage.prompt_tokens == 25_000
+        assert conv._context_limit == 30_000
+    finally:
+        conv.close()
+
+
+def test_thinking_change_on_composite_model_invalidates_prior_context_limit(tmp_path):
+    """Changing thinking on a composite model id picks a different sibling model in session.py;
+    Conversation must invalidate the prior model's _context_limit even when the requested model string is unchanged."""
+    import json as _json
+    import sys as _sys
+    from antigravity_acp_mcp.acp_connection import AcpConnection
+    from antigravity_acp_mcp.client import _completion
+    from antigravity_acp_mcp.conversation import Conversation
+    from ._support import FAKE_AGY
+
+    log = tmp_path / "agy.log"
+    behaviour = _json.dumps({
+        "available_models": [
+            {"modelId": "fake-model-a-medium"},
+            {"modelId": "fake-model-a-xhigh"},
+        ],
+        "script": [
+            [{"usage": {"used": 500, "size": 20_000}},
+             {"result_usage": {"inputTokens": 10_000, "outputTokens": 5, "totalTokens": 10_005}},
+             {"text": "one"}],
+            # Turn 2: same requested model "fake-model-a-medium" with thinking="xhigh" -> selects fake-model-a-xhigh.
+            # No usage_update on this turn; must NOT reuse fake-model-a-medium's 20_000 limit.
+            [{"result_usage": {"inputTokens": 25_000, "outputTokens": 5, "totalTokens": 25_005}},
+             {"text": "two"}],
+        ],
+        "log": str(log),
+    })
+
+    def spawn(_key, cwd):
+        conn = AcpConnection(_sys.executable, [FAKE_AGY, behaviour], cwd)
+        conn.start()
+        conn.initialize()
+        return conn
+
+    conv = Conversation("k-thinking", spawn)
+    msgs = [SYS, {"role": "user", "content": "q1"}]
+    try:
+        r1 = conv.run(msgs, TOOLS, "fake-model-a-medium", thinking="medium")
+        assert _completion(r1, "fake-model-a-medium").usage.prompt_tokens == 10_000
+        assert conv._context_limit == 20_000
+        msgs = _run_turn(conv, msgs, "one")
+        msgs.append({"role": "user", "content": "q2"})
+        r2 = conv.run(msgs, TOOLS, "fake-model-a-medium", thinking="xhigh")
+        u2 = _completion(r2, "fake-model-a-medium").usage
+        assert u2 is not None and u2.prompt_tokens == 25_000
+        assert conv._context_limit is None
+    finally:
+        conv.close()
+
+
+def test_pre_and_post_prompt_usage_update_frames_are_ignored_for_context_limit(tmp_path):
+    """usage_update frames arriving before session/prompt or after prompt completion must not set _context_limit."""
+    import json as _json
+    import sys as _sys
+    from antigravity_acp_mcp.acp_connection import AcpConnection
+    from antigravity_acp_mcp.client import _completion
+    from antigravity_acp_mcp.conversation import Conversation
+    from ._support import FAKE_AGY
+
+    log = tmp_path / "agy.log"
+    behaviour = _json.dumps({
+        "pre_prompt_usage": {"used": 0, "size": 10_000},
+        "script": [
+            [{"result_usage": {"inputTokens": 15_000, "outputTokens": 5, "totalTokens": 15_005}},
+             {"post_prompt_usage": {"used": 0, "size": 10_000}},
+             {"text": "one"}],
+            [{"result_usage": {"inputTokens": 15_500, "outputTokens": 5, "totalTokens": 15_505}},
+             {"text": "two"}],
+        ],
+        "log": str(log),
+    })
+
+    def spawn(_key, cwd):
+        conn = AcpConnection(_sys.executable, [FAKE_AGY, behaviour], cwd)
+        conn.start()
+        conn.initialize()
+        return conn
+
+    conv = Conversation("k-window-bounds", spawn)
+    msgs = [SYS, {"role": "user", "content": "q1"}]
+    try:
+        r1 = conv.run(msgs, TOOLS, "fake-model-a")
+        assert _completion(r1, "fake-model-a").usage.prompt_tokens == 15_000
+        assert conv._context_limit is None
+        msgs = _run_turn(conv, msgs, "one")
+        msgs.append({"role": "user", "content": "q2"})
+        r2 = conv.run(msgs, TOOLS, "fake-model-a")
+        assert _completion(r2, "fake-model-a").usage.prompt_tokens == 15_500
+        assert conv._context_limit is None
+    finally:
+        conv.close()

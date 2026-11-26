@@ -57,6 +57,46 @@ def valid_context_limit(limit: Any) -> int | None:
     return None
 
 
+def nonnegative_usage_number(value: Any) -> bool:
+    """Validate one numeric field inside an ACP ``usage_update`` frame."""
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return value >= 0
+    return isinstance(value, float) and math.isfinite(value) and value >= 0
+
+
+def usage_update_valid(update: Any) -> bool:
+    """Whole-frame validity for ``usage_update`` ``used``/``size`` fields.
+
+    A frame carrying any present-but-invalid ``used`` or ``size`` value is
+    rejected as a whole so corrupt frames never contribute a sibling field or
+    poison the trusted context-window limit.  Partial frames carrying only one
+    valid field remain valid.
+    """
+    if (
+        not isinstance(update, dict)
+        or str(update.get("sessionUpdate") or "").strip() != "usage_update"
+    ):
+        return False
+    present = [field for field in ("used", "size") if field in update]
+    return bool(present) and all(
+        nonnegative_usage_number(update[field]) for field in present
+    )
+
+
+def context_limit_from_usage_update(update: Any) -> int | None:
+    """Extract a validated positive context-window limit from one ``usage_update``.
+
+    Enforces whole-frame validity of ``used`` and ``size`` before validating
+    the context limit so a corrupt ``used`` field vetoes ``size`` in the same
+    frame, while valid partial frames (``size`` alone) remain accepted.
+    """
+    if not usage_update_valid(update):
+        return None
+    return valid_context_limit(update.get("size"))
+
+
 def report_within_context_limit(*, reported: int, context_limit: Any) -> bool:
     """Hard ceiling check: prompt input tokens cannot exceed the model's context window.
 

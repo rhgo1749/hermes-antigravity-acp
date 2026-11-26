@@ -60,6 +60,8 @@ class AcpSession:
         self.session_id = session_id
         self.gate = gate
         self.updates: queue.Queue[dict[str, Any]] = queue.Queue()  # session/update payloads
+        self.prompt_active = False
+        self.effective_model = ""
 
     def prompt(self, blocks: str | list[dict[str, Any]], timeout: float | None = None) -> PromptResult:
         if isinstance(blocks, str):
@@ -67,9 +69,20 @@ class AcpSession:
         if not self.conn.supports_images and any(b.get("type") == "image" for b in blocks):
             logger.warning("acp-mcp: agent did not declare image prompts; images dropped from this prompt")
             blocks = [b for b in blocks if b.get("type") != "image"]
-        result = self.conn.request(
-            "session/prompt", {"sessionId": self.session_id, "prompt": blocks}, timeout=timeout,
-        )
+
+        def end_prompt() -> None:
+            self.prompt_active = False
+
+        self.prompt_active = True
+        try:
+            result = self.conn.request(
+                "session/prompt",
+                {"sessionId": self.session_id, "prompt": blocks},
+                timeout=timeout,
+                on_response=end_prompt,
+            )
+        finally:
+            self.prompt_active = False
         result = result if isinstance(result, dict) else {}
         stop = result.get("stopReason")
         if stop not in STOP_REASON_FINISH:
@@ -81,6 +94,21 @@ class AcpSession:
 
     def close(self) -> None:
         self.conn.close_session(self.session_id)
+
+
+def _reported_session_model(new_result: dict[str, Any]) -> str:
+    for option in new_result.get("configOptions") or []:
+        if not isinstance(option, dict) or "model" not in (option.get("category"), option.get("id")):
+            continue
+        current = str(option.get("currentValue") or "").strip()
+        if current:
+            return current
+    models = new_result.get("models")
+    if isinstance(models, dict):
+        current = str(models.get("currentModelId") or "").strip()
+        if current:
+            return current
+    return ""
 
 
 def new_session(
@@ -107,16 +135,20 @@ def new_session(
 
     def on_update(update: dict[str, Any]) -> None:
         gate.observe_update(update)
+        if not session.prompt_active and update.get("sessionUpdate") == "usage_update":
+            return
         session.updates.put(update)
 
     conn.attach_session(session.session_id, on_update, gate.decide)
+    picked = ""
     if model or thinking:
         while True:
             try:
                 session.updates.get_nowait()
             except queue.Empty:
                 break
-        select_model(conn, session.session_id, result, model or "", thinking)
+        picked = select_model(conn, session.session_id, result, model or "", thinking)
+    session.effective_model = picked or _reported_session_model(result)
     return session
 
 
@@ -141,7 +173,7 @@ def _composite(model: str, thinking: str | None, legacy_ids: list[str]) -> str:
 
 
 def select_model(conn: AcpConnection, session_id: str, new_result: dict[str, Any], model: str,
-                 thinking: str | None = None) -> None:
+                 thinking: str | None = None) -> str:
     """Pick the model, then the thinking level.
 
     A composite id (``fake-model-a-medium``) carries its level: the requested level swaps the suffix when agy
@@ -154,7 +186,7 @@ def select_model(conn: AcpConnection, session_id: str, new_result: dict[str, Any
     if picked:
         _set_model(conn, session_id, new_result, picked)
     if not thinking or picked.rpartition("-")[2] == thinking:
-        return  # the composite id carries the requested level itself
+        return picked  # the composite id carries the requested level itself
     for option in new_result.get("configOptions") or []:
         if isinstance(option, dict) and option.get("category") == "thought_level":
             offered = [str(o.get("value")) for o in option.get("options") or [] if isinstance(o, dict)]
@@ -163,7 +195,8 @@ def select_model(conn: AcpConnection, session_id: str, new_result: dict[str, Any
                 conn.request("session/set_config_option",
                              {"sessionId": session_id, "configId": option.get("id") or "thinking_level",
                               "value": value}, timeout=30.0)
-            return
+            return picked
+    return picked
 
 
 def _set_model(conn: AcpConnection, session_id: str, new_result: dict[str, Any], model: str) -> None:

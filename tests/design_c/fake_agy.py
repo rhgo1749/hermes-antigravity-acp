@@ -122,10 +122,13 @@ def run_prompt(rid, sid, text, steps, token):
         if token["done"]:
             return
         token["done"] = True
+    post_usage = [s["post_prompt_usage"] for s in steps if "post_prompt_usage" in s]
     result: dict = {"stopReason": "end_turn"}
     if pending_result_usage[0] is not None:
         result["usage"] = pending_result_usage[0]
     emit({"jsonrpc": "2.0", "id": rid, "result": result})
+    for pu in post_usage:
+        update(sid, {"sessionUpdate": "usage_update", **pu})
 
 
 def main():
@@ -171,8 +174,12 @@ def main():
             if B.get("new_delay"):
                 threading.Timer(float(B["new_delay"]), emit, args=(reply,)).start()
             else:
+                if B.get("pre_prompt_usage") is not None:
+                    update(sid, {"sessionUpdate": "usage_update", **B["pre_prompt_usage"]})
                 emit(reply)
         elif method in ("session/set_model", "session/set_config_option"):
+            if B.get("pre_prompt_usage") is not None and params.get("sessionId"):
+                update(params["sessionId"], {"sessionUpdate": "usage_update", **B["pre_prompt_usage"]})
             emit({"jsonrpc": "2.0", "id": rid, "result": {}})
         elif method == "session/prompt":
             sid = params["sessionId"]

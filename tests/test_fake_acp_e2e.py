@@ -2254,3 +2254,158 @@ for line in sys.stdin:
     msgs.extend([{"role": "assistant", "content": r3.choices[0].message.content}, {"role": "user", "content": "turn 4"}])
     r4 = client.chat.completions.create(model="fake-model-b", messages=msgs)
     assert r4.usage is not None and r4.usage.prompt_tokens == 25_000
+
+
+
+def test_replay_ignores_post_prompt_and_corrupt_usage_update_for_context_limit(
+    monkeypatch, tmp_path
+) -> None:
+    """Replay _capture_context_occupancy must reject corrupt frames, pre/post-prompt frames,
+    and preserve a valid turn context_limit across subsequent size=0 or used-only frames."""
+    _load_client(
+        monkeypatch,
+        command=sys.executable,
+        args=["-c", "pass"],
+        cwd=str(tmp_path),
+    )
+    client_mod = importlib.import_module("antigravity_acp_fake_e2e.client")
+    # Pre-active (no turn_id_hash): must ignore usage_update.
+    pre_stats: dict = {}
+    client_mod._capture_context_occupancy(
+        {"sessionUpdate": "usage_update", "used": 0, "size": 10_000}, pre_stats
+    )
+    assert "context_limit" not in pre_stats
+    assert "context_occupancy" not in pre_stats
+
+    stats = {
+        "turn_id_hash": "sha256:turn-1",
+        client_mod._PROMPT_TURN_ACTIVE_KEY: True,
+    }
+    # Corrupt frames must not set context_limit.
+    client_mod._capture_context_occupancy(
+        {"sessionUpdate": "usage_update", "used": "bogus", "size": 10_000}, stats
+    )
+    client_mod._capture_context_occupancy(
+        {"sessionUpdate": "usage_update", "used": -1, "size": 10_000}, stats
+    )
+    assert "context_limit" not in stats
+
+    # Valid frame during active prompt sets 20_000; subsequent size=0 or corrupt frame keeps 20_000.
+    client_mod._capture_context_occupancy(
+        {"sessionUpdate": "usage_update", "used": 500, "size": 20_000}, stats
+    )
+    client_mod._capture_context_occupancy(
+        {"sessionUpdate": "usage_update", "used": 600, "size": 0}, stats
+    )
+    client_mod._capture_context_occupancy(
+        {"sessionUpdate": "usage_update", "used": True, "size": 50_000}, stats
+    )
+    assert stats["context_limit"] == 20_000
+
+    # After prompt window closes, late usage_update must be ignored.
+    stats[client_mod._PROMPT_TURN_ACTIVE_KEY] = False
+    client_mod._capture_context_occupancy(
+        {"sessionUpdate": "usage_update", "used": 700, "size": 99_000}, stats
+    )
+    assert stats["context_limit"] == 20_000
+
+
+def test_replay_e2e_usage_update_window_corrupt_and_post_prompt_guard(
+    monkeypatch, tmp_path
+) -> None:
+    """Real subprocess E2E: pre-prompt, corrupt in-prompt, size=0 follow-up, and
+    post-prompt usage_update frames must never poison Replay context_limit; normal
+    usage recovers cleanly after a window-cap rejection."""
+    script = tmp_path / "fake_replay_window_edge.py"
+    state_file = tmp_path / "state.json"
+    script.write_text(
+        f"STATE_FILE = {str(state_file)!r}\n"
+        + r"""import json
+import pathlib
+import sys
+
+def emit(payload):
+    sys.stdout.write(json.dumps(payload) + "\n")
+    sys.stdout.flush()
+
+def update(payload):
+    emit({"jsonrpc": "2.0", "method": "session/update", "params": {"update": payload}})
+
+state_path = pathlib.Path(STATE_FILE)
+prompt_count = int(json.loads(state_path.read_text(encoding="utf-8"))["prompt_count"]) if state_path.exists() else 0
+
+for line in sys.stdin:
+    msg = json.loads(line)
+    method = msg.get("method")
+    params = msg.get("params") or {}
+    rid = msg.get("id")
+    if method == "initialize":
+        emit({"jsonrpc": "2.0", "id": rid, "result": {
+            "protocolVersion": 1,
+            "agentInfo": {"name": "antigravity-acp", "title": "Fake", "version": "1.5.2"},
+            "agentCapabilities": {"sessionCapabilities": {"resume": {}}},
+        }})
+    elif method in ("session/new", "session/resume"):
+        sid = params.get("sessionId") or f"edge-sess-{prompt_count + 1}"
+        # Pre-prompt placeholder: must be ignored for context_limit.
+        update({"sessionUpdate": "usage_update", "used": 0, "size": 10_000})
+        emit({"jsonrpc": "2.0", "id": rid, "result": {
+            "sessionId": sid,
+            "models": {
+                "currentModelId": "fake-model-a",
+                "availableModels": [{"modelId": "fake-model-a", "name": "Fake A"}],
+            },
+        }})
+    elif method == "session/set_model":
+        update({"sessionUpdate": "usage_update", "used": 0, "size": 10_000})
+        emit({"jsonrpc": "2.0", "id": rid, "result": {}})
+    elif method == "session/prompt":
+        prompt_count += 1
+        state_path.write_text(json.dumps({"prompt_count": prompt_count}), encoding="utf-8")
+        update({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": f"reply-{prompt_count}"}})
+        if prompt_count == 1:
+            # Corrupt frame must NOT set 12_000 limit; pre-prompt 10_000 also ignored -> 15_000 accepted.
+            update({"sessionUpdate": "usage_update", "used": "bogus", "size": 12_000})
+            emit({"jsonrpc": "2.0", "id": rid, "result": {
+                "stopReason": "end_turn",
+                "usage": {"inputTokens": 15_000, "outputTokens": 10, "totalTokens": 15_010},
+            }})
+        elif prompt_count == 2:
+            # Valid 20_000 followed by size=0 keeps 20_000; post-prompt 100_000 arrives AFTER prompt result.
+            update({"sessionUpdate": "usage_update", "used": 500, "size": 20_000})
+            update({"sessionUpdate": "usage_update", "used": 600, "size": 0})
+            emit({"jsonrpc": "2.0", "id": rid, "result": {
+                "stopReason": "end_turn",
+                "usage": {"inputTokens": 25_000, "outputTokens": 10, "totalTokens": 25_010},
+            }})
+            update({"sessionUpdate": "usage_update", "used": 0, "size": 100_000})
+        elif prompt_count == 3:
+            # Clean recovery within the 20_000 window after turn 2 rejection.
+            emit({"jsonrpc": "2.0", "id": rid, "result": {
+                "stopReason": "end_turn",
+                "usage": {"inputTokens": 15_500, "outputTokens": 10, "totalTokens": 15_510},
+            }})
+""",
+        encoding="utf-8",
+    )
+    client = _load_client(
+        monkeypatch,
+        command=sys.executable,
+        args=[str(script)],
+        cwd=str(tmp_path),
+    )
+    client_mod = importlib.import_module("antigravity_acp_fake_e2e.client")
+    client_mod._TURN_USAGE_BASELINES.clear()
+    client_mod._CONVERSATION_CONTEXT_LIMITS.clear()
+
+    msgs = [{"role": "user", "content": "turn 1"}]
+    r1 = client.chat.completions.create(model="fake-model-a", messages=msgs)
+    assert r1.usage is not None and r1.usage.prompt_tokens == 15_000
+
+    msgs.extend([{"role": "assistant", "content": r1.choices[0].message.content}, {"role": "user", "content": "turn 2"}])
+    r2 = client.chat.completions.create(model="fake-model-a", messages=msgs)
+    assert r2.usage is None
+
+    msgs.extend([{"role": "assistant", "content": r2.choices[0].message.content}, {"role": "user", "content": "turn 3"}])
+    r3 = client.chat.completions.create(model="fake-model-a", messages=msgs)
+    assert r3.usage is not None and r3.usage.prompt_tokens == 15_500

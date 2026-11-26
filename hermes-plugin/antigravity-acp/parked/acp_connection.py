@@ -77,12 +77,13 @@ class AcpRpcError(AcpError):
 
 
 class _Pending:
-    __slots__ = ("error", "event", "result")
+    __slots__ = ("error", "event", "on_response", "result")
 
-    def __init__(self) -> None:
+    def __init__(self, on_response: Callable[[], None] | None = None) -> None:
         self.event = threading.Event()
         self.result: Any = None
         self.error: Exception | None = None
+        self.on_response = on_response
 
 
 _TERMINAL_METHODS = frozenset({
@@ -237,8 +238,15 @@ class AcpConnection:
 
     # -- client -> agent -----------------------------------------------------------
 
-    def request(self, method: str, params: dict[str, Any], timeout: float | None = None) -> Any:
-        slot = _Pending()
+    def request(
+        self,
+        method: str,
+        params: dict[str, Any],
+        timeout: float | None = None,
+        *,
+        on_response: Callable[[], None] | None = None,
+    ) -> Any:
+        slot = _Pending(on_response=on_response)
         with self._lock:
             if self._exit_error is not None:
                 raise self._exit_error
@@ -367,6 +375,11 @@ class AcpConnection:
                     )
                 else:
                     slot.result = msg.get("result")
+                if slot.on_response is not None:
+                    try:
+                        slot.on_response()
+                    except Exception:
+                        log.exception("ACP on_response callback failed")
                 slot.event.set()
         elif "id" in msg:
             raw_p = msg.get("params")

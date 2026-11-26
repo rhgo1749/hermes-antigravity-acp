@@ -36,10 +36,12 @@ from typing import Any, TypeGuard
 
 from .acp_connection import AcpConnection, AcpError
 from .usage_contract import (
+    context_limit_from_usage_update,
     first_turn_report_plausible,
     report_within_context_limit,
     reported_usage_growth_consistent,
     transcript_tokens,
+    usage_update_valid,
     valid_context_limit,
 )
 from .matcher import (
@@ -693,11 +695,12 @@ class Conversation:
         self.text: list[str] = []
         self.reasoning: list[str] = []
         self.usage: dict[str, int] | None = None  # consumption: session/prompt RESULT breakdown only (gated)
-        self.occupancy: dict[str, int] | None = None  # usage_update used/size: occupancy reading, never billing
+        self.occupancy: dict[str, int | float] | None = None  # usage_update used/size: occupancy reading, never billing
         self.frame_usage: dict[str, int] | None = None  # usage_update token fields: telemetry only
         self._usage_baseline: tuple[int, int] | None = None  # (accepted reported input, local estimate)
         self._context_limit: int | None = None  # confirmed context window for the active model
         self._context_limit_model: str = ""
+        self._context_limit_effective_model: str = ""
         self.images = _Images()  # image numbering of the current ACP session
         self._seen_sys_msgs: set[str] = set()  # sha256 of large <system-message> blocks already sent in this session
         self.fence = fence or "TOOL-OUTPUT-" + secrets.token_hex(4)  # unguessable to tool output, stable across replays
@@ -754,10 +757,11 @@ class Conversation:
             if decision.kind == "guest":
                 return {"guest": True}
             if decision.kind != "resume_held":
-                active_model = str(model or "").strip()
+                active_model = f"{str(model or '').strip()}|{str(thinking or '').strip()}"
                 if active_model != self._context_limit_model:
                     self._context_limit = None
                     self._context_limit_model = active_model
+                    self._context_limit_effective_model = ""
             self.owner_token = token
             if decision.kind == "resume_held":
                 gen = self.gen
@@ -912,6 +916,14 @@ class Conversation:
             else:
                 self.server, self.session = server, session
                 self.tools_fp, self.model = tools_fp, f"{model or ''}|{thinking or ''}"
+                effective_model = str(getattr(session, "effective_model", "") or "").strip()
+                if effective_model:
+                    if (
+                        self._context_limit_effective_model
+                        and effective_model != self._context_limit_effective_model
+                    ):
+                        self._context_limit = None
+                    self._context_limit_effective_model = effective_model
                 self.guard, self.guard_refusals = trailing_tool_round(messages), 0
                 self.view = _inflight_view(messages)
                 self.images = _Images()
@@ -1025,18 +1037,23 @@ class Conversation:
             elif kind == "usage_update":
                 # Frames feed the OCCUPANCY and telemetry channels only; they never reach ``self.usage``
                 # (consumption), which is fed exclusively by the session/prompt result breakdown.
-                occ: dict[str, int] = dict(self.occupancy or {})
-                for key in ("used", "size"):
-                    val = u.get(key)
-                    if _nonnegative_int(val):
-                        occ[key] = int(val)
-                if occ:
-                    self.occupancy = occ
-                limit = valid_context_limit(u.get("size"))
-                if limit is not None:
-                    with self.lock:
-                        if self.gen == gen:
-                            self._context_limit = limit
+                if usage_update_valid(u):
+                    occ: dict[str, int | float] = dict(self.occupancy or {})
+                    for key in ("used", "size"):
+                        if key in u:
+                            val = u[key]
+                            occ[key] = (
+                                int(val)
+                                if isinstance(val, int) or float(val).is_integer()
+                                else val
+                            )
+                    if occ:
+                        self.occupancy = occ
+                    limit = context_limit_from_usage_update(u)
+                    if limit is not None:
+                        with self.lock:
+                            if self.gen == gen:
+                                self._context_limit = limit
                 fu: dict[str, int] = dict(self.frame_usage or {})
                 for src_k, dst_k in (("inputTokens", "input_tokens"), ("outputTokens", "output_tokens"),
                                      ("input_tokens", "input_tokens"), ("output_tokens", "output_tokens")):
