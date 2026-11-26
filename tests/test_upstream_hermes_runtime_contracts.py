@@ -14,6 +14,7 @@ from pathlib import Path
 import hermes_constants
 import providers
 import pytest
+from agent.context_compressor import ContextCompressor
 from agent.model_metadata import estimate_request_tokens_rough
 from agent.turn_context import _preflight_request_tokens
 from agent.usage_anchor import anchored_context_tokens, capture_usage_anchor
@@ -812,6 +813,19 @@ def _preflight_agent(anchor):
     )
 
 
+def _core_compressor() -> ContextCompressor:
+    """Core's real compression gate at the S4 production configuration
+    (window 1,048,576 @ 0.7).  ``config_context_length`` short-circuits
+    endpoint probing, so this stays credential-free; ``should_compress`` is
+    the exact predicate ``_preflight_compression`` consults."""
+    return ContextCompressor(
+        model="fake-model-a",
+        threshold_percent=0.7,
+        config_context_length=1_048_576,
+        quiet_mode=True,
+    )
+
+
 def test_s4_consumption_report_at_core_boundary_inflates_preflight():
     """RED witness (S4): IF a consumption sum reaches Core's anchor capture —
     the pre-#102 plugin behavior — Core trusts it absolutely and the
@@ -826,6 +840,11 @@ def test_s4_consumption_report_at_core_boundary_inflates_preflight():
     preflight = _preflight_request_tokens(_preflight_agent(anchor), messages, "")
     assert preflight >= _S4_PROMPT_TOKENS  # anchored figure is never deferred
     assert preflight > 5 * rough  # inflated occupancy drives premature compaction
+    # Core's OWN compression gate fires on the contaminated figure and would
+    # never fire on the true occupancy: premature compaction, by construction.
+    compressor = _core_compressor()
+    assert compressor.should_compress(preflight)
+    assert not compressor.should_compress(rough)
 
 
 def test_plugin_completion_cannot_seed_core_anchor(monkeypatch, tmp_path):
@@ -893,19 +912,22 @@ for line in sys.stdin:
     preflight = _preflight_request_tokens(agent, messages, "")
     assert preflight <= rough * 1.5  # estimate governs; no 861K anchor exists
     assert preflight < 100_000
+    # The premature-compaction condition is gone at Core's own gate.
+    assert not _core_compressor().should_compress(preflight)
 
 
 def test_needed_compaction_still_fires_without_anchor_c1():
     """C1 control: a GENUINELY large transcript with no anchor (the post-#102
-    steady state) still presents a large occupancy to Core's preflight gate —
-    needed compaction is not suppressed by completion.usage=None."""
+    steady state) still trips Core's compression gate — needed compaction is
+    not suppressed by completion.usage=None."""
     big = [{"role": "user" if i % 2 == 0 else "assistant",
-            "content": ("routine transcript body. " * 40) + str(i)}
-           for i in range(400)]  # ~250K chars -> ~80K+ tokens
+            "content": ("routine transcript body. " * 220) + str(i)}
+           for i in range(700)]  # ~3.5MB chars -> ~800K tokens by rough estimate
     rough = estimate_request_tokens_rough(big, system_prompt="")
-    assert rough > 60_000
+    assert rough > 600_000
     preflight = _preflight_request_tokens(_preflight_agent(None), big, "")
     assert preflight >= rough  # the gate sees the real size, undamped
+    assert _core_compressor().should_compress(preflight)
 
 
 def test_needed_compaction_still_fires_with_valid_anchor_c2():
@@ -913,15 +935,17 @@ def test_needed_compaction_still_fires_with_valid_anchor_c2():
     transcript) keeps driving compaction normally — #102 removes only the
     contamination channel, not the anchored fast path."""
     big = [{"role": "user" if i % 2 == 0 else "assistant",
-            "content": ("routine transcript body. " * 40) + str(i)}
-           for i in range(400)]
+            "content": ("routine transcript body. " * 220) + str(i)}
+           for i in range(700)]
     rough = estimate_request_tokens_rough(big, system_prompt="")
+    assert rough > 600_000
     anchor = capture_usage_anchor(rough, 100, big)
     assert anchor is not None
     anchored = anchored_context_tokens(big, anchor)
     assert anchored is not None and anchored >= rough
     preflight = _preflight_request_tokens(_preflight_agent(anchor), big, "")
     assert preflight >= rough
+    assert _core_compressor().should_compress(preflight)
 
 
 def test_existing_tainted_anchor_survives_usage_less_turns():
@@ -940,6 +964,9 @@ def test_existing_tainted_anchor_survives_usage_less_turns():
     agent = _preflight_agent(tainted)
     preflight = _preflight_request_tokens(agent, messages, "")
     assert preflight >= _S4_PROMPT_TOKENS  # stale inflation persists
+    # The stale anchor keeps Core's gate firing early until restart/re-anchor:
+    # this is why deployment requires a gateway restart for live sessions.
+    assert _core_compressor().should_compress(preflight)
     # Appending turns keeps the anchor matching (prefix fingerprint stable),
     # so the inflation is not self-healing within the session.
     grown = messages + [{"role": "user", "content": "one more routine question"}]
