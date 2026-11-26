@@ -236,11 +236,11 @@ def test_usage_update_is_non_billing_context_occupancy(monkeypatch, tmp_path, no
     else:
         content = reply.choices[0].message.content
         usage = reply.usage
-    # Issue #6 AC4-1/AC4-3: this fake self-reports no `agentInfo`, so the
-    # server's consumption semantics are UNVERIFIED.  Frames are never
-    # accumulated, never synthesized into completion.usage, and never priced:
-    # usage stays None (Core's designed usage-less path) and the only
-    # surviving signal is the ungated latest-valid occupancy reading.
+    # Issue #102: frames are never synthesized into completion.usage and never
+    # priced: usage stays None (Core's designed usage-less path).  The verdict
+    # gate that used to drop these frames for an identity without a behavioral
+    # verdict is retired; the structural lifecycle gates still apply and the
+    # readings carry the honest unverified scope.
     assert usage is None
     assert content == "ok-130"
     assert "usage" not in content and "1048576" not in content
@@ -248,8 +248,14 @@ def test_usage_update_is_non_billing_context_occupancy(monkeypatch, tmp_path, no
     assert telemetry["schema_id"] == "antigravity-acp-usage-v1"
     assert telemetry["status"] == "unavailable"
     assert telemetry["provider"] == "antigravity-acp"
-    assert telemetry["server_consumption_semantics"] == "unverified"
-    assert telemetry["turn_consumption"] is None
+    assert "server_consumption_semantics" not in telemetry
+    assert telemetry["turn_consumption"] == {
+        "source": "acp.session/update:usage_update",
+        "scope": "unverified_server_semantics",
+        "is_billing_usage": False,
+        "model_calls_observed": 3,
+        "total_tokens": 650,
+    }
     assert telemetry["request_usage"] == {
         "input_tokens": None,
         "output_tokens": None,
@@ -265,32 +271,24 @@ def test_usage_update_is_non_billing_context_occupancy(monkeypatch, tmp_path, no
         "size": 1048576,
     }
     store_payload = json.loads((tmp_path / "acp-state.json").read_text(encoding="utf-8"))
-    assert "usage_totals" not in store_payload
-    assert store_payload["usage_drop_counters"]["dropped_semantics_unverified"] == 3
+    assert store_payload["usage_totals"]["hermes-session-130"]["summed_tokens"] == 650
+    assert store_payload["usage_drop_counters"]["dropped_invalid"] == 2
+    assert "dropped_semantics_unverified" not in store_payload["usage_drop_counters"]
     assert telemetry["native_session_id_hash"].startswith("sha256:")
     assert telemetry["turn_id_hash"].startswith("sha256:")
     assert "s-1" not in json.dumps(telemetry)
 
 
-def test_verified_identity_accumulates_consumption_without_synthetic_split(
+def test_consumption_accumulates_without_synthetic_split(
     monkeypatch, tmp_path, no_slash_env
 ) -> None:
-    """Issue #6 AC4-1/AC4-3: a behaviorally-verified identity accumulates
-    observed consumption sums, but completion.usage stays None without the
-    server's own per-turn breakdown — the fabricated prompt/completion split
-    is gone."""
+    """Issue #102: observed consumption sums accumulate for ANY identity (the
+    behavioral-verdict gate is retired), but completion.usage stays None — the
+    fabricated prompt/completion split is gone."""
     client = _load_client(
         monkeypatch, args=_fake_server(tmp_path, "usage-update-verified"), cwd=str(tmp_path)
     )
     client_module = sys.modules["antigravity_acp_130.client"]
-    # Dynamic canary: the consumption-semantics verdict is earned at runtime,
-    # not granted by a version pin.  Seed the store as if this identity had
-    # already passed five growth-consistent turns (verdict derivation itself
-    # is covered in tests/test_dynamic_usage_semantics_canary.py).
-    for _ in range(5):
-        client_module.conversation_registry.record_semantics_evidence(
-            "antigravity-acp|Google Antigravity|1.4.0", ok=True
-        )
     monkeypatch.setattr(
         client_module, "get_runtime_session_env",
         lambda: ("hermes-session-verified", ""),
@@ -302,12 +300,10 @@ def test_verified_identity_accumulates_consumption_without_synthetic_split(
     assert reply.usage is None  # no session/prompt result usage in this fake
     assert reply.choices[0].message.content == "ok-130"
     telemetry = reply.antigravity_usage_telemetry
-    assert telemetry["server_consumption_semantics"] == "verified"
     assert telemetry["turn_consumption"] == {
         "source": "acp.session/update:usage_update",
-        "scope": "per_model_call_consumption_delta",
+        "scope": "unverified_server_semantics",
         "is_billing_usage": False,
-        "semantics": "verified",
         "model_calls_observed": 3,
         "total_tokens": 650,
     }
@@ -315,13 +311,15 @@ def test_verified_identity_accumulates_consumption_without_synthetic_split(
     entry = store_payload["usage_totals"]["hermes-session-verified"]
     assert entry["summed_tokens"] == 650
     assert entry["frames_observed"] == 3
+    assert entry["semantics"] == "unverified_server_semantics"
     assert "s-1" not in json.dumps(entry)
 
 
-def test_verified_session_sequence_counts_only_real_consumption(
+def test_session_sequence_counts_only_real_consumption(
     monkeypatch, tmp_path, no_slash_env
 ) -> None:
-    """Issue #6 review: full lifecycle on a verified fake server.
+    """Issue #6 review (structural lifecycle, verdict retired by #102): full
+    lifecycle on the sequence fake server.
 
     new-session used=0 -> set_model re-report 0 -> real 500 -> resume with a
     nonzero re-report of 500 arriving outside any prompt window -> real 500.
@@ -335,12 +333,6 @@ def test_verified_session_sequence_counts_only_real_consumption(
         cwd=str(tmp_path),
     )
     client_module = sys.modules["antigravity_acp_130.client"]
-    # Dynamic canary: seed the earned verdict (see the note in
-    # test_verified_identity_accumulates_consumption_without_synthetic_split).
-    for _ in range(5):
-        client_module.conversation_registry.record_semantics_evidence(
-            "antigravity-acp|Google Antigravity|1.4.0", ok=True
-        )
     monkeypatch.setattr(
         client_module, "get_runtime_session_env",
         lambda: ("hermes-session-seq", ""),
@@ -382,30 +374,25 @@ def test_verified_session_sequence_counts_only_real_consumption(
 
 @pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.parametrize("mode", ["prompt-result-usage", "prompt-result-only"])
-def test_prompt_result_usage_is_exposed(monkeypatch, tmp_path, stream, mode) -> None:
+def test_prompt_result_usage_is_never_exposed(monkeypatch, tmp_path, stream, mode) -> None:
+    # Issue #102: the prompt-result breakdown is a per-turn consumption sum,
+    # never a verified single-request occupancy reading, so it may not seed
+    # completion.usage (Core's occupancy anchor) on ANY shape.  The plugin no
+    # longer parses the breakdown at all; the only surviving readings are the
+    # explicitly-scoped occupancy/consumption telemetry.
     client = _load_client(monkeypatch, args=_fake_server(tmp_path, mode), cwd=str(tmp_path))
     reply = client.chat.completions.create(
         model="antigravity-acp", messages=[{"role": "user", "content": "hi"}],
         timeout=10, stream=stream,
     )
     usage = reply[-1].usage if stream else reply.usage
-    assert usage.prompt_tokens == 100
-    assert usage.completion_tokens == 25
-    assert usage.total_tokens == 125
-    assert usage.completion_tokens_details.reasoning_tokens == 5
-    assert usage.prompt_tokens_details.cached_tokens == 30
-
-
-@pytest.mark.parametrize("field,bad", [
-    ("inputTokens", -1), ("outputTokens", True), ("totalTokens", "10"),
-    ("thoughtTokens", -1), ("cachedReadTokens", False), ("cachedWriteTokens", 1.5),
-])
-def test_invalid_prompt_usage_is_rejected(monkeypatch, tmp_path, field, bad) -> None:
-    _load_client(monkeypatch, args=_fake_server(tmp_path, "plain"), cwd=str(tmp_path))
+    assert usage is None
+    telemetry = reply.antigravity_usage_telemetry
+    assert all(value is None for value in telemetry["request_usage"].values())
+    # Removal pin (issue #102): the breakdown parser that used to map these
+    # fields into a Core usage object is gone from the engine.
     module = sys.modules["antigravity_acp_130.client"]
-    usage = {"inputTokens": 10, "outputTokens": 2, "totalTokens": 12}
-    usage[field] = bad
-    assert module._turn_usage_from_prompt_result({"usage": usage}) is None
+    assert not hasattr(module, "_turn_usage_from_prompt_result")
 
 
 def test_zero_usage_update_frames_create_no_totals_entry(monkeypatch, tmp_path, no_slash_env) -> None:

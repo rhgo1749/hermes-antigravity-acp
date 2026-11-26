@@ -20,7 +20,7 @@ Engines (--mode default only):
                through its Hermes-facing facade (model discovery and
                selection, plain response, one harmless harness-owned MCP tool
                parked inside a single held prompt with a sentinel proving
-               delivery, same-conversation follow-up, #87 usage gate,
+               delivery, same-conversation follow-up, #102 usage suppression,
                containment observation, cancellation, direct-child teardown).
                Requires POSIX SIGALRM on the main thread (--timeout bounds
                the run) and exactly one lane: --fake-acp-only (explicit fake
@@ -470,32 +470,23 @@ def _teardown_verdict(exited: list[bool]) -> str:
 
 
 def _usage_verdict(turns: list[dict[str, Any]]) -> tuple[str, str]:
-    """Per reported turn the engine may accept only a parser-valid, plausible
-    report: valid+plausible accepted, or invalid/implausible rejected, is
-    contract success.  Breaches (fail): accepting an invalid or implausible
-    report, rejecting a valid plausible one, or surfacing usage the server
-    never reported.  Any-turn breach fails the whole run; nothing reported is
-    inconclusive."""
-    if any(not t["server_reported"] and t["engine_accepted"] for t in turns):
+    """Issue #102 contract: the ACP ``session/prompt`` result usage is a
+    per-turn CONSUMPTION sum over the server's internal model calls, never a
+    verified single-request occupancy reading, so it may NEVER surface as
+    ``completion.usage`` — Hermes Core anchors context occupancy (and its
+    premature-compaction decision) on that field.  Surfacing it fails the
+    contract, whether or not the server reported it (surfacing an
+    unreported figure is invented usage).  If the server never reported any
+    usage, the contamination channel was never exercised: NOT OBSERVED
+    (inconclusive), never a PASS.
+    """
+    if any(not t["server_reported"] and t["engine_surfaced_usage"] for t in turns):
         return "invented_usage", "fail"
-    reported = [t for t in turns if t["server_reported"]]
-    if not reported:
+    if any(t["engine_surfaced_usage"] for t in turns):
+        return "surfaced_consumption_sum", "fail"
+    if not any(t["server_reported"] for t in turns):
         return "unavailable", "inconclusive"
-    if any(t["engine_accepted"] and not t["report_valid"] for t in reported):
-        return "invalid_accepted", "fail"
-    if any(t["engine_accepted"] and not t["plausible"] for t in reported):
-        return "anomalous_accepted", "fail"
-    if any(not t["engine_accepted"] and t["report_valid"] and t["plausible"]
-           for t in reported):
-        return "plausible_rejected", "fail"
-    accepted = [t for t in reported if t["engine_accepted"]]
-    if not accepted:
-        if all(not t["report_valid"] for t in reported):
-            return "invalid_rejected", "pass"
-        return "anomalous_rejected", "pass"
-    if len(accepted) == len(reported):
-        return "plausible", "pass"
-    return "mixed", "pass"
+    return "suppressed", "pass"
 
 
 def _cancel_verdict(probe: dict[str, Any]) -> str:
@@ -1339,7 +1330,6 @@ def run_parked(args, module, recorder: FrameRecorder, evidence_dir: Path,
     parked_acp = importlib.import_module(pkg + ".parked.acp_connection")
     parked_session = importlib.import_module(pkg + ".parked.session")
     parked_usage = importlib.import_module(pkg + ".parked.usage_contract")
-    parked_conv = importlib.import_module(pkg + ".parked.conversation")
     parked_upstream = importlib.import_module(pkg + ".parked._upstream")
     client_module = importlib.import_module(pkg + ".client")
 
@@ -1563,52 +1553,25 @@ def run_parked(args, module, recorder: FrameRecorder, evidence_dir: Path,
                 "pass" if follow_up["same_session_no_new"] else "fail"
             )
 
-            # Usage contract (#87): judge EVERY turn independently against
-            # the same gate the engine applies (turn 1's local estimate uses
-            # the full turn1_messages transcript, matching the resume the
-            # prompt result actually arrived on).  Any accepted/rejected vs
-            # plausible/anomalous mismatch on any turn fails the contract.
+            # Usage contract (issue #102): the server's prompt-result usage is
+            # a consumption sum and must NEVER surface as completion.usage on
+            # ANY turn (plausible, inflated, or malformed shapes alike).  The
+            # engine surfacing it fails the contract; the server never
+            # reporting it is NOT OBSERVED.
             observations = getattr(third, "antigravity_usage_observations", None)
-            gate_rejection_logged = any(
-                "rejected" in line for line in engine_logs.messages)
             prompt_ids = [entry["frame"].get("id")
                           for entry in out_frames("session/prompt")][:2]
             turn_locals = [parked_usage.transcript_tokens(turn1_messages),
                            parked_usage.transcript_tokens(follow_messages)]
             usage_turns: list[dict[str, Any]] = []
-            baseline = None  # (reported_in, local) of the last accepted report
             for raw_usage, completion, local in zip(
                     (server_prompt_usage(pid) for pid in prompt_ids),
                     (turn1_completion, third), turn_locals):
-                accepted = getattr(completion, "usage", None) is not None
-                turn = {"server_reported": raw_usage is not None,
-                        "report_valid": False,
-                        "engine_accepted": accepted,
-                        "plausible": None}
-                if raw_usage is not None:
-                    # Same parser the engine gates on: a report it rejects as
-                    # malformed must never be judged plausible here (that was
-                    # a false FAIL when the engine behaved correctly).
-                    consumption = parked_conv._consumption_from_prompt_result(
-                        {"usage": raw_usage})
-                    turn["report_valid"] = consumption is not None
-                    if consumption is None:
-                        turn["plausible"] = False
-                    elif not local:
-                        turn["plausible"] = False
-                    else:
-                        reported_in = consumption["input_tokens"]
-                        if baseline is None:
-                            plausible = parked_usage.first_turn_report_plausible(
-                                reported=reported_in, local=local)
-                        else:
-                            plausible, _, _ = parked_usage.reported_usage_growth_consistent(
-                                prev_reported=baseline[0], reported=reported_in,
-                                prev_local=baseline[1], local=local)
-                        turn["plausible"] = plausible
-                        if accepted:
-                            baseline = (reported_in, local)
-                usage_turns.append(turn)
+                usage_turns.append({
+                    "server_reported": raw_usage is not None,
+                    "engine_surfaced_usage": getattr(completion, "usage", None) is not None,
+                    "local_estimate_tokens": local,
+                })
             server_report_status, verdicts["usage_contract"] = _usage_verdict(usage_turns)
 
             usage = getattr(third, "usage", None)
@@ -1623,7 +1586,6 @@ def run_parked(args, module, recorder: FrameRecorder, evidence_dir: Path,
                 "observations_present": bool(observations),
                 "observations": recorder._sanitize(observations, clean_text) if observations else None,
                 "local_estimate_tokens": turn_locals[-1],
-                "gate_rejection_logged": gate_rejection_logged,
                 "billing_claim": "none; server-reported figures are unverified telemetry",
             }
 

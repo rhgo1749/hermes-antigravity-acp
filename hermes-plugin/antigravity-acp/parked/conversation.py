@@ -35,15 +35,7 @@ from dataclasses import replace
 from typing import Any, TypeGuard
 
 from .acp_connection import AcpConnection, AcpError
-from .usage_contract import (
-    context_limit_from_usage_update,
-    first_turn_report_plausible,
-    report_within_context_limit,
-    reported_usage_growth_consistent,
-    transcript_tokens,
-    usage_update_valid,
-    valid_context_limit,
-)
+from .usage_contract import usage_update_valid
 from .matcher import (
     TurnView,
     IMAGE_PART_TYPES,
@@ -113,22 +105,22 @@ def degenerate(text: str) -> bool:
     return bool(stripped) and len(stripped) <= 8 and all(unicodedata.category(c).startswith("P") for c in stripped)
 
 
-# ---- usage semantics (ported from the old engine's verified contract; docs/acp-usage-telemetry.md) ----------
+# ---- usage semantics (issue #102 contract; docs/acp-usage-telemetry.md) ------------------------------------
 # ACP ``usage_update`` frames carry per-model-call consumption DELTA observations (``used``/``size``) whose
 # server semantics are NOT verified — the canonical doc is explicit that ``used`` is not cumulative context
 # occupancy and never billing. Reporting them as ``prompt_tokens`` makes every Hermes reader integrate
 # frame snapshots as consumption (issue #6 class; #194 chain audit: 25.39M "tokens" that were a frame
 # integral), so they are exposed ONLY as an explicitly unverified observation channel.
-# ``completion.usage`` is fed ONLY by the server's own ``session/prompt`` result breakdown, and only after a
-# growth-consistency gate against this adapter's local transcript estimate (2026-11-23 incident: a ~31K
-# transcript reported as ~1.07M fired the Core compression gate twice early).
+# ``completion.usage`` is ALWAYS None: the ``session/prompt`` result breakdown is a per-turn consumption
+# sum, never a verified single-request occupancy reading, and Core treats prompt_tokens as its occupancy
+# anchor. Core's local-estimate fallback governs compression. The magnitude gates that used to police the
+# breakdown (8x growth #87, window cap #99) and their baselines/limit tracking were retired with #102.
 _CONTEXT_OBSERVATION_SOURCE = "acp.session/update:usage_update"
 _USAGE_OBSERVATION_SEMANTICS = ("usage_update.used is per-model-call consumption delta, not billing usage "
                                 "and not verified cumulative context occupancy; size is the context window")
 _USAGE_SCOPE_UNVERIFIED = "unverified_server_semantics"  # no runtime verdict store here: label honestly
-# Gate constants, tolerance, first-turn/growth decisions and the token
-# estimator live in ONE owner shared with the Replay engine:
-# ``usage_contract.py`` (issue #87 drift).  Do not re-fork them here.
+# Frame validity and the token estimator live in ONE owner shared with the
+# Replay engine: ``usage_contract.py``.  Do not re-fork them here.
 
 
 def _nonnegative_int(value: Any) -> TypeGuard[int]:
@@ -694,13 +686,8 @@ class Conversation:
         self.owner_token: threading.Event | None = None
         self.text: list[str] = []
         self.reasoning: list[str] = []
-        self.usage: dict[str, int] | None = None  # consumption: session/prompt RESULT breakdown only (gated)
         self.occupancy: dict[str, int | float] | None = None  # usage_update used/size: occupancy reading, never billing
         self.frame_usage: dict[str, int] | None = None  # usage_update token fields: telemetry only
-        self._usage_baseline: tuple[int, int] | None = None  # (accepted reported input, local estimate)
-        self._context_limit: int | None = None  # confirmed context window for the active model
-        self._context_limit_model: str = ""
-        self._context_limit_effective_model: str = ""
         self.images = _Images()  # image numbering of the current ACP session
         self._seen_sys_msgs: set[str] = set()  # sha256 of large <system-message> blocks already sent in this session
         self.fence = fence or "TOOL-OUTPUT-" + secrets.token_hex(4)  # unguessable to tool output, stable across replays
@@ -756,12 +743,6 @@ class Conversation:
             logger.info("acp-mcp turn: %s%s", decision.kind, f" ({why})" if why else "")
             if decision.kind == "guest":
                 return {"guest": True}
-            if decision.kind != "resume_held":
-                active_model = f"{str(model or '').strip()}|{str(thinking or '').strip()}"
-                if active_model != self._context_limit_model:
-                    self._context_limit = None
-                    self._context_limit_model = active_model
-                    self._context_limit_effective_model = ""
             self.owner_token = token
             if decision.kind == "resume_held":
                 gen = self.gen
@@ -771,7 +752,7 @@ class Conversation:
                     call.answer(*tool_answer(decision.tool_results.get(call.id, ""), self._seen_sys_msgs))
                 self.handed = []
                 self.last_activity = time.monotonic()
-                self.text, self.reasoning, self.usage = [], [], None
+                self.text, self.reasoning = [], []
                 self.occupancy, self.frame_usage = None, None
             elif decision.kind == "continue":
                 gen = self.gen
@@ -916,14 +897,6 @@ class Conversation:
             else:
                 self.server, self.session = server, session
                 self.tools_fp, self.model = tools_fp, f"{model or ''}|{thinking or ''}"
-                effective_model = str(getattr(session, "effective_model", "") or "").strip()
-                if effective_model:
-                    if (
-                        self._context_limit_effective_model
-                        and effective_model != self._context_limit_effective_model
-                    ):
-                        self._context_limit = None
-                    self._context_limit_effective_model = effective_model
                 self.guard, self.guard_refusals = trailing_tool_round(messages), 0
                 self.view = _inflight_view(messages)
                 self.images = _Images()
@@ -943,7 +916,7 @@ class Conversation:
         assert session is not None
         if self.server is not None:
             self.server.clear_completed()
-        self.text, self.reasoning, self.usage = [], [], None
+        self.text, self.reasoning = [], []
         self.occupancy, self.frame_usage = None, None
         self.last_activity = time.monotonic()
         leftover: list[dict[str, Any]] = []
@@ -1035,8 +1008,8 @@ class Conversation:
             elif kind == "agent_thought_chunk" and content.get("type", "text") == "text":
                 self.reasoning.append(str(content.get("text") or ""))
             elif kind == "usage_update":
-                # Frames feed the OCCUPANCY and telemetry channels only; they never reach ``self.usage``
-                # (consumption), which is fed exclusively by the session/prompt result breakdown.
+                # Frames feed the OCCUPANCY and telemetry channels only; since issue #102
+                # nothing feeds ``completion.usage`` (Core's occupancy anchor stays None).
                 if usage_update_valid(u):
                     occ: dict[str, int | float] = dict(self.occupancy or {})
                     for key in ("used", "size"):
@@ -1049,11 +1022,6 @@ class Conversation:
                             )
                     if occ:
                         self.occupancy = occ
-                    limit = context_limit_from_usage_update(u)
-                    if limit is not None:
-                        with self.lock:
-                            if self.gen == gen:
-                                self._context_limit = limit
                 fu: dict[str, int] = dict(self.frame_usage or {})
                 for src_k, dst_k in (("inputTokens", "input_tokens"), ("outputTokens", "output_tokens"),
                                      ("input_tokens", "input_tokens"), ("output_tokens", "output_tokens")):
@@ -1077,52 +1045,6 @@ class Conversation:
         if self.frame_usage:
             obs["frame_tokens"] = dict(self.frame_usage)
         return obs
-
-    def _gate_turn_consumption(self, result: dict[str, Any],
-                               messages: list[dict[str, Any]],
-                               *,
-                               context_limit: Any = None) -> dict[str, int] | None:
-        """Consumption for this turn: the prompt-result breakdown, gated on window cap & growth consistency.
-
-        A rejected report yields ``None`` so Hermes falls back to its own token estimate instead of
-        compacting against a number this adapter cannot vouch for; the last trusted baseline is kept,
-        so a permanently inflated server keeps getting rejected.
-        """
-        consumption = _consumption_from_prompt_result(result)
-        if consumption is None:
-            return None
-        reported = consumption["input_tokens"]
-        effective_limit = getattr(self, "_context_limit", None) if context_limit is None else context_limit
-        if not report_within_context_limit(reported=reported, context_limit=effective_limit):
-            limit = valid_context_limit(effective_limit)
-            logger.warning(
-                "acp-mcp: reported inputTokens %d rejected: exceeds active model context window %s; "
-                "Hermes falls back to its own token estimate this turn",
-                reported,
-                limit if limit is not None else effective_limit,
-            )
-            return None
-        local = transcript_tokens(messages)
-        baseline = self._usage_baseline
-        if baseline is None:
-            # First turn (or first after a restart): gate the absolute report
-            # against the local transcript estimate (shared contract; the
-            # Replay engine skipped this and shipped issue #87).  A rejected
-            # first report leaves no baseline, so turn two is gated on its own.
-            if not first_turn_report_plausible(reported=reported, local=local):
-                logger.warning("acp-mcp: first-turn inputTokens %d rejected: diverges from local transcript "
-                               "estimate %d beyond tolerance; Hermes falls back to its own estimate", reported, local)
-                return None
-            self._usage_baseline = (reported, local)
-            return consumption
-        ok, actual, expected = reported_usage_growth_consistent(
-            prev_reported=baseline[0], reported=reported, prev_local=baseline[1], local=local)
-        if ok:
-            self._usage_baseline = (reported, local)
-            return consumption
-        logger.warning("acp-mcp: reported inputTokens rejected: server growth %d vs local estimate growth %d; "
-                       "Hermes falls back to its own token estimate this turn", actual, expected)
-        return None
 
     def _fail(self, gen: int, reason: str, exc: ProviderError, *, drop_conn: bool = False) -> ProviderError:
         with self.lock:
@@ -1203,9 +1125,14 @@ class Conversation:
                     self.view = view_after(messages)
                     if self.server is not None:
                         self.server.clear_completed()
-                    self.usage = self._gate_turn_consumption(payload.result, messages)
+                    # Issue #102: ``completion.usage`` is always None. The prompt-result
+                    # breakdown is a per-turn consumption sum, never a verified
+                    # single-request occupancy reading, and Core treats prompt_tokens as
+                    # its occupancy anchor; Core's local-estimate fallback governs
+                    # compression. The breakdown stays visible only in the raw prompt
+                    # result (frames) for the live canary's telemetry report.
                 return {"text": "".join(self.text), "reasoning": "".join(self.reasoning), "tool_calls": [],
-                        "finish_reason": payload.finish_reason, "usage": dict(self.usage) if self.usage else None,
+                        "finish_reason": payload.finish_reason, "usage": None,
                         "usage_observation": self._usage_observation()}
             if kind == "guard-loop":
                 self._drain_updates(gen)
