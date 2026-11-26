@@ -14,6 +14,7 @@ same stdio connection.  These tests pin the warm-pool contract:
 from __future__ import annotations
 
 import array
+import errno
 import importlib.util
 import json
 import os
@@ -227,10 +228,48 @@ def test_shutdown_terminates_parked_children(fake, tmp_path) -> None:
     assert all(p.poll() is not None for p in procs)
 
 
-@pytest.mark.skipif(sys.platform != "linux", reason="requires Linux proc start-time identities and fork")
+_PIDFD_UNSUPPORTED_ERRNOS = frozenset(
+    getattr(errno, name)
+    for name in ("ENOSYS", "EPERM", "EACCES", "ENOTSUP", "EOPNOTSUPP", "ENODEV")
+    if hasattr(errno, name)
+)
+
+
+def _linux_pidfd_capability_gap() -> str | None:
+    if sys.platform != "linux":
+        return "requires Linux proc start-time identities, fork, and os.pidfd_open"
+    if not Path("/proc").is_dir():
+        return "requires /proc for start-time identity observation"
+    if not all(hasattr(socket, name) for name in ("socketpair", "SCM_RIGHTS", "MSG_CTRUNC", "CMSG_SPACE")):
+        return "requires AF_UNIX socketpair and SCM_RIGHTS fd passing"
+    if not hasattr(os, "_exit"):
+        return "requires os._exit"
+    if not hasattr(os, "pidfd_open"):
+        return "interpreter build lacks os.pidfd_open"
+    return None
+
+
+def _require_working_pidfd_open() -> None:
+    gap = _linux_pidfd_capability_gap()
+    if gap is not None:
+        pytest.skip(gap)
+    try:
+        probe_fd = os.pidfd_open(os.getpid())
+    except OSError as exc:
+        if exc.errno in _PIDFD_UNSUPPORTED_ERRNOS:
+            pytest.skip(f"kernel/runtime lacks working os.pidfd_open (errno={exc.errno})")
+        raise
+    os.close(probe_fd)
+
+
+@pytest.mark.skipif(
+    _linux_pidfd_capability_gap() is not None,
+    reason=_linux_pidfd_capability_gap() or "requires Linux proc start-time identities, fork, and os.pidfd_open",
+)
 @pytest.mark.parametrize("hold_stdin_open", [False, True])
 def test_parked_fixture_natural_exit_after_owner_hard_exit(fake, tmp_path, hold_stdin_open) -> None:
     """Observe the real fixture and grandchild without signals; retain a writer as a negative control."""
+    _require_working_pidfd_open()
     from scripts.gateway_e2e import _live
 
     _, _, _ = fake
@@ -366,3 +405,40 @@ except BaseException:
         while any(_live(pid, token) for pid, token in identities) and time.monotonic() < deadline:
             time.sleep(0.01)
         assert not any(_live(pid, token) for pid, token in identities), "fixture cleanup left a live process"
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux"
+    or not Path("/proc").is_dir()
+    or not all(hasattr(socket, name) for name in ("socketpair", "SCM_RIGHTS", "MSG_CTRUNC", "CMSG_SPACE")),
+    reason="requires Linux /proc and SCM_RIGHTS fd passing",
+)
+def test_pidfd_guard_distinguishes_unsupported_runtime_from_real_failures(monkeypatch) -> None:
+    monkeypatch.delattr(os, "pidfd_open", raising=False)
+    assert _linux_pidfd_capability_gap() == "interpreter build lacks os.pidfd_open"
+    with pytest.raises(pytest.skip.Exception):
+        _require_working_pidfd_open()
+
+    for err in (errno.ENOSYS, errno.EPERM):
+        def _unsupported(_pid: int, _flags: int = 0, code: int = err) -> int:
+            raise OSError(code, os.strerror(code))
+
+        monkeypatch.setattr(os, "pidfd_open", _unsupported, raising=False)
+        assert _linux_pidfd_capability_gap() is None
+        with pytest.raises(pytest.skip.Exception):
+            _require_working_pidfd_open()
+
+    def _missing_pid(_pid: int, _flags: int = 0) -> int:
+        raise ProcessLookupError(errno.ESRCH, "No such process")
+
+    monkeypatch.setattr(os, "pidfd_open", _missing_pid, raising=False)
+    with pytest.raises(ProcessLookupError):
+        _require_working_pidfd_open()
+
+    def _invalid_arg(_pid: int, _flags: int = 0) -> int:
+        raise OSError(errno.EINVAL, "Invalid argument")
+
+    monkeypatch.setattr(os, "pidfd_open", _invalid_arg, raising=False)
+    with pytest.raises(OSError) as exc_info:
+        _require_working_pidfd_open()
+    assert exc_info.value.errno == errno.EINVAL
