@@ -29,16 +29,30 @@ Server-reported `inputTokens` feeds Hermes Core's compression preflight
 premature compaction. The server binary is opaque (a 714MB ELF; static audit
 is impossible), so every reported turn-usage value must correlate with the
 adapter's own local transcript estimate (`native_tokens`) before it is
-forwarded. Per affinity key the adapter keeps the last trusted
+forwarded. Ahead of the 8x gates, when the server has confirmed a positive finite context
+window (`usage_update.size` emitted during an active `session/prompt` turn for
+the current active model, persisted across turns that omit `usage_update` and
+cleared immediately on model switch), any report with
+`inputTokens > context_limit` is rejected immediately (`report_within_context_limit`
+in `parked/usage_contract.py`) without seeding or updating the baseline (issue #99:
+proportional multi-turn inflation inside the 8x tolerance that exceeded the
+model's physical window). When no confirmed window limit exists yet, the check
+passes through to the 8x gates rather than guessing a limit.
+
+Per affinity key the adapter keeps the last trusted
 `(reported, local)` pair; a turn passes only when the reported growth stays
 within `max(8x, local growth + 64K)` of the local growth (negative growth is
-tolerated within the same slack for context rotation). A rejected turn is
+tolerated within the same slack for context rotation). Proportional inflation
+that remains strictly below the active model's confirmed context window is still
+bounded only by this 8x tolerance. A rejected turn is
 dropped (`dropped_inflated_turn_usage`), the identity's canary verdict is
 demoted, and `completion.usage` becomes `None` for that turn — Core falls back
 to its local estimate instead of a number this adapter cannot vouch for. The
 2026-11-23 incident (1.07M reported against a ~31K transcript on 1.5.2,
-forcing two premature compressions) is the regression case this gate replays
-in `tests/test_dynamic_usage_semantics_canary.py`.
+forcing two premature compressions) and issue #99 window-overflow samples are
+the regression cases this gate replays in
+`tests/test_dynamic_usage_semantics_canary.py` and
+`tests/test_usage_contract_single_owner.py`.
 
 ## Issue #6: no fabricated split in `completion.usage`
 

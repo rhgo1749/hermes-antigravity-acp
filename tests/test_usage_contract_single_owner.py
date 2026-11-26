@@ -61,6 +61,11 @@ CONTRACT_NAMES = {
     "USAGE_GROWTH_FACTOR",
     "USAGE_GROWTH_SLACK_TOKENS",
     "_CJK_RANGES",
+    "valid_context_limit",
+    "nonnegative_usage_number",
+    "usage_update_valid",
+    "context_limit_from_usage_update",
+    "report_within_context_limit",
     "reported_usage_growth_consistent",
     "first_turn_report_plausible",
     "usage_divergence_tolerance",
@@ -149,6 +154,8 @@ def _load_package(monkeypatch, tmp_path: Path):
     contract = importlib.import_module(module_name + ".parked.usage_contract")
     conversation = importlib.import_module(module_name + ".parked.conversation")
     client._TURN_USAGE_BASELINES.clear()
+    if hasattr(client, "_CONVERSATION_CONTEXT_LIMITS"):
+        client._CONVERSATION_CONTEXT_LIMITS.clear()
     return client, contract, conversation
 
 
@@ -167,7 +174,14 @@ def _messages(chars: int) -> list[dict]:
     return [{"role": "user", "content": "x" * chars}]
 
 
-def _parked_gate(conversation, baseline_state, reported: int, messages):
+def _parked_gate(
+    conversation,
+    baseline_state,
+    reported: int,
+    messages,
+    *,
+    context_limit=None,
+):
     """Drive the Parked-MCP gate without a live conversation (pure decision)."""
     conv = object.__new__(conversation.Conversation)
     conv._usage_baseline = baseline_state
@@ -178,25 +192,48 @@ def _parked_gate(conversation, baseline_state, reported: int, messages):
             "totalTokens": reported + 100,
         }
     }
-    kept = conv._gate_turn_consumption(result, messages)
+    if context_limit is None:
+        kept = conv._gate_turn_consumption(result, messages)
+    else:
+        kept = conv._gate_turn_consumption(result, messages, context_limit=context_limit)
     return kept, conv._usage_baseline
 
 
-def _flat_gate(client, affinity: str, reported: int, native: int):
+def _flat_gate(
+    client,
+    affinity: str,
+    reported: int,
+    native: int,
+    *,
+    context_limit=None,
+):
+    kwargs = {}
+    if context_limit is not None:
+        kwargs["context_limit"] = context_limit
     kept = client._guard_reported_turn_usage(
         affinity_key=affinity,
         server_identity="",
         turn_usage=SimpleNamespace(prompt_tokens=reported),
         native_tokens=native,
+        **kwargs,
     )
     return kept, client._TURN_USAGE_BASELINES.get(affinity)
 
 
 def test_engines_share_the_identical_decision_objects(monkeypatch, tmp_path) -> None:
     client, contract, conversation = _load_package(monkeypatch, tmp_path)
+    assert client.valid_context_limit is contract.valid_context_limit
+    assert client.nonnegative_usage_number is contract.nonnegative_usage_number
+    assert client.usage_update_valid is contract.usage_update_valid
+    assert client.context_limit_from_usage_update is contract.context_limit_from_usage_update
+    assert client.report_within_context_limit is contract.report_within_context_limit
     assert client.reported_usage_growth_consistent is contract.reported_usage_growth_consistent
     assert client.first_turn_report_plausible is contract.first_turn_report_plausible
     assert client.estimate_tokens is contract.estimate_tokens
+    assert conversation.valid_context_limit is contract.valid_context_limit
+    assert conversation.usage_update_valid is contract.usage_update_valid
+    assert conversation.context_limit_from_usage_update is contract.context_limit_from_usage_update
+    assert conversation.report_within_context_limit is contract.report_within_context_limit
     assert conversation.reported_usage_growth_consistent is contract.reported_usage_growth_consistent
     assert conversation.first_turn_report_plausible is contract.first_turn_report_plausible
     assert conversation.transcript_tokens is contract.transcript_tokens
@@ -529,3 +566,350 @@ def test_consistent_growth_parity(monkeypatch, tmp_path) -> None:
     assert kept_flat is not None and kept_parked is not None
     assert baseline_flat == (reported2, local2)
     assert baseline_parked == (reported2, local2)
+
+
+@pytest.mark.parametrize("seeded", [False, True])
+@pytest.mark.parametrize("verdict", [True, False])
+@pytest.mark.parametrize("reported", [1_048_576, 1_048_577])
+def test_replay_guard_context_limit_delegates_and_adopts_verdict(
+    monkeypatch, tmp_path, reported, verdict, seeded
+) -> None:
+    client, _contract, _conversation = _load_package(monkeypatch, tmp_path)
+    affinity = f"spy-win-{seeded}-{reported}-{verdict}"
+    if seeded:
+        _flat_gate(client, affinity, 154_735, 150_000)
+
+    calls = []
+    downstream_calls = []
+
+    def spy_limit(*, reported, context_limit):
+        calls.append((reported, context_limit))
+        return verdict
+
+    def spy_downstream(**kw):
+        downstream_calls.append(kw)
+        return (True, 1, 1) if seeded else True
+
+    monkeypatch.setattr(client, "report_within_context_limit", spy_limit)
+    monkeypatch.setattr(
+        client,
+        "reported_usage_growth_consistent" if seeded else "first_turn_report_plausible",
+        spy_downstream,
+    )
+
+    kept, baseline = _flat_gate(
+        client, affinity, reported, 600_000, context_limit=1_048_576
+    )
+    assert calls == [(reported, 1_048_576)], (
+        "Replay guard bypassed the shared window-cap decision"
+    )
+    assert (kept is not None) is verdict
+    if verdict:
+        assert len(downstream_calls) == 1
+        assert baseline == (reported, 600_000)
+    else:
+        assert downstream_calls == [], (
+            "Window-cap rejection must short-circuit before the 8x gates"
+        )
+        assert baseline == ((154_735, 150_000) if seeded else None)
+
+
+@pytest.mark.parametrize("seeded", [False, True])
+@pytest.mark.parametrize("verdict", [True, False])
+@pytest.mark.parametrize("reported", [1_048_576, 1_048_577])
+def test_parked_gate_context_limit_delegates_and_adopts_verdict(
+    monkeypatch, tmp_path, reported, verdict, seeded
+) -> None:
+    _client, _contract, conversation = _load_package(monkeypatch, tmp_path)
+    messages = _messages(_chars_for(600_000))
+    initial_baseline = (154_735, 150_000) if seeded else None
+
+    calls = []
+    downstream_calls = []
+
+    def spy_limit(*, reported, context_limit):
+        calls.append((reported, context_limit))
+        return verdict
+
+    def spy_downstream(**kw):
+        downstream_calls.append(kw)
+        return (True, 1, 1) if seeded else True
+
+    monkeypatch.setattr(conversation, "report_within_context_limit", spy_limit)
+    monkeypatch.setattr(
+        conversation,
+        "reported_usage_growth_consistent" if seeded else "first_turn_report_plausible",
+        spy_downstream,
+    )
+
+    kept, baseline = _parked_gate(
+        conversation, initial_baseline, reported, messages, context_limit=1_048_576
+    )
+    assert calls == [(reported, 1_048_576)], (
+        "Parked gate bypassed the shared window-cap decision"
+    )
+    assert (kept is not None) is verdict
+    if verdict:
+        assert len(downstream_calls) == 1
+        assert baseline == (reported, 600_000)
+    else:
+        assert downstream_calls == [], (
+            "Window-cap rejection must short-circuit before the 8x gates"
+        )
+        assert baseline == initial_baseline
+
+
+WINDOW_CAP_CASES = [
+    pytest.param(1_048_575, 1_000_000, 1_048_576, True, id="limit-minus-one-accept"),
+    pytest.param(1_048_576, 1_000_000, 1_048_576, True, id="limit-exact-accept"),
+    pytest.param(1_048_577, 1_000_000, 1_048_576, False, id="limit-plus-one-reject"),
+    pytest.param(1_048_577, 1_000_000, None, True, id="unknown-limit-falls-through"),
+    pytest.param(1_048_577, 1_000_000, 0, True, id="zero-limit-ignored"),
+    pytest.param(1_048_577, 1_000_000, -1, True, id="negative-limit-ignored"),
+    pytest.param(1_048_577, 1_000_000, True, True, id="bool-limit-ignored"),
+    pytest.param(1_048_577, 1_000_000, float("nan"), True, id="nan-limit-ignored"),
+]
+
+
+@pytest.mark.parametrize("seeded", [False, True])
+@pytest.mark.parametrize(
+    ("reported", "local", "context_limit", "accept"), WINDOW_CAP_CASES
+)
+def test_window_cap_boundary_matrix_parity(
+    monkeypatch, tmp_path, seeded, reported, local, context_limit, accept
+) -> None:
+    client, _contract, conversation = _load_package(monkeypatch, tmp_path)
+    affinity = f"win-edge-{seeded}-{reported}-{context_limit}"
+    prev = (950_000, 940_000) if seeded else None
+    if seeded:
+        _flat_gate(client, affinity, prev[0], prev[1])
+
+    kept_flat, baseline_flat = _flat_gate(
+        client, affinity, reported, local, context_limit=context_limit
+    )
+    kept_parked, baseline_parked = _parked_gate(
+        conversation,
+        prev,
+        reported,
+        _messages(_chars_for(local)),
+        context_limit=context_limit,
+    )
+    assert (kept_flat is not None) is accept
+    assert (kept_parked is not None) is accept
+    expected = (reported, local) if accept else prev
+    assert baseline_flat == expected
+    assert baseline_parked == expected
+
+
+@pytest.mark.parametrize(
+    ("reported", "local"),
+    [
+        (1_077_303, 300_000),
+        (2_610_753, 600_000),
+        (6_164_316, 850_000),
+        (11_227_431, 1_400_000),
+    ],
+)
+def test_issue_99_proportional_inflation_parity(
+    monkeypatch, tmp_path, reported, local
+) -> None:
+    """Issue #99 samples: proportional inflation passes 8x growth gate without a window cap,
+    and MUST be rejected in both engines when the 1,048,576 context window is known.
+    """
+    client, contract, conversation = _load_package(monkeypatch, tmp_path)
+    baseline = (154_735, 150_000)
+
+    # Confirm the proportional numbers indeed cleared the 8x growth gate pre-fix.
+    ok_without_cap, _, _ = contract.reported_usage_growth_consistent(
+        prev_reported=baseline[0],
+        reported=reported,
+        prev_local=baseline[1],
+        local=local,
+    )
+    assert ok_without_cap is True
+
+    _flat_gate(client, f"i99-{reported}", baseline[0], baseline[1])
+    kept_flat, baseline_flat = _flat_gate(
+        client, f"i99-{reported}", reported, local, context_limit=1_048_576
+    )
+    kept_parked, baseline_parked = _parked_gate(
+        conversation,
+        baseline,
+        reported,
+        _messages(_chars_for(local)),
+        context_limit=1_048_576,
+    )
+    assert kept_flat is None
+    assert kept_parked is None
+    assert baseline_flat == baseline
+    assert baseline_parked == baseline
+
+
+def _parked_drain_frame(
+    conversation,
+    frame: dict,
+    *,
+    prior_limit: int | None = None,
+    prior_occupancy: dict | None = None,
+):
+    """Drive Parked-MCP Conversation._drain_updates on one frame."""
+    import queue
+    import threading
+
+    q: queue.Queue = queue.Queue()
+    q.put(frame)
+    conv = object.__new__(conversation.Conversation)
+    conv.lock = threading.Lock()
+    conv.gen = 1
+    conv.session = SimpleNamespace(updates=q)
+    conv.occupancy = dict(prior_occupancy) if prior_occupancy is not None else None
+    conv.frame_usage = None
+    conv._context_limit = prior_limit
+    conv.last_activity = 0.0
+    conv._drain_updates(1)
+    return conv.occupancy, conv._context_limit
+
+
+def _replay_capture_frame(
+    client,
+    frame: dict,
+    *,
+    prior_limit: int | None = None,
+    prior_occupancy: dict | None = None,
+):
+    """Drive Replay _capture_context_occupancy on one frame."""
+    stats: dict = {
+        "turn_id_hash": "sha256:single-owner-test",
+        client._PROMPT_TURN_ACTIVE_KEY: True,
+    }
+    if prior_limit is not None:
+        stats["context_limit"] = prior_limit
+    if prior_occupancy is not None:
+        stats["context_occupancy"] = dict(prior_occupancy)
+    client._capture_context_occupancy(frame, stats)
+    occ = stats.get("context_occupancy")
+    if isinstance(occ, dict):
+        occ = {k: occ[k] for k in ("used", "size") if k in occ}
+    return occ, stats.get("context_limit")
+
+
+@pytest.mark.parametrize("limit_verdict", [None, 42_424])
+def test_both_engines_delegate_usage_update_context_limit_to_contract(
+    monkeypatch, tmp_path, limit_verdict
+) -> None:
+    """Both Replay _capture_context_occupancy and Parked-MCP _drain_updates must
+    call and adopt the shared usage_update_valid / context_limit_from_usage_update."""
+    client, _contract, conversation = _load_package(monkeypatch, tmp_path)
+    frame = {"sessionUpdate": "usage_update", "used": 500, "size": 20_000}
+
+    replay_valid_calls = []
+    replay_limit_calls = []
+
+    def spy_replay_valid(u):
+        replay_valid_calls.append(u)
+        return True
+
+    def spy_replay_limit(u):
+        replay_limit_calls.append(u)
+        return limit_verdict
+
+    monkeypatch.setattr(client, "usage_update_valid", spy_replay_valid)
+    monkeypatch.setattr(client, "context_limit_from_usage_update", spy_replay_limit)
+    _occ_r, limit_r = _replay_capture_frame(client, frame)
+    assert replay_valid_calls == [frame]
+    assert replay_limit_calls == [frame]
+    assert limit_r == limit_verdict
+
+    parked_valid_calls = []
+    parked_limit_calls = []
+
+    def spy_parked_valid(u):
+        parked_valid_calls.append(u)
+        return True
+
+    def spy_parked_limit(u):
+        parked_limit_calls.append(u)
+        return limit_verdict
+
+    monkeypatch.setattr(conversation, "usage_update_valid", spy_parked_valid)
+    monkeypatch.setattr(conversation, "context_limit_from_usage_update", spy_parked_limit)
+    _occ_p, limit_p = _parked_drain_frame(conversation, frame)
+    assert parked_valid_calls == [frame]
+    assert parked_limit_calls == [frame]
+    assert limit_p == limit_verdict
+
+
+USAGE_UPDATE_PARITY_CASES = [
+    pytest.param(
+        {"sessionUpdate": "usage_update", "used": 500, "size": 20_000},
+        None,
+        {"used": 500, "size": 20_000},
+        20_000,
+        id="valid-full-frame",
+    ),
+    pytest.param(
+        {"sessionUpdate": "usage_update", "used": "bogus", "size": 20_000},
+        15_000,
+        None,
+        15_000,
+        id="corrupt-used-vetoes-size",
+    ),
+    pytest.param(
+        {"sessionUpdate": "usage_update", "used": -1, "size": 20_000},
+        15_000,
+        None,
+        15_000,
+        id="negative-used-vetoes-size",
+    ),
+    pytest.param(
+        {"sessionUpdate": "usage_update", "used": True, "size": 20_000},
+        15_000,
+        None,
+        15_000,
+        id="bool-used-vetoes-size",
+    ),
+    pytest.param(
+        {"sessionUpdate": "usage_update", "used": 500, "size": float("nan")},
+        15_000,
+        None,
+        15_000,
+        id="nan-size-rejected",
+    ),
+    pytest.param(
+        {"sessionUpdate": "usage_update", "size": 30_000},
+        15_000,
+        {"size": 30_000},
+        30_000,
+        id="valid-partial-size-only",
+    ),
+    pytest.param(
+        {"sessionUpdate": "usage_update", "used": 500},
+        15_000,
+        {"used": 500},
+        15_000,
+        id="valid-partial-used-only-keeps-limit",
+    ),
+    pytest.param(
+        {"sessionUpdate": "usage_update", "used": 500, "size": 0},
+        15_000,
+        {"used": 500, "size": 0},
+        15_000,
+        id="zero-size-keeps-prior-limit",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("frame", "prior_limit", "expected_occ", "expected_limit"),
+    USAGE_UPDATE_PARITY_CASES,
+)
+def test_usage_update_whole_frame_validity_parity(
+    monkeypatch, tmp_path, frame, prior_limit, expected_occ, expected_limit
+) -> None:
+    client, _contract, conversation = _load_package(monkeypatch, tmp_path)
+    occ_r, limit_r = _replay_capture_frame(client, frame, prior_limit=prior_limit)
+    occ_p, limit_p = _parked_drain_frame(conversation, frame, prior_limit=prior_limit)
+    assert occ_r == expected_occ
+    assert occ_p == expected_occ
+    assert limit_r == expected_limit
+    assert limit_p == expected_limit

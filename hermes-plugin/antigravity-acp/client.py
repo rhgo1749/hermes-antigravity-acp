@@ -25,7 +25,6 @@ import itertools
 from importlib import import_module
 import json
 import logging
-import math
 import os
 import queue
 import re
@@ -80,9 +79,14 @@ from .bridge import (
 )
 # Turn-usage validity contract: ONE owner for both engines (issue #87 drift).
 from .parked.usage_contract import (
+    context_limit_from_usage_update,
     estimate_tokens,
     first_turn_report_plausible,
+    nonnegative_usage_number,
+    report_within_context_limit,
     reported_usage_growth_consistent,
+    usage_update_valid,
+    valid_context_limit,
 )
 
 
@@ -2260,6 +2264,38 @@ _TURN_USAGE_BASELINE_LOCK = threading.Lock()
 # The gate DECISIONS themselves are shared with the Parked-MCP engine in
 # ``parked/usage_contract.py`` — this engine keeps only the state plumbing.
 _TURN_USAGE_BASELINES: dict[str, tuple[int, int]] = {}
+# affinity_key -> (effective_model, confirmed context-window limit).
+_CONVERSATION_CONTEXT_LIMITS: dict[str, tuple[str, int]] = {}
+
+
+def _resolve_conversation_context_limit(
+    *,
+    affinity_key: str,
+    effective_model: str,
+    observed_size: Any = None,
+) -> int | None:
+    """Track the confirmed active-model context window per conversation.
+
+    Persists across turns that omit ``usage_update`` and clears immediately
+    when ``effective_model`` changes so a prior model's limit never caps a
+    newly selected model.  Stateless requests (empty ``affinity_key``) use only
+    their own current observation and never read or share cross-request state.
+    """
+    model_key = str(effective_model or "").strip()
+    observed = valid_context_limit(observed_size)
+    if not affinity_key:
+        return observed
+    with _TURN_USAGE_BASELINE_LOCK:
+        cached = _CONVERSATION_CONTEXT_LIMITS.get(affinity_key)
+        if observed is not None:
+            _CONVERSATION_CONTEXT_LIMITS[affinity_key] = (model_key, observed)
+            return observed
+        if cached is not None:
+            cached_model, cached_limit = cached
+            if cached_model == model_key:
+                return cached_limit
+            _CONVERSATION_CONTEXT_LIMITS.pop(affinity_key, None)
+        return None
 
 
 def _guard_reported_turn_usage(
@@ -2268,8 +2304,9 @@ def _guard_reported_turn_usage(
     server_identity: str,
     turn_usage: Any,
     native_tokens: int,
+    context_limit: Any = None,
 ) -> Any:
-    """Reject server-reported turn usage that diverges from local growth.
+    """Reject server-reported turn usage that exceeds context window or diverges from local growth.
 
     Always-on safety gate for the Core compression trigger: it protects every
     server identity (verified or not) regardless of version.  A rejected turn
@@ -2280,35 +2317,55 @@ def _guard_reported_turn_usage(
     """
     reported = int(getattr(turn_usage, "prompt_tokens", 0) or 0)
     identity = str(server_identity or "")
-    # One critical section per turn: baseline lookup, gate decision, and
-    # re-seed are atomic, so two same-affinity requests can never both pass
-    # their own gate and clobber each other's baseline (a split lookup/seed
-    # let a caller seed from a stale first-turn view).  Evidence and logging
-    # stay outside the lock.
-    with _TURN_USAGE_BASELINE_LOCK:
-        baseline = _TURN_USAGE_BASELINES.get(affinity_key)
-        if baseline is None:
-            # First turn of this conversation: no growth to correlate, so gate
-            # the absolute report against the local transcript estimate (issue
-            # #87: a long first turn reported ~1.4M cumulative inputTokens
-            # against a ~110K transcript and fired Core compression twice).  A
-            # rejected first report seeds nothing, so turn two is gated on its
-            # own; an accepted one becomes the growth baseline.
-            first_turn = True
-            accepted = first_turn_report_plausible(
-                reported=reported, local=native_tokens
-            )
-            actual = expected = 0
-        else:
-            first_turn = False
-            accepted, actual, expected = reported_usage_growth_consistent(
-                prev_reported=baseline[0],
-                reported=reported,
-                prev_local=baseline[1],
-                local=native_tokens,
-            )
-        if accepted:
-            _TURN_USAGE_BASELINES[affinity_key] = (reported, native_tokens)
+    if not report_within_context_limit(reported=reported, context_limit=context_limit):
+        if identity:
+            conversation_registry.record_semantics_evidence(identity, ok=False)
+        conversation_registry.note_usage_frame("dropped_inflated_turn_usage")
+        limit = valid_context_limit(context_limit)
+        logger.warning(
+            "Antigravity ACP reported inputTokens %d rejected: exceeds active model context window %s "
+            "(identity=%s); Core falls back to its own token estimate for compression this turn.",
+            reported,
+            limit if limit is not None else context_limit,
+            identity or "unknown",
+        )
+        return None
+    if not affinity_key:
+        first_turn = True
+        accepted = first_turn_report_plausible(
+            reported=reported, local=native_tokens
+        )
+        actual = expected = 0
+    else:
+        # One critical section per turn: baseline lookup, gate decision, and
+        # re-seed are atomic, so two same-affinity requests can never both pass
+        # their own gate and clobber each other's baseline (a split lookup/seed
+        # let a caller seed from a stale first-turn view).  Evidence and logging
+        # stay outside the lock.
+        with _TURN_USAGE_BASELINE_LOCK:
+            baseline = _TURN_USAGE_BASELINES.get(affinity_key)
+            if baseline is None:
+                # First turn of this conversation: no growth to correlate, so gate
+                # the absolute report against the local transcript estimate (issue
+                # #87: a long first turn reported ~1.4M cumulative inputTokens
+                # against a ~110K transcript and fired Core compression twice).  A
+                # rejected first report seeds nothing, so turn two is gated on its
+                # own; an accepted one becomes the growth baseline.
+                first_turn = True
+                accepted = first_turn_report_plausible(
+                    reported=reported, local=native_tokens
+                )
+                actual = expected = 0
+            else:
+                first_turn = False
+                accepted, actual, expected = reported_usage_growth_consistent(
+                    prev_reported=baseline[0],
+                    reported=reported,
+                    prev_local=baseline[1],
+                    local=native_tokens,
+                )
+            if accepted:
+                _TURN_USAGE_BASELINES[affinity_key] = (reported, native_tokens)
     if accepted:
         if not first_turn and identity:
             conversation_registry.record_semantics_evidence(identity, ok=True)
@@ -2334,14 +2391,6 @@ def _guard_reported_turn_usage(
             identity or "unknown",
         )
     return None
-
-
-def _nonnegative_json_number(value: Any) -> bool:
-    if isinstance(value, bool):
-        return False
-    if isinstance(value, int):
-        return value >= 0
-    return isinstance(value, float) and math.isfinite(value) and value >= 0
 
 
 def _capture_usage_delta(
@@ -2373,10 +2422,7 @@ def _capture_usage_delta(
     if not isinstance(activity_stats, dict):
         conversation_registry.note_usage_frame("dropped_invalid")
         return
-    present = [field for field in ("used", "size") if field in update]
-    if "used" not in present or not all(
-        _nonnegative_json_number(update[field]) for field in present
-    ):
+    if not usage_update_valid(update):
         conversation_registry.note_usage_frame("dropped_invalid")
         return
     # The server never reports a zero delta from `_maybe_send_usage_update`
@@ -2441,23 +2487,19 @@ def _capture_context_occupancy(
         not isinstance(update, dict)
         or not isinstance(activity_stats, dict)
         or not activity_stats.get("turn_id_hash")
-        or str(update.get("sessionUpdate") or "").strip() != "usage_update"
+        or activity_stats.get(_PROMPT_TURN_ACTIVE_KEY) is False
+        or not usage_update_valid(update)
     ):
         return
 
     present = [field for field in ("used", "size") if field in update]
-    if not present or not all(
-        _nonnegative_json_number(update[field]) for field in present
-    ):
-        return
-
     previous = activity_stats.get("context_occupancy")
     merged: dict[str, Any] = {}
     if isinstance(previous, dict):
         merged = {
             field: previous[field]
             for field in ("used", "size")
-            if field in previous and _nonnegative_json_number(previous[field])
+            if field in previous and nonnegative_usage_number(previous[field])
         }
     merged.update({field: update[field] for field in present})
     # The reading's MEANING depends on the server's semantics.  Only a
@@ -2474,6 +2516,9 @@ def _capture_context_occupancy(
         "is_billing_usage": False,
         **merged,
     }
+    limit = context_limit_from_usage_update(update)
+    if limit is not None:
+        activity_stats["context_limit"] = limit
 
 
 _TURN_USAGE_CALLS_KEY = "turn_usage_calls_observed"
@@ -2494,16 +2539,9 @@ def _capture_turn_usage(update: Any, activity_stats: dict[str, Any] | None) -> N
     """
     if (
         not isinstance(update, dict)
-        or str(update.get("sessionUpdate") or "").strip() != "usage_update"
         or not isinstance(activity_stats, dict)
-    ):
-        return
-    # Whole-frame validity mirrors _capture_context_occupancy: a frame with a
-    # present-but-invalid used/size contributes nothing, even when its other
-    # field is well-formed.
-    present = [field for field in ("used", "size") if field in update]
-    if "used" not in present or not all(
-        _nonnegative_json_number(update[field]) for field in present
+        or "used" not in update
+        or not usage_update_valid(update)
     ):
         return
     # Same consumption gates as _capture_usage_delta: the turn sum is a
@@ -2567,7 +2605,7 @@ def _build_usage_telemetry(
             field: context_occupancy[field]
             for field in ("used", "size")
             if field in context_occupancy
-            and _nonnegative_json_number(context_occupancy[field])
+            and nonnegative_usage_number(context_occupancy[field])
         }
         if values:
             # The capture site already labeled the reading's meaning against
@@ -4808,16 +4846,16 @@ class AntigravityACPClient:
                     )
     
             session_id = str(session_result.get("session_id") or "").strip()
+            resumed = bool(session_result.get("resumed"))
+            if affinity_key and session_id and resumed:
+                native_tokens = prior_native_tokens + estimate_tokens(prompt_text)
+            else:
+                native_tokens = estimate_tokens(full_prompt_text)
+            native_tokens = min(
+                native_tokens + estimate_tokens(cleaned_text),
+                _native_token_limit(model),
+            )
             if affinity_key and session_id:
-                resumed = bool(session_result.get("resumed"))
-                if resumed:
-                    native_tokens = prior_native_tokens + estimate_tokens(prompt_text)
-                else:
-                    native_tokens = estimate_tokens(full_prompt_text)
-                native_tokens = min(
-                    native_tokens + estimate_tokens(cleaned_text),
-                    _native_token_limit(model),
-                )
                 denied_request_fingerprint = ""
                 if session_result.get("permission_denied"):
                     denied_request = next(
@@ -4847,23 +4885,34 @@ class AntigravityACPClient:
                 )
                 conversation_registry.put(affinity_key, state)
 
-                # Dynamic canary gate: the compression trigger must never see
-                # a server-reported inputTokens whose growth diverges from the
-                # transcript this adapter actually grew.  Runs for EVERY
-                # identity and version; a rejected turn falls back to Core's
-                # own token estimate instead of compacting against an
-                # inflated number (2026-11-23 incident: 31K transcript
-                # reported as 1.07M, two premature compactions).
-                reported_turn_usage = session_result.get("turn_usage")
-                if reported_turn_usage is not None:
-                    session_result["turn_usage"] = _guard_reported_turn_usage(
-                        affinity_key=affinity_key,
-                        server_identity=str(
-                            session_result.get("server_identity") or ""
-                        ),
-                        turn_usage=reported_turn_usage,
-                        native_tokens=native_tokens,
-                    )
+            # Dynamic canary gate: the compression trigger must never see
+            # a server-reported inputTokens whose growth diverges from the
+            # transcript this adapter actually grew.  Runs for EVERY
+            # request (including stateless llm_backend requests), identity,
+            # and version; a rejected turn falls back to Core's own token
+            # estimate instead of compacting against an inflated number
+            # (2026-11-23 incident: 31K transcript reported as 1.07M, two
+            # premature compactions).
+            context_occupancy = session_result.get("context_occupancy")
+            observed_limit = session_result.get("context_limit")
+            if observed_limit is None and isinstance(context_occupancy, dict):
+                observed_limit = context_occupancy.get("size")
+            resolved_context_limit = _resolve_conversation_context_limit(
+                affinity_key=affinity_key,
+                effective_model=str(session_result.get("effective_model") or model or ""),
+                observed_size=observed_limit,
+            )
+            reported_turn_usage = session_result.get("turn_usage")
+            if reported_turn_usage is not None:
+                session_result["turn_usage"] = _guard_reported_turn_usage(
+                    affinity_key=affinity_key,
+                    server_identity=str(
+                        session_result.get("server_identity") or ""
+                    ),
+                    turn_usage=reported_turn_usage,
+                    native_tokens=native_tokens,
+                    context_limit=resolved_context_limit,
+                )
     
             native_reasoning_details = _native_tool_reasoning_details(native_activity)
             message = SimpleNamespace(
@@ -6262,6 +6311,7 @@ class AntigravityACPClient:
                 session_result["context_occupancy"] = (
                     dict(occupancy) if isinstance(occupancy, dict) else None
                 )
+                session_result["context_limit"] = activity_stats.get("context_limit")
                 # Issue #6 AC4-1: the ONLY source for the generic OpenAI-shaped
                 # usage is the server's own per-turn `usage` breakdown on the
                 # prompt result.  When it is absent or invalid, usage stays
@@ -6301,7 +6351,7 @@ class AntigravityACPClient:
                             int(_turn_sum)
                             if _turn_calls
                             and _turn_sum is not None
-                            and _nonnegative_json_number(_turn_sum)
+                            and nonnegative_usage_number(_turn_sum)
                             else None
                         ),
                     }

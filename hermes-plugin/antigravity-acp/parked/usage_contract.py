@@ -27,6 +27,7 @@ policy.
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 # Deliberately generous (8x plus a flat 64K slack): the server legitimately
@@ -40,6 +41,75 @@ _CJK_RANGES = (
     (0x3400, 0x4DBF), (0x4E00, 0x9FFF), (0xAC00, 0xD7AF), (0xF900, 0xFAFF),
     (0xFE30, 0xFE4F), (0xFF00, 0xFFDC), (0x20000, 0x3134F),
 )
+
+
+def valid_context_limit(limit: Any) -> int | None:
+    """Validate a model context-window token limit; return None when unknown/invalid."""
+    if isinstance(limit, bool):
+        return None
+    if isinstance(limit, int):
+        return limit if limit > 0 else None
+    if isinstance(limit, float):
+        if not math.isfinite(limit) or limit <= 0:
+            return None
+        val = int(limit)
+        return val if val > 0 else None
+    return None
+
+
+def nonnegative_usage_number(value: Any) -> bool:
+    """Validate one numeric field inside an ACP ``usage_update`` frame."""
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return value >= 0
+    return isinstance(value, float) and math.isfinite(value) and value >= 0
+
+
+def usage_update_valid(update: Any) -> bool:
+    """Whole-frame validity for ``usage_update`` ``used``/``size`` fields.
+
+    A frame carrying any present-but-invalid ``used`` or ``size`` value is
+    rejected as a whole so corrupt frames never contribute a sibling field or
+    poison the trusted context-window limit.  Partial frames carrying only one
+    valid field remain valid.
+    """
+    if (
+        not isinstance(update, dict)
+        or str(update.get("sessionUpdate") or "").strip() != "usage_update"
+    ):
+        return False
+    present = [field for field in ("used", "size") if field in update]
+    return bool(present) and all(
+        nonnegative_usage_number(update[field]) for field in present
+    )
+
+
+def context_limit_from_usage_update(update: Any) -> int | None:
+    """Extract a validated positive context-window limit from one ``usage_update``.
+
+    Enforces whole-frame validity of ``used`` and ``size`` before validating
+    the context limit so a corrupt ``used`` field vetoes ``size`` in the same
+    frame, while valid partial frames (``size`` alone) remain accepted.
+    """
+    if not usage_update_valid(update):
+        return None
+    return valid_context_limit(update.get("size"))
+
+
+def report_within_context_limit(*, reported: int, context_limit: Any) -> bool:
+    """Hard ceiling check: prompt input tokens cannot exceed the model's context window.
+
+    Runs ahead of the 8x growth/first-turn gates (issue #99): when the server
+    folds cumulative cache/hidden state into ``inputTokens`` in proportion to
+    transcript growth, the delta still clears 8x tolerance, yet the reported
+    occupancy exceeds the model's physical window limit.  When the window limit
+    is unknown/invalid (``None``), this check passes through to the 8x gates.
+    """
+    limit = valid_context_limit(context_limit)
+    if limit is None:
+        return True
+    return reported <= limit
 
 
 def usage_divergence_tolerance(reference: int) -> int:
