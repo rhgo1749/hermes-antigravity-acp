@@ -59,7 +59,9 @@ DELTA=$((T1S-T0S))
 # active tree). That is NOT attestable idle: FAIL CLOSED (r7 review finding #1:
 # clamping negatives to 0 is fail-open when survivors burn CPU).
 if [ "$DELTA" -lt 0 ]; then echo "IDLE-GATE: ACP-tree churn during window (delta=$DELTA) — cannot attest idle; STOP"; exit 1; fi
-DATA_SRC=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/opt/data"}}{{.Source}}{{end}}{{end}}' hermes)
+DATA_DEST=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' hermes | sed -n 's/^HERMES_HOME=//p' | head -n1)
+[ -n "$DATA_DEST" ] || { echo 'IDLE-GATE: FAIL HERMES_HOME unset on container hermes'; exit 1; }
+DATA_SRC=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "'"$DATA_DEST"'"}}{{.Source}}{{end}}{{end}}' hermes)
 LOG="$DATA_SRC/logs/agent.log"
 [ -f "$LOG" ] || { echo 'IDLE-GATE: FAIL agent.log missing — cannot attest idleness'; exit 1; }
 LOG_AGE=$(( $(date +%s) - $(stat -c %Y "$LOG") ))
@@ -147,7 +149,7 @@ if [ -e "$BASE" ]; then
     rm -rf "$BASE" || { echo 'FAIL: cannot clear stale canary dir even privileged'; exit 1; }
   fi
 fi
-mkdir -p "$BASE/ws"
+mkdir -p "$BASE/workspace"
 # B1. seam source at the EXACT reviewed head
 gh repo clone rhgo1749/hermes-antigravity-acp "$BASE/seam-src"
 git -C "$BASE/seam-src" checkout --quiet --detach 961607aed610f821a7b60b4ea15c9c80d6b3ec46
@@ -161,7 +163,7 @@ echo SEAM-TREE-OK
 # full-state copy (~270G/run) is unacceptable SSD wear. The gate reads
 # config/secrets/ACP-auth state only; everything else regenerates at boot
 # (evidence: the 2026-11-18 bind-probe container started ALL s6 services
-# with an empty /opt/data). Isolation invariant preserved: the canary
+# with an empty HERMES_HOME). Isolation invariant preserved: the canary
 # never shares a state dir with the live gateway. Copies run as root
 # INSIDE a disposable container with the source mounted READ-ONLY (the
 # production state contains root-owned files the host user cannot read
@@ -193,7 +195,7 @@ copyas() { # $1=host src dir (mounted ro), $2=dest name under $BASE, $3=extra ta
 # B2a. config/secrets/identity whitelist — the ONLY production data files
 # the gate semantics depend on (measured 2026-11-18: ~30KB + .hermes 1.5M).
 mkdir -p "$BASE/data" "$BASE/home/.local/opt/antigravity-acp"
-docker run --rm -u 0 -v "$(src /opt/data)":/src:ro -v "$BASE/data":/dst \
+docker run --rm -u 0 -v "$(src "$DATA_DEST")":/src:ro -v "$BASE/data":/dst \
   --entrypoint /bin/bash nousresearch/hermes-agent:v0.23.2 -c '
     set -euo pipefail
     cp /src/config.yaml /src/.env /src/auth.json /dst/
@@ -201,19 +203,19 @@ docker run --rm -u 0 -v "$(src /opt/data)":/src:ro -v "$BASE/data":/dst \
     cp -a /src/.local/bin /dst/.local/bin
     cp -a /src/.hermes /dst/.hermes
     rm -rf /dst/.hermes/cache /dst/.hermes/logs /dst/.hermes/desktop-attachments
-    ln -sfn /opt/data/.hermes/acp-accounts.json /dst/acp-accounts.json
+    ln -sfn "'"$DATA_DEST"'/.hermes/acp-accounts.json" /dst/acp-accounts.json
     chown -R 1000:1000 /dst'
 for f in config.yaml .env auth.json .hermes/acp-accounts.json .local/bin/antigravity-acp-mux.py; do
   [ -s "$BASE/data/$f" ] || { echo "FAIL: whitelist copy missing/empty: $f"; exit 1; }
 done
 echo WHITELIST-COPY-OK
 # B2b. ACP account homes — auth state ONLY. Excluded per account:
-# conversations/ + brain/ history (~7G) and .local (rhgo1746 carries a
+# conversations/ + brain/ history (~7G) and .local (one account carries a
 # duplicate 1G CLI install the live tree never executes — production
 # processes run the MAIN-home 1.4.4, verified from live cmdline). Auth
 # core across 5 accounts measured ~120M (2026-11-18). Block F fires a
 # REAL ACP request, so these credentials are load-bearing.
-copyas "$(src /opt/data/home)/.agy-acp" agy-acp "--exclude=*/conversations --exclude=*/brain --exclude=*/.local"
+copyas "$(src "$DATA_DEST/home")/.agy-acp" agy-acp "--exclude=*/conversations --exclude=*/brain --exclude=*/.local"
 # ACP CLIENT BINARIES ARE NOT COPIED — mounted READ-ONLY in compose
 # (immutable versioned installs: data/.local/opt 1.5.0 + home/.local/opt
 # 1.4.4, ~2.1G; the live tree executes 1.4.4). The never-share-state rule
@@ -279,7 +281,7 @@ services:
     network_mode: bridge          # canary-local; api port published to host loopback only
     ports:
       - "127.0.0.1:18642:8642"
-    working_dir: /ws
+    working_dir: /workspace
     shm_size: "1gb"
     # CapEff a82425fb both). Disposable canary only: bridge network,
     environment:
@@ -289,27 +291,27 @@ services:
       HERMES_SKIP_CONFIG_MIGRATION: "1"
       PYTHONUNBUFFERED: "1"
       HERMES_ANTIGRAVITY_ACP_EXECUTION_MODE: "trusted-coding"
-      HERMES_ANTIGRAVITY_ACP_WORKSPACE: "/ws"
+      HERMES_ANTIGRAVITY_ACP_WORKSPACE: "/workspace"
       HERMES_ANTIGRAVITY_ACP_CGROUP_ROOT: "/sys/fs/cgroup/acp-delegate"
       HERMES_ANTIGRAVITY_ACP_WARM_TTL_SECONDS: "15"
       API_SERVER_KEY: "APIKEYPLACEHOLDER"
       API_SERVER_HOST: "0.0.0.0"
       API_SERVER_PORT: "8642"
     volumes:
-      - { type: bind, source: $HOME/acp-p1/data,       target: /opt/data,               bind: { create_host_path: false } }
-      - { type: bind, source: $HOME/acp-p1/home,       target: /opt/data/home,          bind: { create_host_path: false } }
-      - { type: bind, source: $HOME/acp-p1/agy-acp,    target: /opt/data/home/.agy-acp, bind: { create_host_path: false } }
+      - { type: bind, source: $HOME/acp-p1/data,       target: $DATA_DEST,               bind: { create_host_path: false } }
+      - { type: bind, source: $HOME/acp-p1/home,       target: $DATA_DEST/home,          bind: { create_host_path: false } }
+      - { type: bind, source: $HOME/acp-p1/agy-acp,    target: $DATA_DEST/home/.agy-acp, bind: { create_host_path: false } }
       # ACP client binaries: production trees mounted READ-ONLY (immutable
       # versioned installs; zero copy; isolation rule targets mutable state).
-      - { type: bind, source: "$STATE_BASE"/data/.local/opt/antigravity-acp, target: /opt/data/.local/opt/antigravity-acp, read_only: true, bind: { create_host_path: false } }
-      - { type: bind, source: "$STATE_BASE"/home/.local/opt/antigravity-acp, target: /opt/data/home/.local/opt/antigravity-acp, read_only: true, bind: { create_host_path: false } }
-      - { type: bind, source: $HOME/acp-p1/ws,         target: /ws,                     bind: { create_host_path: false } }
+      - { type: bind, source: "$STATE_BASE"/data/.local/opt/antigravity-acp, target: $DATA_DEST/.local/opt/antigravity-acp, read_only: true, bind: { create_host_path: false } }
+      - { type: bind, source: "$STATE_BASE"/home/.local/opt/antigravity-acp, target: $DATA_DEST/home/.local/opt/antigravity-acp, read_only: true, bind: { create_host_path: false } }
+      - { type: bind, source: $HOME/acp-p1/workspace,  target: /workspace,               bind: { create_host_path: false } }
       - { type: bind, source: $HOME/acp-p1/machine-id, target: /etc/machine-id,         read_only: true, bind: { create_host_path: false } }
       - { type: bind, source: $HOME/acp-p1/seam-src,   target: /acp-seam,               read_only: true, bind: { create_host_path: false } }
 YAML
 sed -i "s/APIKEYPLACEHOLDER/$KEY/" "$BASE/docker-compose.acp-p1.yml"
 grep -q "$KEY" "$BASE/docker-compose.acp-p1.yml" && echo APIKEY-INJECTED-OK
-# The copied /opt/data/.env OVERRIDES container env at runtime
+# The copied HERMES_HOME/.env OVERRIDES container env at runtime
 # (override=True; observed in the 2026-11-18 canary boot warning
 # "API_SERVER_KEY is set in both ... the .env value wins"). Align the copied
 # .env so api_server actually serves the key Blocks D/F/H authenticate with.

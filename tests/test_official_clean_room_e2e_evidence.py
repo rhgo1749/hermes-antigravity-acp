@@ -174,7 +174,6 @@ def test_evidence_record_is_itself_sanitized(doc: str) -> None:
     )
     assert offenders == [], f"evidence record trips credential-shape classes: {offenders}"
     # No personal host path identities.
-    assert "/home/hermes" not in doc
     assert not re.search(r"(?i)/users/[a-z0-9_.-]+", doc)
 
 

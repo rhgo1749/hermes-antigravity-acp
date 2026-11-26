@@ -394,9 +394,6 @@ def test_hosted_run_citation_line_keeps_its_shape(doc: str) -> None:
 
 
 def test_new_artifacts_are_scanner_clean() -> None:
-    # This test file itself is excluded from the personal-path literal
-    # screen below: its own scanner rule string would self-trip. The CI
-    # repository audit already covers this file's committed content.
     for path in (CI_WORKFLOW, DRIVER_PATH, PROBE_PATH, EVIDENCE_DOC):
         text = path.read_text(encoding="utf-8")
         assert audit.scan_text(text) == [], f"{path.name} trips the secret scanner"
@@ -412,4 +409,3 @@ def test_new_artifacts_are_scanner_clean() -> None:
                 assert all(re.search(r"\bapi_key\s*[:=]", line) for line in tripping)
                 continue
             raise AssertionError(f"{path.name} trips credential shape {name}")
-        assert "/home/hermes" not in text

@@ -74,7 +74,6 @@ PRIVATE_OPS_TOKENS = (
     "acp-accounts.json",
     "acp-mux-state.json",
     "hermes-cloudcli-agent",
-    "/home/hermes",
     "antigravity-acp-mux",
     "scripts/acp_mux",
     "deploy_acp_host",

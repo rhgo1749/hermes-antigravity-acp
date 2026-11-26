@@ -162,7 +162,7 @@ def test_native_read_evidence_survives_kind_other_without_exposing_commands(monk
         "kind": "other",
         "title": "Running client_view_file",
         "status": "in_progress",
-        "rawInput": {"absolute_path": "/ws/projects/source.py", "start_line": 20, "end_line": 37},
+        "rawInput": {"absolute_path": "/srv/acp-demo/source.py", "start_line": 20, "end_line": 37},
     }, stats)
     module._capture_native_tool_activity({
         "sessionUpdate": "tool_call_update",
@@ -178,7 +178,7 @@ def test_native_read_evidence_survives_kind_other_without_exposing_commands(monk
     } == {
         "type": "antigravity_native_tool", "tool_call_id": "view-1",
         "title": "Running client_view_file", "kind": "other", "status": "completed",
-        "input": {"absolute_path": "/ws/projects/source.py", "start_line": 20, "end_line": 37},
+        "input": {"absolute_path": "/srv/acp-demo/source.py", "start_line": 20, "end_line": 37},
     }
     assert native_call["origin"] == "unknown"
     assert native_call["tool_call_id_hash"].startswith("sha256:")
@@ -1514,7 +1514,7 @@ def test_stream_preserves_adapter_observed_native_read_evidence(monkeypatch) -> 
         "kind": "read",
         "status": "completed",
         "input": {
-            "absolute_path": "/ws/projects/repo/router.py",
+            "absolute_path": "/srv/acp-demo/repo/router.py",
             "start_line": 40,
             "end_line": 52,
         },
@@ -1745,7 +1745,7 @@ def test_auditable_review_accepts_completed_native_read_evidence(monkeypatch) ->
                     "kind": "read",
                     "status": "completed",
                     "input": {
-                        "absolute_path": "/ws/projects/repo/router.py",
+                        "absolute_path": "/srv/acp-demo/repo/router.py",
                         "start_line": 1,
                         "end_line": 80,
                     },
