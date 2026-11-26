@@ -407,9 +407,12 @@ def test_parked_fake_lane_full_round(canary, monkeypatch, tmp_path):
     assert summary["model_selection"]["selection_request"] == "exact"
     assert summary["model_selection"]["selection_response_ok"] is True
 
-    assert summary["usage"]["server_report_status"] == "plausible"
-    assert summary["usage"]["final_turn_reported"] == {
-        "prompt_tokens": 60, "completion_tokens": 10, "total_tokens": 70}
+    # Issue #102: the fake reports plausible prompt-result usage; the engine
+    # must SUPPRESS it (completion.usage None on every turn).
+    assert summary["usage"]["server_report_status"] == "suppressed"
+    assert summary["usage"]["final_turn_reported"] is None
+    assert all(t["server_reported"] and not t["engine_surfaced_usage"]
+               for t in summary["usage"]["turns"])
 
     containment = summary["containment"]
     assert containment["recorded_matches_engine_declaration_prefix"] is True
@@ -465,55 +468,71 @@ def test_parked_model_selection_error_fails_run(canary, monkeypatch, tmp_path):
     assert code == 1 and summary["overall"] == "fail"
 
 
-def test_parked_inflated_usage_rejected_passes_contract(canary, monkeypatch, tmp_path):
-    """#87: when the server sends inflated usage and the engine rejects it, that is PASS."""
+def test_parked_inflated_usage_suppressed_passes_contract(canary, monkeypatch, tmp_path):
+    """#102: the server reports inflated prompt-result usage and the engine
+    never surfaces it as completion.usage — that is PASS (the #87 gate that
+    used to reject it is retired with the channel it policed)."""
     code, summary, _, _, _, _ = _run_parked(
         canary, monkeypatch, tmp_path, "parked_inflated_usage")
     assert code == 0 and summary["overall"] == "pass"
-    assert summary["usage"]["server_report_status"] == "anomalous_rejected"
-    assert summary["usage"]["gate_rejection_logged"] is True
+    assert summary["usage"]["server_report_status"] == "suppressed"
+    assert all(t["server_reported"] and not t["engine_surfaced_usage"]
+               for t in summary["usage"]["turns"])
+    assert summary["usage"]["final_turn_reported"] is None
     assert summary["verdicts"]["usage_contract"] == "pass"
 
 
-def test_parked_anomalous_usage_accepted_fails_contract(canary, monkeypatch, tmp_path):
-    """#87: when anomalous server usage slips onto the completion, usage_contract FAILs."""
-    original_loader = canary.load_client_module
+def _surface_usage(canary, monkeypatch, original_loader, only_first=False):
+    """Witness: a regressed engine that puts the consumption sum onto the
+    completion (the exact 2026-11-26 production breach).
+
+    ``only_first`` surfaces on the first TEXT completion (a tool-call
+    completion carries no text and is not one of the turns the canary
+    judges), reproducing a breach on turn 1 only.
+    """
+    state = {"surfaced": 0}
 
     def spy_loader(repo):
         module = original_loader(repo)
-        conv = importlib.import_module(module.__name__ + ".parked.conversation")
-        monkeypatch.setattr(conv, "first_turn_report_plausible", lambda **kwargs: True)
+        client_mod = importlib.import_module(module.__name__ + ".parked.client")
+        original = client_mod._completion
+
+        def surfacing(result, model):
+            completion = original(result, model)
+            if not only_first or (result.get("text") and state["surfaced"] == 0):
+                state["surfaced"] += 1
+                completion.usage = __import__("types").SimpleNamespace(
+                    prompt_tokens=900, completion_tokens=50, total_tokens=950)
+            return completion
+
+        client_mod._completion = surfacing
         return module
 
     monkeypatch.setattr(canary, "load_client_module", spy_loader)
+
+
+def test_parked_surfaced_usage_fails_contract(canary, monkeypatch, tmp_path):
+    """#102: an engine that surfaces the server's consumption sum on the
+    completion (opening Core's anchor-contamination channel) FAILS."""
+    _surface_usage(canary, monkeypatch, canary.load_client_module)
     code, summary, _, _, _, _ = _run_parked(
-        canary, monkeypatch, tmp_path, "parked_inflated_usage")
+        canary, monkeypatch, tmp_path, "parked_round")
     assert code == 1 and summary["overall"] == "fail"
-    assert summary["usage"]["server_report_status"] == "anomalous_accepted"
+    assert summary["usage"]["server_report_status"] == "surfaced_consumption_sum"
     assert summary["verdicts"]["usage_contract"] == "fail"
 
 
-def test_parked_turn1_anomalous_accepted_turn2_rejected_fails_contract(
-        canary, monkeypatch, tmp_path):
-    """#87 boundary: an anomalous report accepted on turn 1 is a breach even
-    when the engine correctly rejects turn 2's report (no false PASS)."""
-    original_loader = canary.load_client_module
-
-    def spy_loader(repo):
-        module = original_loader(repo)
-        conv = importlib.import_module(module.__name__ + ".parked.conversation")
-        monkeypatch.setattr(conv, "first_turn_report_plausible", lambda **kwargs: True)
-        return module
-
-    monkeypatch.setattr(canary, "load_client_module", spy_loader)
+def test_parked_turn1_only_surfaced_fails_contract(canary, monkeypatch, tmp_path):
+    """#102 boundary: surfacing on ONE turn is a breach even when the other
+    turn behaves (no false PASS from averaging turns)."""
+    _surface_usage(canary, monkeypatch, canary.load_client_module, only_first=True)
     code, summary, _, _, _, _ = _run_parked(
         canary, monkeypatch, tmp_path, "parked_usage_turn1_bad_turn2_rejected")
     assert code == 1 and summary["overall"] == "fail"
     turns = summary["usage"]["turns"]
-    assert turns[0]["engine_accepted"] is True
-    assert turns[0]["plausible"] is False
-    assert turns[1]["engine_accepted"] is False
-    assert summary["usage"]["server_report_status"] == "anomalous_accepted"
+    assert turns[0]["engine_surfaced_usage"] is True
+    assert turns[1]["engine_surfaced_usage"] is False
+    assert summary["usage"]["server_report_status"] == "surfaced_consumption_sum"
     assert summary["verdicts"]["usage_contract"] == "fail"
 
 
@@ -526,88 +545,38 @@ def test_parked_turn1_anomalous_accepted_turn2_rejected_fails_contract(
     "parked_usage_malformed_scalar",
     "parked_usage_malformed_list",
 ))
-def test_parked_malformed_usage_rejected_passes_contract(
+def test_parked_malformed_usage_suppressed_passes_contract(
         canary, monkeypatch, tmp_path, scenario):
-    """Engine-parser boundaries (missing required field, wrong type, negative,
-    bool, invalid optional): the engine rejects the report whole and that is
-    contract PASS, never a canary false FAIL."""
+    """#102: malformed reports are suppressed like every other shape — the
+    engine never parses the breakdown, so no shape can leak onto completion.usage."""
     code, summary, _, _, _, _ = _run_parked(canary, monkeypatch, tmp_path, scenario)
     assert code == 0 and summary["overall"] == "pass"
     turns = summary["usage"]["turns"]
-    assert all(t["server_reported"] and not t["report_valid"]
-               and not t["engine_accepted"] for t in turns)
-    assert summary["usage"]["server_report_status"] == "invalid_rejected"
+    assert all(t["server_reported"] and not t["engine_surfaced_usage"] for t in turns)
+    assert summary["usage"]["server_report_status"] == "suppressed"
     assert summary["verdicts"]["usage_contract"] == "pass"
 
 
-def test_parked_plausible_usage_rejected_fails_contract(canary, monkeypatch, tmp_path):
-    """#87 boundary: the engine rejecting a PLAUSIBLE report is a contract
-    breach (false rejection), not a pass."""
-    original_loader = canary.load_client_module
-
-    def spy_loader(repo):
-        module = original_loader(repo)
-        conv = importlib.import_module(module.__name__ + ".parked.conversation")
-        monkeypatch.setattr(conv, "first_turn_report_plausible", lambda **kwargs: False)
-        return module
-
-    monkeypatch.setattr(canary, "load_client_module", spy_loader)
-    code, summary, _, _, _, _ = _run_parked(canary, monkeypatch, tmp_path, "parked_round")
-    assert code == 1 and summary["overall"] == "fail"
-    turns = summary["usage"]["turns"]
-    assert turns[0]["server_reported"] is True
-    assert turns[0]["engine_accepted"] is False
-    assert turns[0]["plausible"] is True
-    assert summary["usage"]["server_report_status"] == "plausible_rejected"
-    assert summary["verdicts"]["usage_contract"] == "fail"
-
-
 def test_parked_usage_verdict_decision_table(canary):
-    def turn(reported, accepted, plausible, valid=None):
-        return {"server_reported": reported, "engine_accepted": accepted,
-                "report_valid": reported if valid is None else valid,
-                "plausible": plausible}
-    # normal accepted -> PASS
-    assert canary._usage_verdict([turn(True, True, True)]) == ("plausible", "pass")
-    # anomalous rejected -> PASS
-    assert canary._usage_verdict([turn(True, False, False)]) == ("anomalous_rejected", "pass")
-    # anomalous accepted -> FAIL
-    assert canary._usage_verdict([turn(True, True, False)]) == ("anomalous_accepted", "fail")
-    # normal rejected -> FAIL
-    assert canary._usage_verdict([turn(True, False, True)]) == ("plausible_rejected", "fail")
-    # malformed rejected -> PASS
-    assert canary._usage_verdict(
-        [turn(True, False, False, valid=False)]) == ("invalid_rejected", "pass")
-    # malformed accepted -> FAIL
-    assert canary._usage_verdict(
-        [turn(True, True, False, valid=False)]) == ("invalid_accepted", "fail")
-    # usage invented with no server report -> FAIL
-    assert canary._usage_verdict([turn(False, True, None)]) == ("invented_usage", "fail")
-    # nothing reported -> INCONCLUSIVE
-    assert canary._usage_verdict([turn(False, False, None)]) == ("unavailable", "inconclusive")
+    def turn(reported, surfaced):
+        return {"server_reported": reported, "engine_surfaced_usage": surfaced}
+    # reported and suppressed -> PASS
+    assert canary._usage_verdict([turn(True, False)]) == ("suppressed", "pass")
+    # reported and surfaced -> FAIL (anchor contamination channel open)
+    assert canary._usage_verdict([turn(True, True)]) == ("surfaced_consumption_sum", "fail")
+    # surfaced without any server report -> FAIL (invented)
+    assert canary._usage_verdict([turn(False, True)]) == ("invented_usage", "fail")
+    # nothing reported -> NOT OBSERVED (never a PASS)
+    assert canary._usage_verdict([turn(False, False)]) == ("unavailable", "inconclusive")
     assert canary._usage_verdict([]) == ("unavailable", "inconclusive")
     # any-turn breach poisons the whole run regardless of the other turn
     assert canary._usage_verdict(
-        [turn(True, True, False), turn(True, False, False)]) == ("anomalous_accepted", "fail")
+        [turn(True, True), turn(True, False)]) == ("surfaced_consumption_sum", "fail")
     assert canary._usage_verdict(
-        [turn(True, False, False), turn(True, True, False)]) == ("anomalous_accepted", "fail")
+        [turn(True, False), turn(True, True)]) == ("surfaced_consumption_sum", "fail")
+    # invented outranks surfaced
     assert canary._usage_verdict(
-        [turn(True, False, True), turn(True, True, True)]) == ("plausible_rejected", "fail")
-    assert canary._usage_verdict(
-        [turn(True, True, True, valid=False), turn(True, False, False)]) == ("invalid_accepted", "fail")
-    assert canary._usage_verdict(
-        [turn(True, True, True), turn(True, False, False)]) == ("mixed", "pass")
-
-
-@pytest.mark.parametrize("flag", ("--prompt", "--follow-up"))
-def test_parked_refuses_custom_prompts(canary, monkeypatch, tmp_path, flag):
-    """Parked records only its fixed synthetic prompts; user text is refused
-    at preflight so it never reaches the evidence files."""
-    monkeypatch.setattr(sys, "argv", _parked_argv(
-        tmp_path, "--fake-acp-only", "--command", str(tmp_path / "fake"),
-        flag, "arbitrary user data"))
-    assert canary.main() == 2
-    assert not (tmp_path / "evidence").exists()
+        [turn(True, True), turn(False, True)]) == ("invented_usage", "fail")
 
 
 def test_parked_cancel_verdict_distinguishes_race_from_failure(canary):

@@ -14,6 +14,10 @@ from pathlib import Path
 import hermes_constants
 import providers
 import pytest
+from agent.context_compressor import ContextCompressor
+from agent.model_metadata import estimate_request_tokens_rough
+from agent.turn_context import _preflight_request_tokens
+from agent.usage_anchor import anchored_context_tokens, capture_usage_anchor
 from gateway.session_context import clear_session_vars, set_session_vars
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
@@ -152,12 +156,6 @@ def test_credential_free_fake_acp_initialize_session_under_real_policy_filtering
     monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
     monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
     monkeypatch.setenv("HERMES_ANTIGRAVITY_ACP_STATE_FILE", str(tmp_path / "acp-state.json"))
-    monkeypatch.setenv(
-        "HERMES_ANTIGRAVITY_ACP_SEMANTICS_FILE", str(tmp_path / "acp-semantics.json")
-    )
-    monkeypatch.setenv(
-        "HERMES_ANTIGRAVITY_ACP_LIMIT_STATE_FILE", str(tmp_path / "acp-limits.json")
-    )
     client_module = _load_client(monkeypatch, tmp_path)
     _poison_host_environment(monkeypatch, tmp_path)
     hermes_home = tmp_path / ".hermes"
@@ -230,9 +228,9 @@ for line in sys.stdin:
     params = message.get("params") or {}
     request_id = message.get("id")
     if method == "initialize":
-        # Issue #6 AC4-3: self-report an identity whose consumption verdict
-        # the test seeds (see record_semantics_evidence) so this lane
-        # exercises the verified consumption-accumulation path.
+        # Self-report the production server identity so this lane exercises
+        # the real initialize shape (issue #102: identity no longer gates
+        # anything; consumption telemetry is scope-labeled for every server).
         emit({"jsonrpc": "2.0", "id": request_id, "result": {
             "protocolVersion": 1,
             "agentInfo": {
@@ -651,22 +649,7 @@ def test_public_session_context_persists_model_deltas_and_rejects_bad_frames(
     monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
     state_path = tmp_path / "acp-public-session-context.json"
     monkeypatch.setenv("HERMES_ANTIGRAVITY_ACP_STATE_FILE", str(state_path))
-    monkeypatch.setenv(
-        "HERMES_ANTIGRAVITY_ACP_SEMANTICS_FILE",
-        str(tmp_path / "acp-public-session-semantics.json"),
-    )
-    monkeypatch.setenv(
-        "HERMES_ANTIGRAVITY_ACP_LIMIT_STATE_FILE",
-        str(tmp_path / "acp-public-session-limits.json"),
-    )
     client_module = _load_client(monkeypatch, tmp_path)
-    # Dynamic canary: seed the earned consumption verdict for the identity
-    # this fake self-reports (verdict derivation lives in
-    # tests/test_dynamic_usage_semantics_canary.py).
-    for _ in range(5):
-        client_module.conversation_registry.record_semantics_evidence(
-            "antigravity-acp|Google Antigravity|1.4.0", ok=True
-        )
     client = client_module.AntigravityACPClient(
         command=sys.executable,
         args=[str(_write_usage_update_server(tmp_path))],
@@ -697,16 +680,15 @@ def test_public_session_context_persists_model_deltas_and_rejects_bad_frames(
             clear_session_vars(tokens)
 
         telemetry = response.antigravity_usage_telemetry
-        # Issue #6 AC4-1: without the server's own per-turn breakdown,
-        # completion.usage stays None (Core's designed usage-less path);
-        # observed consumption lives only in scoped turn_consumption telemetry.
+        # Issue #102: completion.usage stays None (Core's designed usage-less
+        # path); observed consumption lives only in scoped turn_consumption
+        # telemetry with the honest unverified scope.
         assert response.usage is None
-        assert telemetry["server_consumption_semantics"] == "verified"
+        assert "server_consumption_semantics" not in telemetry
         assert telemetry["turn_consumption"] == {
             "source": "acp.session/update:usage_update",
-            "scope": "per_model_call_consumption_delta",
+            "scope": "unverified_server_semantics",
             "is_billing_usage": False,
-            "semantics": "verified",
             "model_calls_observed": 1,
             "total_tokens": used,
         }
@@ -714,7 +696,7 @@ def test_public_session_context_persists_model_deltas_and_rejects_bad_frames(
         assert all(value is None for value in telemetry["request_usage"].values())
         assert telemetry["context_occupancy"] == {
             "source": "acp.session/update:usage_update",
-            "scope": "per_model_call_consumption_delta",
+            "scope": "unverified_server_semantics",
             "is_billing_usage": False,
             "used": used,
             "size": 1000,
@@ -791,3 +773,301 @@ def test_credential_free_namespace_snapshot_covers_installed_core() -> None:
 
     for name, namespaces in computed.items():
         _assert_namespace_snapshot_covers(name, namespaces, HERMES_TOP_LEVEL_SNAPSHOT)
+
+
+# ---------------------------------------------------------------------------
+# Issue #102: Core occupancy-anchor boundary — FULL DATA PATH
+# ---------------------------------------------------------------------------
+#
+# Full-path regressions for the production incident class.  Every test here
+# drives the same chain production drove:
+#
+#     ACP server (fake) -> shipped plugin engine (Replay / Parked-MCP)
+#       -> completion -> Core record_response_usage -> normalize_usage
+#       -> capture/set_usage_anchor -> _preflight_request_tokens
+#       -> ContextCompressor.should_compress
+#
+# Fixtures are the measured final-turn ``session/prompt`` usage reports of
+# the four contaminated production sessions (issue #102 incident table),
+# paired with synthetic transcripts of the published durable-transcript
+# sizes.  The RED test replays the PRE-#102 engine completion shape through
+# Core's real recording path; the GREEN tests drive the SHIPPED engines
+# end to end.  No test injects numbers into Core internals directly.
+
+# name: (inputTokens, outputTokens, thoughtTokens, cachedReadTokens,
+#        transcript messages, transcript chars)
+_INCIDENTS = {
+    "S1": (5_373, 20_178, 0, 1_148_804, 143, 380_000),
+    "S2": (5_656, 47_331, 0, 6_028_410, 324, 560_000),
+    "S3": (2_087, 31_559, 0, 2_332_129, 385, 1_020_000),
+    "S4": (0, 306, 17_000, 861_529, 89, 227_000),
+}
+
+_FAKE_AGY = Path(__file__).resolve().parent / "design_c" / "fake_agy.py"
+
+_INCIDENT_ACP_SERVER = r"""import json
+import sys
+
+
+def emit(payload):
+    sys.stdout.write(json.dumps(payload) + "\n")
+    sys.stdout.flush()
+
+
+USAGE = json.loads(sys.argv[1])
+
+
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    params = message.get("params") or {}
+    request_id = message.get("id")
+    if method == "initialize":
+        emit({"jsonrpc": "2.0", "id": request_id, "result": {
+            "protocolVersion": 1,
+            "agentInfo": {"name": "antigravity-acp", "title": "Google Antigravity",
+                          "version": "1.5.2"},
+        }})
+    elif method in ("session/new", "session/resume"):
+        emit({"jsonrpc": "2.0", "id": request_id, "result": {
+            "sessionId": params.get("sessionId") or "incident-native",
+            "configOptions": [{"id": "model", "category": "model",
+                               "currentValue": "model-a",
+                               "options": [{"value": "model-a"}]}],
+        }})
+    elif method in ("session/set_config_option", "session/set_model"):
+        emit({"jsonrpc": "2.0", "id": request_id, "result": {}})
+    elif method == "session/prompt":
+        emit({"jsonrpc": "2.0", "id": request_id, "result": {
+            "stopReason": "end_turn", "usage": USAGE,
+        }})
+"""
+
+
+def _incident_wire(name: str) -> dict:
+    inp, out, thought, cached, _, _ = _INCIDENTS[name]
+    wire = {"inputTokens": inp, "outputTokens": out,
+            "totalTokens": inp + out + thought + cached,
+            "cachedReadTokens": cached}
+    if thought:
+        wire["thoughtTokens"] = thought
+    return wire
+
+
+def _incident_transcript(name: str) -> list:
+    _, _, _, _, n_msgs, n_chars = _INCIDENTS[name]
+    per = max(1, n_chars // n_msgs)
+    filler = "routine multi-turn engineering transcript body. "
+    body = (filler * (per // len(filler) + 1))[:per]
+    return [
+        {"role": "user" if i % 2 == 0 else "assistant",
+         "content": f"turn {i}: {body}"}
+        for i in range(n_msgs)
+    ]
+
+
+def _core_agent():
+    """Minimal agent surface accepted by ``record_response_usage`` across
+    every supported Core era (v0.21.6 floor, stable baseline, main), with a
+    fresh compression gate at the S4 production configuration (window
+    1,048,576 @ 0.7 -> threshold 734,003; ``config_context_length`` keeps
+    resolution credential-free)."""
+    from types import SimpleNamespace
+    return SimpleNamespace(
+        _usage_anchor=None, _turn_base_usage_anchor=None, tools=None,
+        api_mode="chat_completions", provider="antigravity-acp",
+        model="fake-model-a", base_url="",
+        context_compressor=ContextCompressor(
+            model="fake-model-a", threshold_percent=0.7,
+            config_context_length=1_048_576, quiet_mode=True),
+        session_api_calls=0, quiet_mode=True, log_prefix="",
+        verbose_logging=False, platform="cli",
+        _vprint=lambda *a, **k: None, _safe_print=lambda *a, **k: None,
+        _ensure_db_session=lambda: None,
+        _session_db=None, session_id=None, _persist_disabled=True,
+        _session_db_created=False, _turn_route_task="", client=None,
+        session_prompt_tokens=0, session_completion_tokens=0,
+        session_total_tokens=0, session_input_tokens=0,
+        session_output_tokens=0, session_cache_read_tokens=0,
+        session_cache_write_tokens=0, session_reasoning_tokens=0,
+        session_estimated_cost_usd=0.0, session_cost_status=None,
+        session_cost_source=None,
+    )
+
+
+def _record(agent, completion, messages):
+    """Core's REAL response-usage recording path (the agent loop's own
+    fold function): normalize_usage -> anchor capture -> session totals."""
+    from agent.turn_usage import record_response_usage
+    return record_response_usage(
+        agent, completion, messages=messages, api_call_count=1,
+        api_duration=0.1, compression_attempts=0, max_compression_attempts=3)
+
+
+def _legacy_completion(wire: dict):
+    """The PRE-#102 engine completion shape: the prompt-result consumption
+    sum copied into ``usage`` verbatim (witnessed on the pre-fix tree with
+    the S4 payload: prompt_tokens=0, cached=861,529, total=878,835)."""
+    from types import SimpleNamespace
+    return SimpleNamespace(
+        id="chatcmpl-legacy", provider=None,
+        usage=SimpleNamespace(
+            prompt_tokens=wire["inputTokens"],
+            completion_tokens=wire["outputTokens"] + wire.get("thoughtTokens", 0),
+            total_tokens=wire["totalTokens"],
+            prompt_tokens_details=SimpleNamespace(
+                cached_tokens=wire["cachedReadTokens"])))
+
+
+def _replay_completion(incident: str, monkeypatch, tmp_path):
+    """Drive the SHIPPED Replay engine against a server reporting the
+    incident's prompt-result usage; return its completion."""
+    script = tmp_path / f"fake_{incident}_prompt_usage_acp.py"
+    script.write_text(_INCIDENT_ACP_SERVER, encoding="utf-8")
+    client_module = _load_client(monkeypatch, tmp_path)
+    client = client_module.AntigravityACPClient(
+        command=sys.executable,
+        args=[str(script), json.dumps(_incident_wire(incident))],
+        acp_cwd=str(tmp_path), rate_limit_retries=0,
+    )
+    return client.chat.completions.create(
+        model="model-a",
+        messages=[{"role": "user", "content": f"{incident} probe"}],
+        timeout=10,
+    )
+
+
+def _parked_completion(incident: str, monkeypatch, tmp_path):
+    """Drive the SHIPPED Parked-MCP engine (the deployed default) against
+    the design_c fake ACP server reporting the incident's prompt-result
+    usage; return its completion."""
+    client_module = _load_client(monkeypatch, tmp_path)
+    parked = importlib.import_module(client_module.__package__ + ".parked.client")
+    behaviour = json.dumps({"script": [[
+        {"text": "ok"},
+        {"result_usage": _incident_wire(incident)},
+    ]]})
+    client = parked.AntigravityAcpMcpClient(
+        acp_command=sys.executable, acp_args=[str(_FAKE_AGY), behaviour])
+    return client.chat.completions.create(
+        model="model-a",
+        messages=[{"role": "user", "content": f"{incident} probe"}],
+        timeout=30,
+    )
+
+
+@pytest.mark.parametrize("incident", sorted(_INCIDENTS))
+def test_incident_usage_through_real_recording_path_poisons_gate(incident):
+    """RED (full path): the pre-#102 completion shape, fed through Core's
+    REAL record_response_usage, forms an occupancy anchor from the
+    consumption sum and fires Core's own compression gate against the true
+    transcript — the production premature-compaction mechanism, reproduced
+    through the recording path rather than by injecting numbers."""
+    wire = _incident_wire(incident)
+    messages = _incident_transcript(incident)
+    agent = _core_agent()
+    rough = estimate_request_tokens_rough(messages, system_prompt="")
+    _record(agent, _legacy_completion(wire), messages)
+    assert agent._usage_anchor is not None
+    assert agent._usage_anchor["prompt_tokens"] >= wire["cachedReadTokens"]
+    preflight = _preflight_request_tokens(agent, messages, "")
+    assert preflight > 5 * rough  # anchored figure is real usage + delta, never deferred
+    assert agent.context_compressor.should_compress(preflight)  # premature fire
+    assert not agent.context_compressor.should_compress(rough)  # truth: never fires
+
+
+@pytest.mark.parametrize("incident", sorted(_INCIDENTS))
+@pytest.mark.parametrize("engine", ["replay", "parked"])
+def test_shipped_engines_never_poison_core_recording(incident, engine, monkeypatch, tmp_path):
+    """GREEN (full path): both shipped engines, fed the exact incident
+    reports, produce completions that Core's REAL record_response_usage
+    treats as usage-less: no anchor is formed, preflight falls back to the
+    transcript estimate, and the compression gate never fires early."""
+    completion = (_replay_completion if engine == "replay" else _parked_completion)(
+        incident, monkeypatch, tmp_path)
+    messages = _incident_transcript(incident)
+    agent = _core_agent()
+    _record(agent, completion, messages)
+    assert agent._usage_anchor is None
+    rough = estimate_request_tokens_rough(messages, system_prompt="")
+    preflight = _preflight_request_tokens(agent, messages, "")
+    assert preflight <= rough * 1.05  # the local estimate governs
+    assert not agent.context_compressor.should_compress(preflight)
+
+
+def test_tainted_anchor_persists_through_real_usage_less_recording(monkeypatch, tmp_path):
+    """Lifecycle (full path, documented operational consequence): an anchor
+    formed from a pre-#102 completion is NOT cleared by later usage-less
+    recordings — Core's real record_response_usage usage-less path never
+    touches it, so the gate keeps firing early until restart or re-anchor.
+    This is the basis for the restart-on-deploy requirement; no silent DB
+    rewrite is performed anywhere."""
+    wire = _incident_wire("S4")
+    messages = _incident_transcript("S4")
+    agent = _core_agent()
+    _record(agent, _legacy_completion(wire), messages)
+    tainted = agent._usage_anchor
+    assert tainted is not None
+    # Post-#102 steady state: the SHIPPED Replay engine's usage-less completion.
+    _record(agent, _replay_completion("S4", monkeypatch, tmp_path), messages)
+    assert agent._usage_anchor is tainted  # same object: never replaced
+    preflight = _preflight_request_tokens(agent, messages, "")
+    assert preflight >= wire["cachedReadTokens"]
+    assert agent.context_compressor.should_compress(preflight)  # still fires early
+    # Appending turns keeps the anchor matching (prefix fingerprint stable),
+    # so the inflation is not self-healing within the session.
+    grown = messages + [{"role": "user", "content": "one more routine question"}]
+    assert anchored_context_tokens(grown, tainted) is not None
+
+
+def _preflight_agent(anchor):
+    from types import SimpleNamespace
+    return SimpleNamespace(
+        _usage_anchor=anchor, tools=None, api_mode="", provider="antigravity-acp",
+        model="fake-model-a", base_url="",
+    )
+
+
+def _core_compressor() -> ContextCompressor:
+    """Core's real compression gate at the S4 production configuration
+    (window 1,048,576 @ 0.7).  ``config_context_length`` short-circuits
+    endpoint probing, so this stays credential-free; ``should_compress`` is
+    the exact predicate ``_preflight_compression`` consults."""
+    return ContextCompressor(
+        model="fake-model-a",
+        threshold_percent=0.7,
+        config_context_length=1_048_576,
+        quiet_mode=True,
+    )
+
+
+def test_needed_compaction_still_fires_without_anchor_c1():
+    """C1 control: a GENUINELY large transcript with no anchor (the post-#102
+    steady state) still trips Core's compression gate — needed compaction is
+    not suppressed by completion.usage=None."""
+    big = [{"role": "user" if i % 2 == 0 else "assistant",
+            "content": ("routine transcript body. " * 220) + str(i)}
+           for i in range(700)]  # ~3.5MB chars -> ~800K tokens by rough estimate
+    rough = estimate_request_tokens_rough(big, system_prompt="")
+    assert rough > 600_000
+    preflight = _preflight_request_tokens(_preflight_agent(None), big, "")
+    assert preflight >= rough  # the gate sees the real size, undamped
+    assert _core_compressor().should_compress(preflight)
+
+
+def test_needed_compaction_still_fires_with_valid_anchor_c2():
+    """C2 control: a VALID anchor (provider-priced occupancy matching the
+    transcript) keeps driving compaction normally — #102 removes only the
+    contamination channel, not the anchored fast path."""
+    big = [{"role": "user" if i % 2 == 0 else "assistant",
+            "content": ("routine transcript body. " * 220) + str(i)}
+           for i in range(700)]
+    rough = estimate_request_tokens_rough(big, system_prompt="")
+    assert rough > 600_000
+    anchor = capture_usage_anchor(rough, 100, big)
+    assert anchor is not None
+    anchored = anchored_context_tokens(big, anchor)
+    assert anchored is not None and anchored >= rough
+    preflight = _preflight_request_tokens(_preflight_agent(anchor), big, "")
+    assert preflight >= rough
+    assert _core_compressor().should_compress(preflight)

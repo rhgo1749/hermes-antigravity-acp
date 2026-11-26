@@ -6,10 +6,7 @@ Deterministic unit + fixture-contract coverage for the provider-side
 - the bridge copies the attribute unchanged onto StreamChunks (stream parity
   without widening generic OpenAI usage fields),
 - usage_update occupancy remains latest-valid per turn while all valid used
-  deltas accumulate only for an explicit Hermes session,
-- the downstream Core/HGK boundary fixture documents the sessions-default
-  zero/unknown projection and keeps the worker_session_id-missing class
-  separate, without executing Hermes Core or HGK code.
+  deltas accumulate only for an explicit Hermes session.
 
 Fake subprocess / pure units only: no credentials, no Google binary.
 """
@@ -26,7 +23,6 @@ from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 PLUGIN_DIR = ROOT / "hermes-plugin" / "antigravity-acp"
-FIXTURE_PATH = ROOT / "tests" / "fixtures" / "acp-usage-hgk-boundary.json"
 
 
 def _load_client_module(monkeypatch, tmp_path: Path):
@@ -163,7 +159,6 @@ def test_usage_update_deltas_accumulate_for_explicit_hermes_session(monkeypatch,
         "path": "/private/workspace",
         # Issue #6 gates: accumulation requires a behaviorally-verified server
         # identity and an in-flight prompt turn (see _capture_usage_delta).
-        client._SERVER_CONSUMPTION_SEMANTICS_KEY: client._USAGE_SEMANTICS_VERIFIED,
         client._PROMPT_TURN_ACTIVE_KEY: True,
     }
 
@@ -188,10 +183,12 @@ def test_usage_update_deltas_accumulate_for_explicit_hermes_session(monkeypatch,
     assert entry["first_seen"] <= entry["last_seen"]
     assert entry["native_session_id_hash"].startswith("sha256:")
     assert entry["provenance"] == (
-        "acp.usage_update.delta_sum(main-agent-only, may under-report)"
+        "acp.usage_update.delta_sum(main-agent-only, may under-report, "
+        "semantics unverified)"
     )
-    # Issue #33 R2: new writes carry the verified-semantics marker.
-    assert entry["semantics"] == "per_model_call_consumption_delta"
+    # Issue #102: totals carry the honest unverified scope, never the
+    # per-model-call claim the retired verdict system used to earn.
+    assert entry["semantics"] == "unverified_server_semantics"
     serialized = json.dumps(payload)
     assert "raw-native-session-identifier" not in serialized
     assert "session-key-must-not-key-totals" not in serialized
@@ -214,7 +211,6 @@ def test_usage_totals_keep_truthful_model_breakdown_when_switching_back(monkeypa
             {
                 "native_session_id": f"raw-native-{model}",
                 "model": model,
-                client._SERVER_CONSUMPTION_SEMANTICS_KEY: client._USAGE_SEMANTICS_VERIFIED,
                 client._PROMPT_TURN_ACTIVE_KEY: True,
             },
         )
@@ -290,7 +286,6 @@ def test_single_usage_delta_is_recorded_and_absent_identity_is_not_guessed(monke
         {
             "native_session_id": "native-a",
             "model": "model-a",
-            client._SERVER_CONSUMPTION_SEMANTICS_KEY: client._USAGE_SEMANTICS_VERIFIED,
             client._PROMPT_TURN_ACTIVE_KEY: True,
         },
     )
@@ -311,7 +306,6 @@ def test_single_usage_delta_is_recorded_and_absent_identity_is_not_guessed(monke
         {
             "native_session_id": "native-b",
             "model": "model-b",
-            client._SERVER_CONSUMPTION_SEMANTICS_KEY: client._USAGE_SEMANTICS_VERIFIED,
             client._PROMPT_TURN_ACTIVE_KEY: True,
         },
     )
@@ -341,7 +335,6 @@ def test_usage_frame_drop_counters_cover_every_gate(monkeypatch, tmp_path) -> No
         {
             "native_session_id": "native-a",
             "model": "model-a",
-            client._SERVER_CONSUMPTION_SEMANTICS_KEY: client._USAGE_SEMANTICS_VERIFIED,
             client._PROMPT_TURN_ACTIVE_KEY: True,
         },
     )
@@ -351,7 +344,6 @@ def test_usage_frame_drop_counters_cover_every_gate(monkeypatch, tmp_path) -> No
         {"sessionUpdate": "usage_update", "used": 10},
         {
             "model": "model-a",
-            client._SERVER_CONSUMPTION_SEMANTICS_KEY: client._USAGE_SEMANTICS_VERIFIED,
             client._PROMPT_TURN_ACTIVE_KEY: True,
         },
     )
@@ -368,7 +360,6 @@ def test_usage_frame_drop_counters_cover_every_gate(monkeypatch, tmp_path) -> No
         {
             "native_session_id": "native-a",
             "model": "model-a",
-            client._SERVER_CONSUMPTION_SEMANTICS_KEY: client._USAGE_SEMANTICS_VERIFIED,
             client._PROMPT_TURN_ACTIVE_KEY: True,
         },
     )
@@ -376,17 +367,13 @@ def test_usage_frame_drop_counters_cover_every_gate(monkeypatch, tmp_path) -> No
     assert payload["usage_drop_counters"]["frames_seen"] == 3
     assert payload["usage_totals"]["session-c"]["summed_tokens"] == 42
 
-    # Issue #6 gates: each rejection names its own reason, never silently.
-    client._capture_usage_delta(  # unverified server identity
-        {"sessionUpdate": "usage_update", "used": 7},
-        {"native_session_id": "native-a", "model": "model-a"},
-    )
-    client._capture_usage_delta(  # verified but outside the prompt-turn window
+    # Issue #102: the semantics gate is retired; each remaining rejection
+    # names its own reason, never silently.
+    client._capture_usage_delta(  # outside the prompt-turn window
         {"sessionUpdate": "usage_update", "used": 7},
         {
             "native_session_id": "native-a",
             "model": "model-a",
-            client._SERVER_CONSUMPTION_SEMANTICS_KEY: client._USAGE_SEMANTICS_VERIFIED,
         },
     )
     client._capture_usage_delta(  # in-window zero placeholder
@@ -394,23 +381,22 @@ def test_usage_frame_drop_counters_cover_every_gate(monkeypatch, tmp_path) -> No
         {
             "native_session_id": "native-a",
             "model": "model-a",
-            client._SERVER_CONSUMPTION_SEMANTICS_KEY: client._USAGE_SEMANTICS_VERIFIED,
             client._PROMPT_TURN_ACTIVE_KEY: True,
         },
     )
-    client._capture_usage_delta(  # zero from an UNVERIFIED server: still zero
+    client._capture_usage_delta(  # zero outside the window: zero gate runs first
         {"sessionUpdate": "usage_update", "used": 0},
         {"native_session_id": "native-a", "model": "model-a"},
     )
     counters = json.loads(state_path.read_text())["usage_drop_counters"]
     assert counters == {
-        "frames_seen": 7,
+        "frames_seen": 6,
         "dropped_invalid": 1,
         "dropped_no_native_session": 1,
-        "dropped_semantics_unverified": 1,
         "dropped_outside_prompt_turn": 1,
         "dropped_zero": 2,
     }
+    assert "dropped_semantics_unverified" not in counters
     # The gated frames changed nothing in the totals.
     assert payload["usage_totals"]["session-c"]["summed_tokens"] == 42
 
@@ -434,7 +420,6 @@ def test_identical_used_values_in_window_both_accumulate_while_rerports_do_not(
         return {
             "native_session_id": "native-dup",
             "model": "model-a",
-            client._SERVER_CONSUMPTION_SEMANTICS_KEY: client._USAGE_SEMANTICS_VERIFIED,
             client._PROMPT_TURN_ACTIVE_KEY: active,
         }
 
@@ -482,7 +467,6 @@ def test_valid_used_with_invalid_size_is_rejected_by_every_consumer(
             "native_session_id": "native-split",
             "model": "model-a",
             "turn_id_hash": "sha256:turn",
-            client._SERVER_CONSUMPTION_SEMANTICS_KEY: client._USAGE_SEMANTICS_VERIFIED,
             client._PROMPT_TURN_ACTIVE_KEY: True,
         }
 
@@ -531,7 +515,6 @@ def test_state_save_preserves_usage_drop_counters_and_totals(monkeypatch, tmp_pa
         {
             "native_session_id": "native-a",
             "model": "model-a",
-            client._SERVER_CONSUMPTION_SEMANTICS_KEY: client._USAGE_SEMANTICS_VERIFIED,
             client._PROMPT_TURN_ACTIVE_KEY: True,
         },
     )
@@ -540,7 +523,6 @@ def test_state_save_preserves_usage_drop_counters_and_totals(monkeypatch, tmp_pa
         {
             "native_session_id": "native-a",
             "model": "model-a",
-            client._SERVER_CONSUMPTION_SEMANTICS_KEY: client._USAGE_SEMANTICS_VERIFIED,
             client._PROMPT_TURN_ACTIVE_KEY: True,
         },
     )
@@ -638,46 +620,3 @@ def test_context_occupancy_requires_active_turn_and_valid_numbers(monkeypatch, t
         client._capture_context_occupancy(update, stats)
     assert "context_occupancy" not in stats
 
-
-def test_downstream_boundary_fixture_documents_known_zero_projection() -> None:
-    """Reproducible boundary shape for the Core/HGK owners (historical reference).
-
-    Hermes Core exits its usage recording before any per-model row exists when
-    ``usage is None``; the sessions row then carries schema defaults (0 tokens,
-    NULL billing provider). HGK's local_usage fallback treats those defaults as
-    known usage and renders ``unknown/<model>: 0``. This fixture pins the exact
-    boundary JSON that both owners must regress in their own repositories; it
-    does not execute Core or HGK and does not modify either.
-    """
-    fixture = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
-    provider = fixture["provider_response"]
-    assert provider["usage"] is None
-    telemetry = provider["antigravity_usage_telemetry"]
-    assert telemetry["schema_id"] == "antigravity-acp-usage-v1"
-    assert telemetry["status"] == "unavailable"
-    assert telemetry["context_occupancy"] is None
-
-    core = fixture["hermes_core_state"]
-    assert core["session_model_usage_rows"] == []
-    assert core["sessions_row_defaults"] == {
-        "input_tokens": 0, "output_tokens": 0, "billing_provider": None,
-    }
-
-    # HGK fallback projection: with no per-model rows, sessions defaults are
-    # accepted as known usage -> zero-token unknown provider display.
-    projection = fixture["hgk_local_usage_projection"]
-    defaults = core["sessions_row_defaults"]
-    provider_label = defaults["billing_provider"] or "unknown"
-    assert projection == {
-        "model_key": f"{provider_label}/{telemetry['model']}",
-        "input_tokens": defaults["input_tokens"],
-        "output_tokens": defaults["output_tokens"],
-        "total_tokens": defaults["input_tokens"] + defaults["output_tokens"],
-    }
-
-    # The worker_session_id-missing run-attribution class stays separate from
-    # ACP usage absence and must never be folded into usage reporting.
-    attribution = fixture["run_attribution_diagnostic"]
-    assert attribution["class"] == "worker_session_id_missing"
-    assert attribution["observed_runs"] == 173
-    assert attribution["independent_of_acp_usage_unavailability"] is True

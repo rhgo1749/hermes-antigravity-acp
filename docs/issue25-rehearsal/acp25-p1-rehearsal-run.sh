@@ -66,7 +66,7 @@ LOG_AGE=$(( $(date +%s) - $(stat -c %Y "$LOG") ))
 RECENT_ACP=0
 if [ "$LOG_AGE" -lt 300 ]; then
   # model=gemini* = ACTUAL ACP provider request lines. Do NOT grep bare
-  # 'antigravity-acp': unrelated github-kanban maintenance lines contain the
+  # 'antigravity-acp': unrelated maintenance lines contain the
   # repo name 'antigravity-acp-harness' and false-fail this gate (observed
   # 2026-11-18). Tool-call text does not enter agent.log (verified), so this
   # pattern cannot be polluted by the reviewing session itself.

@@ -285,14 +285,16 @@ def test_failover_replay_still_recovers_without_tool_activity(monkeypatch, tmp_p
     assert reply.choices[0].message.content == "recovered"
     assert counter.read_text(encoding="utf-8").count("spawn") == 2
     telemetry = reply.antigravity_usage_telemetry
-    # Issue #6 AC4-1/AC4-3: this fake self-reports no `agentInfo`, so its
-    # frames are unverified — never accumulated, never synthesized into
-    # completion.usage.  The failed first attempt's frame (900000) must not
-    # leak into the surfaced turn's occupancy either (docs/acp-usage-telemetry.md).
+    # Issue #102: frames accumulate as explicitly-scoped, non-billing
+    # telemetry and are never synthesized into completion.usage.  The failed
+    # first attempt's frame (900000) must not leak into the surfaced turn's
+    # occupancy or consumption either (docs/acp-usage-telemetry.md).
     assert reply.usage is None
     assert telemetry["status"] == "unavailable"
-    assert telemetry["server_consumption_semantics"] == "unverified"
-    assert telemetry["turn_consumption"] is None
+    consumption = telemetry["turn_consumption"]
+    assert consumption["scope"] == "unverified_server_semantics"
+    assert consumption["is_billing_usage"] is False
+    assert consumption["total_tokens"] == 30
     assert telemetry["context_occupancy"] == {
         "source": "acp.session/update:usage_update",
         "scope": "unverified_server_semantics",

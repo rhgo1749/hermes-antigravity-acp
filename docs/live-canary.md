@@ -27,18 +27,14 @@ harness-owned MCP tool (`canary_echo`) plus a throwaway cancellation probe.
    `call_<32hex>` ids. Uncalled or unechoed rounds are `inconclusive` (exit 3).
 4. **`follow_up_same_session`** — follow-up turn reuses the session without a
    second `session/new`.
-5. **`usage_contract`** — checks issue #87 per turn, reusing the engine's own
-   parser (`parked.conversation._consumption_from_prompt_result`) and
-   `parked.usage_contract` gates on the same transcript the engine saw (turn
-   1's local estimate includes the tool-round rows). Per reported turn the
-   engine may accept only a parser-valid, plausible report:
-   valid+plausible+accepted → `pass` (`plausible`); invalid or implausible +
-   rejected → `pass` (`invalid_rejected` / `anomalous_rejected`);
-   accepted-invalid → `fail` (`invalid_accepted`); accepted-implausible →
-   `fail` (`anomalous_accepted`); rejected-valid-plausible → `fail`
-   (`plausible_rejected`); usage with no server report → `fail`
-   (`invented_usage`); nothing reported → `inconclusive` (`unavailable`).
-   A breach on any turn fails the whole run. `billing_claim: none`.
+5. **`usage_contract`** — issue #102 semantics: the contract is that NO
+   server-reported consumption sum may surface on a completion. Per turn:
+   server reported usage and the engine suppressed it (`completion.usage`
+   is `None`) → `pass` (`suppressed`); any completion carrying usage →
+   `fail` (`surfaced_consumption_sum`); usage on a completion with no
+   server report → `fail` (`invented_usage`); nothing reported at all →
+   `inconclusive` (`unavailable`) — an unexercised condition is never a
+   PASS. A breach on any turn fails the whole run. `billing_claim: none`.
 6. **`containment`** — verifies `disabledTools` prefix on `session/new` matches
    `NATIVE_TOOLS` and fails if any non-MCP `session/request_permission` is
    allowed. (Active native permission refusal is exercised by fake-ACP tests;

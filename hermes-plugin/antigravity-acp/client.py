@@ -44,7 +44,6 @@ from typing import Any, NoReturn, Sequence
 
 from .conversation_state import (
     ACPConversationState,
-    _SEMANTICS_VERDICT_VERIFIED,
     conversation_registry,
 )
 from .hermes_compat import (
@@ -77,16 +76,13 @@ from .bridge import (
     extract_tool_calls_from_text,
     render_tool_bridge_sections,
 )
-# Turn-usage validity contract: ONE owner for both engines (issue #87 drift).
+# Turn-usage validity contract: ONE owner for both engines.  Since issue
+# #102 this module never populates completion.usage; the contract owns frame
+# validity and the local token estimator (docs/acp-usage-telemetry.md).
 from .parked.usage_contract import (
-    context_limit_from_usage_update,
     estimate_tokens,
-    first_turn_report_plausible,
     nonnegative_usage_number,
-    report_within_context_limit,
-    reported_usage_growth_consistent,
     usage_update_valid,
-    valid_context_limit,
 )
 
 
@@ -2201,196 +2197,14 @@ _USAGE_BUCKETS = (
     "reasoning_tokens",
 )
 _CONTEXT_OCCUPANCY_SOURCE = "acp.session/update:usage_update"
-_USAGE_DELTA_SCOPE = "per_model_call_consumption_delta"
 _USAGE_SCOPE_UNVERIFIED = "unverified_server_semantics"
-
-# Consumption-semantics verdicts are DYNAMIC, not version-pinned.  The retired
-# frozenset of ``agentInfo`` triples (1.4.0/1.4.4) went stale the day 1.5.2
-# shipped: every ``usage_update`` frame was dropped as ``semantics_unverified``
-# while inflated ``inputTokens`` still reached the compression gate
-# unchallenged (2026-11-23 incident: a ~31K transcript reported as ~1.07M, two
-# premature compactions, lost guard feedback).  A version list can never cover
-# the next release; a verdict earned at runtime can.  See
-# ``_usage_semantics_for_identity`` and ``_reported_usage_growth_consistent``.
-_USAGE_SEMANTICS_VERIFIED = "verified"
-_USAGE_SEMANTICS_UNVERIFIED = "unverified"
-_USAGE_SEMANTICS_ATTR = "_antigravity_usage_semantics"
-_SERVER_IDENTITY_ATTR = "_antigravity_server_identity"
-_SERVER_CONSUMPTION_SEMANTICS_KEY = "server_consumption_semantics"
-_SERVER_IDENTITY_KEY = "server_identity"
+# Issue #102 retired the dynamic consumption-semantics verdict system (the
+# growth/window gates that earned it, the machine-wide verdict store, and the
+# per-identity ``verified``/``unverified`` labels).  No server-reported number
+# reaches completion.usage any more, so every frame-derived reading carries one
+# honest static scope: the server's own semantics are not behaviorally
+# verified, and the readings are diagnostics, never billing or occupancy.
 _PROMPT_TURN_ACTIVE_KEY = "prompt_turn_active"
-
-
-def _server_identity_from_initialize(result: Any) -> str:
-    """Extract the ``name|title|version`` identity from the ``initialize`` result.
-
-    An empty string means ``agentInfo`` is absent, malformed, or incomplete —
-    fail closed: an unknown identity never accumulates and never earns a
-    verdict.
-    """
-    if not isinstance(result, dict):
-        return ""
-    agent_info = result.get("agentInfo")
-    if not isinstance(agent_info, dict):
-        return ""
-    fields = tuple(agent_info.get(field) for field in ("name", "title", "version"))
-    if not all(isinstance(field, str) and field for field in fields):
-        return ""
-    return "|".join(str(field) for field in fields)
-
-
-def _usage_semantics_for_identity(identity_key: str) -> str:
-    """Dynamic consumption-semantics verdict for a connected server identity.
-
-    Verdicts are earned at runtime: each growth-consistent turn of a
-    conversation folds evidence into the durable store via
-    ``conversation_registry.record_semantics_evidence``; identities that stay
-    consistent across enough tested turns become behaviorally verified, and
-    any order-of-magnitude divergence demotes them back to unverified.
-    Unknown or never-tested identities are unverified — the adapter never
-    guesses semantics from a version string.
-    """
-    if not identity_key:
-        return _USAGE_SEMANTICS_UNVERIFIED
-    if conversation_registry.semantics_verdict(identity_key) == _SEMANTICS_VERDICT_VERIFIED:
-        return _USAGE_SEMANTICS_VERIFIED
-    return _USAGE_SEMANTICS_UNVERIFIED
-
-
-_TURN_USAGE_BASELINE_LOCK = threading.Lock()
-# affinity_key -> (last accepted reported inputTokens, native_tokens estimate
-# at that moment).  Process-local on purpose: a restart merely leaves the
-# first turn after it untested; the shared verdicts live in the durable store.
-# The gate DECISIONS themselves are shared with the Parked-MCP engine in
-# ``parked/usage_contract.py`` — this engine keeps only the state plumbing.
-_TURN_USAGE_BASELINES: dict[str, tuple[int, int]] = {}
-# affinity_key -> (effective_model, confirmed context-window limit).
-_CONVERSATION_CONTEXT_LIMITS: dict[str, tuple[str, int]] = {}
-
-
-def _resolve_conversation_context_limit(
-    *,
-    affinity_key: str,
-    effective_model: str,
-    observed_size: Any = None,
-) -> int | None:
-    """Track the confirmed active-model context window per conversation.
-
-    Persists across turns that omit ``usage_update`` and clears immediately
-    when ``effective_model`` changes so a prior model's limit never caps a
-    newly selected model.  Stateless requests (empty ``affinity_key``) use only
-    their own current observation and never read or share cross-request state.
-    """
-    model_key = str(effective_model or "").strip()
-    observed = valid_context_limit(observed_size)
-    if not affinity_key:
-        return observed
-    with _TURN_USAGE_BASELINE_LOCK:
-        cached = _CONVERSATION_CONTEXT_LIMITS.get(affinity_key)
-        if observed is not None:
-            _CONVERSATION_CONTEXT_LIMITS[affinity_key] = (model_key, observed)
-            return observed
-        if cached is not None:
-            cached_model, cached_limit = cached
-            if cached_model == model_key:
-                return cached_limit
-            _CONVERSATION_CONTEXT_LIMITS.pop(affinity_key, None)
-        return None
-
-
-def _guard_reported_turn_usage(
-    *,
-    affinity_key: str,
-    server_identity: str,
-    turn_usage: Any,
-    native_tokens: int,
-    context_limit: Any = None,
-) -> Any:
-    """Reject server-reported turn usage that exceeds context window or diverges from local growth.
-
-    Always-on safety gate for the Core compression trigger: it protects every
-    server identity (verified or not) regardless of version.  A rejected turn
-    yields ``None`` so Hermes falls back to its own token estimate instead of
-    compacting against an inflated number; the last trusted baseline is kept,
-    so a permanently inflated server keeps getting rejected.  Consistent
-    turns feed the identity's dynamic semantics verdict.
-    """
-    reported = int(getattr(turn_usage, "prompt_tokens", 0) or 0)
-    identity = str(server_identity or "")
-    if not report_within_context_limit(reported=reported, context_limit=context_limit):
-        if identity:
-            conversation_registry.record_semantics_evidence(identity, ok=False)
-        conversation_registry.note_usage_frame("dropped_inflated_turn_usage")
-        limit = valid_context_limit(context_limit)
-        logger.warning(
-            "Antigravity ACP reported inputTokens %d rejected: exceeds active model context window %s "
-            "(identity=%s); Core falls back to its own token estimate for compression this turn.",
-            reported,
-            limit if limit is not None else context_limit,
-            identity or "unknown",
-        )
-        return None
-    if not affinity_key:
-        first_turn = True
-        accepted = first_turn_report_plausible(
-            reported=reported, local=native_tokens
-        )
-        actual = expected = 0
-    else:
-        # One critical section per turn: baseline lookup, gate decision, and
-        # re-seed are atomic, so two same-affinity requests can never both pass
-        # their own gate and clobber each other's baseline (a split lookup/seed
-        # let a caller seed from a stale first-turn view).  Evidence and logging
-        # stay outside the lock.
-        with _TURN_USAGE_BASELINE_LOCK:
-            baseline = _TURN_USAGE_BASELINES.get(affinity_key)
-            if baseline is None:
-                # First turn of this conversation: no growth to correlate, so gate
-                # the absolute report against the local transcript estimate (issue
-                # #87: a long first turn reported ~1.4M cumulative inputTokens
-                # against a ~110K transcript and fired Core compression twice).  A
-                # rejected first report seeds nothing, so turn two is gated on its
-                # own; an accepted one becomes the growth baseline.
-                first_turn = True
-                accepted = first_turn_report_plausible(
-                    reported=reported, local=native_tokens
-                )
-                actual = expected = 0
-            else:
-                first_turn = False
-                accepted, actual, expected = reported_usage_growth_consistent(
-                    prev_reported=baseline[0],
-                    reported=reported,
-                    prev_local=baseline[1],
-                    local=native_tokens,
-                )
-            if accepted:
-                _TURN_USAGE_BASELINES[affinity_key] = (reported, native_tokens)
-    if accepted:
-        if not first_turn and identity:
-            conversation_registry.record_semantics_evidence(identity, ok=True)
-        return turn_usage
-    if identity:
-        conversation_registry.record_semantics_evidence(identity, ok=False)
-    conversation_registry.note_usage_frame("dropped_inflated_turn_usage")
-    if first_turn:
-        logger.warning(
-            "Antigravity ACP first-turn inputTokens %d rejected: diverges from "
-            "local transcript estimate %d beyond tolerance; Core falls back to "
-            "its own token estimate for compression this turn.",
-            reported,
-            native_tokens,
-        )
-    else:
-        logger.warning(
-            "Antigravity ACP reported inputTokens rejected: server growth %d vs "
-            "local estimate growth %d (identity=%s); Core falls back to its own "
-            "token estimate for compression this turn.",
-            actual,
-            expected,
-            identity or "unknown",
-        )
-    return None
 
 
 def _capture_usage_delta(
@@ -2433,12 +2247,10 @@ def _capture_usage_delta(
     if update["used"] == 0:
         conversation_registry.note_usage_frame("dropped_zero")
         return
-    # Issue #6 AC4-3: accumulate only for a server identity whose per-call
-    # delta semantics carry a behaviorally-earned verdict (dynamic canary;
-    # see _usage_semantics_for_identity).
-    if activity_stats.get(_SERVER_CONSUMPTION_SEMANTICS_KEY) != _USAGE_SEMANTICS_VERIFIED:
-        conversation_registry.note_usage_frame("dropped_semantics_unverified")
-        return
+    # Issue #102: the per-identity consumption-semantics verdict gate was
+    # retired with the gates that earned it.  Accumulation is governed by the
+    # structural lifecycle gates below only; every accumulated sum is labeled
+    # ``unverified_server_semantics`` at its consumers.
     # Issue #6 AC4-2: the official 1.4.x server emits consumption deltas ONLY
     # while a prompt turn is in flight (`_maybe_send_usage_update` is reached
     # exclusively from `prompt()`/`_stream_live_step`).  Frames outside the
@@ -2502,23 +2314,15 @@ def _capture_context_occupancy(
             if field in previous and nonnegative_usage_number(previous[field])
         }
     merged.update({field: update[field] for field in present})
-    # The reading's MEANING depends on the server's semantics.  Only a
-    # behaviorally-verified identity gets the per-call-consumption-delta
-    # label; for anything else the meaning is honestly unverified
-    # (issue #6 review).
-    verified = (
-        activity_stats.get(_SERVER_CONSUMPTION_SEMANTICS_KEY)
-        == _USAGE_SEMANTICS_VERIFIED
-    )
+    # The reading's MEANING is honestly unverified (issue #102 retired the
+    # behavioral verdict system): the frame is the server's own observation,
+    # never billing usage and never a verified occupancy claim.
     activity_stats["context_occupancy"] = {
         "source": _CONTEXT_OCCUPANCY_SOURCE,
-        "scope": _USAGE_DELTA_SCOPE if verified else _USAGE_SCOPE_UNVERIFIED,
+        "scope": _USAGE_SCOPE_UNVERIFIED,
         "is_billing_usage": False,
         **merged,
     }
-    limit = context_limit_from_usage_update(update)
-    if limit is not None:
-        activity_stats["context_limit"] = limit
 
 
 _TURN_USAGE_CALLS_KEY = "turn_usage_calls_observed"
@@ -2544,13 +2348,12 @@ def _capture_turn_usage(update: Any, activity_stats: dict[str, Any] | None) -> N
         or not usage_update_valid(update)
     ):
         return
-    # Same consumption gates as _capture_usage_delta: the turn sum is a
-    # per-call consumption proxy only for a verified identity's in-prompt-turn
-    # frames; re-reports, out-of-window frames, and zero placeholders are not
-    # consumption and must not inflate the sum or the call count.
+    # Same structural lifecycle gates as _capture_usage_delta (issue #102
+    # retired the verdict gate): only in-prompt-turn, nonzero frames count;
+    # re-reports, out-of-window frames, and zero placeholders must not inflate
+    # the sum or the call count.
     if (
-        activity_stats.get(_SERVER_CONSUMPTION_SEMANTICS_KEY) != _USAGE_SEMANTICS_VERIFIED
-        or not activity_stats.get(_PROMPT_TURN_ACTIVE_KEY)
+        not activity_stats.get(_PROMPT_TURN_ACTIVE_KEY)
         or update["used"] == 0
     ):
         return
@@ -2560,34 +2363,6 @@ def _capture_turn_usage(update: Any, activity_stats: dict[str, Any] | None) -> N
     ) + float(update["used"])
 
 
-def _turn_usage_from_prompt_result(result: Any) -> Any:
-    """Translate ACP's optional per-turn Usage into OpenAI usage fields."""
-    usage = result.get("usage") if isinstance(result, dict) else None
-    if not isinstance(usage, dict):
-        return None
-    required = ("inputTokens", "outputTokens", "totalTokens")
-    optional = ("thoughtTokens", "cachedReadTokens", "cachedWriteTokens")
-    for name in required + optional:
-        value = usage.get(name)
-        if name in required or value is not None:
-            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-                return None
-    thoughts = usage.get("thoughtTokens") or 0
-    result_usage = SimpleNamespace(
-        prompt_tokens=usage["inputTokens"],
-        completion_tokens=usage["outputTokens"] + thoughts,
-        total_tokens=usage["totalTokens"],
-        completion_tokens_details=SimpleNamespace(reasoning_tokens=thoughts),
-    )
-    if usage.get("cachedReadTokens") is not None:
-        result_usage.prompt_tokens_details = SimpleNamespace(
-            cached_tokens=usage["cachedReadTokens"]
-        )
-    return result_usage
-
-
-
-
 def _build_usage_telemetry(
     *,
     model: str | None,
@@ -2595,10 +2370,8 @@ def _build_usage_telemetry(
     turn_id_hash: str | None,
     context_occupancy: Any,
     turn_consumption: Any = None,
-    server_consumption_semantics: str = _USAGE_SEMANTICS_UNVERIFIED,
 ) -> dict[str, Any]:
     """Build JSON-compatible metadata without inferring billable token counts."""
-    semantics_verified = server_consumption_semantics == _USAGE_SEMANTICS_VERIFIED
     occupancy: dict[str, Any] | None = None
     if isinstance(context_occupancy, dict):
         values = {
@@ -2608,20 +2381,15 @@ def _build_usage_telemetry(
             and nonnegative_usage_number(context_occupancy[field])
         }
         if values:
-            # The capture site already labeled the reading's meaning against
-            # the pinned server semantics; carry that label, never relabel it
-            # as a delta here (issue #6 review).
+            # The capture site already labeled the reading's meaning; carry
+            # that label, never relabel it here (issue #6 review).
             captured_scope = context_occupancy.get("scope")
             occupancy = {
                 "source": _CONTEXT_OCCUPANCY_SOURCE,
                 "scope": (
                     captured_scope
                     if isinstance(captured_scope, str) and captured_scope
-                    else (
-                        _USAGE_DELTA_SCOPE
-                        if semantics_verified
-                        else _USAGE_SCOPE_UNVERIFIED
-                    )
+                    else _USAGE_SCOPE_UNVERIFIED
                 ),
                 "is_billing_usage": False,
                 **values,
@@ -2630,17 +2398,6 @@ def _build_usage_telemetry(
     consumption: dict[str, Any] | None = (
         dict(turn_consumption) if isinstance(turn_consumption, dict) else None
     )
-    occupancy_provenance = (
-        "usage_update.used is per-model-call consumption, not billing usage; "
-        "size is the context window"
-        if semantics_verified
-        else (
-            "this server's usage_update.used semantics have not earned the "
-            "behavioral verdict; "
-            "the reading is retained as an opaque observation, not billing "
-            "usage, consumption deltas, or context occupancy"
-        )
-    )
 
     return {
         "schema_id": "antigravity-acp-usage-v1",
@@ -2648,19 +2405,24 @@ def _build_usage_telemetry(
         "provider": "antigravity-acp",
         "model": str(model or "antigravity-acp"),
         "request_usage": {bucket: None for bucket in _USAGE_BUCKETS},
-        "server_consumption_semantics": str(server_consumption_semantics),
         "provenance": {
             "source": "official_acp_v1.4.0",
             "request_usage": (
-                "populated in completion.usage ONLY from the server's own "
-                "session/prompt result usage breakdown; never synthesized from "
-                "usage_update frames (issue #6 AC4-1)"
+                "never populated: the server's session/prompt result usage is a "
+                "per-turn consumption sum, not a verified single-request context "
+                "occupancy reading, and is ineligible for completion.usage "
+                "(issue #102; Core's local-estimate fallback governs compression)"
             ),
-            "context_occupancy": occupancy_provenance,
+            "context_occupancy": (
+                "this server's usage_update.used semantics are not behaviorally "
+                "verified; the reading is retained as an opaque observation, not "
+                "billing usage, consumption deltas, or context occupancy"
+            ),
             "turn_consumption": (
-                "sum of gated per-model-call consumption deltas observed this turn "
-                "(main-agent-only, may under-report); observed processing, not "
-                "unique-context size, billed tokens, or account quota"
+                "sum of per-model-call consumption delta frames observed this turn "
+                "(main-agent-only, may under-report, semantics unverified); "
+                "observed processing, not unique-context size, billed tokens, or "
+                "account quota"
             ),
         },
         "native_session_id_hash": _opaque_permission_id(session_id, "native-session"),
@@ -4885,35 +4647,13 @@ class AntigravityACPClient:
                 )
                 conversation_registry.put(affinity_key, state)
 
-            # Dynamic canary gate: the compression trigger must never see
-            # a server-reported inputTokens whose growth diverges from the
-            # transcript this adapter actually grew.  Runs for EVERY
-            # request (including stateless llm_backend requests), identity,
-            # and version; a rejected turn falls back to Core's own token
-            # estimate instead of compacting against an inflated number
-            # (2026-11-23 incident: 31K transcript reported as 1.07M, two
-            # premature compactions).
-            context_occupancy = session_result.get("context_occupancy")
-            observed_limit = session_result.get("context_limit")
-            if observed_limit is None and isinstance(context_occupancy, dict):
-                observed_limit = context_occupancy.get("size")
-            resolved_context_limit = _resolve_conversation_context_limit(
-                affinity_key=affinity_key,
-                effective_model=str(session_result.get("effective_model") or model or ""),
-                observed_size=observed_limit,
-            )
-            reported_turn_usage = session_result.get("turn_usage")
-            if reported_turn_usage is not None:
-                session_result["turn_usage"] = _guard_reported_turn_usage(
-                    affinity_key=affinity_key,
-                    server_identity=str(
-                        session_result.get("server_identity") or ""
-                    ),
-                    turn_usage=reported_turn_usage,
-                    native_tokens=native_tokens,
-                    context_limit=resolved_context_limit,
-                )
-    
+            # Issue #102: no server-reported usage is forwarded to
+            # completion.usage at all (see the completion build below).  The
+            # growth/window gates that used to police the prompt-result
+            # breakdown here were retired with the contract that pinned
+            # completion.usage to None; Core's local-estimate fallback
+            # governs compression (docs/acp-usage-telemetry.md).
+
             native_reasoning_details = _native_tool_reasoning_details(native_activity)
             message = SimpleNamespace(
                 content=cleaned_text,
@@ -4933,10 +4673,6 @@ class AntigravityACPClient:
                     turn_id_hash=session_result.get("turn_id_hash"),
                     context_occupancy=session_result.get("context_occupancy"),
                     turn_consumption=session_result.get("turn_consumption"),
-                    server_consumption_semantics=str(
-                        session_result.get("server_consumption_semantics")
-                        or _USAGE_SEMANTICS_UNVERIFIED
-                    ),
                 ),
                 choices=[
                     SimpleNamespace(
@@ -4944,11 +4680,14 @@ class AntigravityACPClient:
                         finish_reason="tool_calls" if tool_calls else "stop",
                     )
                 ],
-                # Per AC4-1, `turn_usage` is populated only from the official
-                # prompt result's per-turn breakdown; it is None when that
-                # breakdown is absent or invalid.  No usage_update proxy is
-                # retained (docs/acp-usage-telemetry.md, "Issue #6").
-                usage=session_result.get("turn_usage"),
+                # Issue #102: completion.usage is ALWAYS None.  The prompt
+                # result's per-turn usage breakdown is a consumption sum over
+                # the server's internal model calls (cachedReadTokens
+                # hop-sums), never a verified single-request occupancy
+                # reading; forwarding it seeded Core's usage anchor and fired
+                # premature compactions (production S1-S4).  None lets Hermes'
+                # own estimate stand (docs/acp-usage-telemetry.md).
+                usage=None,
                 model=session_result.get("effective_model") or model or "antigravity-acp",
             )
             result = completion_to_stream_chunks(completion) if stream else completion
@@ -5214,11 +4953,6 @@ class AntigravityACPClient:
                 "native_tool_calls": [],
                 "permission_denied": False,
                 "_native_tool_call_index": {},
-                _SERVER_CONSUMPTION_SEMANTICS_KEY: str(
-                    getattr(proc, _USAGE_SEMANTICS_ATTR, _USAGE_SEMANTICS_UNVERIFIED)
-                    or _USAGE_SEMANTICS_UNVERIFIED
-                ),
-                _SERVER_IDENTITY_KEY: str(getattr(proc, _SERVER_IDENTITY_ATTR, "") or ""),
             }
         )
 
@@ -5495,7 +5229,7 @@ class AntigravityACPClient:
         try:
             if fresh:
                 initialize_started = time.monotonic()
-                initialize_result = request("initialize", _INITIALIZE_PARAMS)
+                request("initialize", _INITIALIZE_PARAMS)
                 self._trace_event(
                     "initialize",
                     req_key=attempt_key,
@@ -5507,25 +5241,10 @@ class AntigravityACPClient:
                         "request_key": _TRACE_REQUEST_KEY.get() or "unknown",
                     },
                 )
-                # Pin the server identity and its DYNAMIC consumption
-                # semantics verdict for the lifetime of this stdio connection
-                # (issue #6 AC4-3 successor: verdicts are earned at runtime by
-                # the growth-consistency gate, never granted by a version
-                # pin); warm reuse of the same process keeps the pinned pair.
-                _server_identity = _server_identity_from_initialize(initialize_result)
-                setattr(proc, _SERVER_IDENTITY_ATTR, _server_identity)
-                setattr(
-                    proc,
-                    _USAGE_SEMANTICS_ATTR,
-                    _usage_semantics_for_identity(_server_identity),
-                )
-                # The activity_stats seed above ran before this handshake on a
-                # fresh connection; refresh it with the pinned identity.
-                activity_stats[_SERVER_CONSUMPTION_SEMANTICS_KEY] = str(
-                    getattr(proc, _USAGE_SEMANTICS_ATTR)
-                    or _USAGE_SEMANTICS_UNVERIFIED
-                )
-                activity_stats[_SERVER_IDENTITY_KEY] = _server_identity
+                # Issue #102 retired the per-connection server-identity pin
+                # and its dynamic consumption-semantics verdict: no
+                # server-reported usage reaches completion.usage, so there is
+                # nothing left for a verdict to gate.
             # Hermes model-provider mode always disables the native
             # run_command built-in at launch; shell work belongs to Hermes'
             # approval-gated terminal tool through the <tool_call> bridge.
@@ -6311,41 +6030,19 @@ class AntigravityACPClient:
                 session_result["context_occupancy"] = (
                     dict(occupancy) if isinstance(occupancy, dict) else None
                 )
-                session_result["context_limit"] = activity_stats.get("context_limit")
-                # Issue #6 AC4-1: the ONLY source for the generic OpenAI-shaped
-                # usage is the server's own per-turn `usage` breakdown on the
-                # prompt result.  When it is absent or invalid, usage stays
-                # None (Core's designed usage-less path); the observed
-                # per-call consumption frames are reported ONLY as explicitly
-                # scoped provider telemetry below, never as measured
-                # input/output.
-                # The self-reported server identity rides along so the caller
-                # (which owns the local transcript estimate) can run the
-                # dynamic growth-consistency gate on this usage.
-                session_result["turn_usage"] = _turn_usage_from_prompt_result(
-                    prompt_result
-                )
-                session_result["server_identity"] = str(
-                    activity_stats.get(_SERVER_IDENTITY_KEY) or ""
-                )
-                session_result["server_consumption_semantics"] = str(
-                    activity_stats.get(_SERVER_CONSUMPTION_SEMANTICS_KEY)
-                    or _USAGE_SEMANTICS_UNVERIFIED
-                )
-                # Observed per-call consumption stays in explicitly scoped
-                # provider telemetry (issue #6 AC4-1): never generic-priced,
-                # never presented as an input/output split.
+                # Issue #102: the prompt result's per-turn `usage` breakdown
+                # is NOT forwarded anywhere Core reads as occupancy; it stays
+                # in the raw prompt result for the live canary's report only.
+                # Observed per-call consumption stays in explicitly scoped,
+                # semantics-unverified provider telemetry (issue #6 AC4-1):
+                # never generic-priced, never an input/output split.
                 _turn_calls = int(activity_stats.get(_TURN_USAGE_CALLS_KEY) or 0)
                 _turn_sum = activity_stats.get(_TURN_USAGE_SUM_KEY)
                 session_result["turn_consumption"] = (
                     {
                         "source": _CONTEXT_OCCUPANCY_SOURCE,
-                        "scope": _USAGE_DELTA_SCOPE,
+                        "scope": _USAGE_SCOPE_UNVERIFIED,
                         "is_billing_usage": False,
-                        "semantics": str(
-                            activity_stats.get(_SERVER_CONSUMPTION_SEMANTICS_KEY)
-                            or _USAGE_SEMANTICS_UNVERIFIED
-                        ),
                         "model_calls_observed": _turn_calls,
                         "total_tokens": (
                             int(_turn_sum)

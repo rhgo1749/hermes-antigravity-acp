@@ -1,145 +1,133 @@
 # Truthful ACP usage telemetry contract
 
-## Provider boundary
+## The contract (issue #102)
 
-The standalone adapter exposes `antigravity_usage_telemetry` as a response-level
-attribute. Streaming `StreamChunks` preserve that attribute through the bridge.
-Google's official Antigravity ACP 1.4.0 did not expose the token breakdown in
-`SessionPromptResult`. The 1.4.4 server can include `usage` in the completed
-`session/prompt` result: the adapter uses this per-turn breakdown in
-`completion.usage` when present and valid. `inputTokens` maps to
-`prompt_tokens`; `outputTokens` plus `thoughtTokens` maps to `completion_tokens`,
-with thoughts also exposed as `completion_tokens_details.reasoning_tokens`.
-`totalTokens` is forwarded as reported, and `cachedReadTokens`, when present,
-is exposed as `prompt_tokens_details.cached_tokens`. This is server-reported
-usage, not an invoice; the server can omit it and excludes subagent usage.
-Do not derive billing values from prompt characters, output length, or
-`native_tokens`.
+`completion.usage` is **always `None`** in both engines (Replay and
+Parked-MCP). Hermes Core treats `completion.usage.prompt_tokens` as the
+authoritative single-request context occupancy: `normalize_usage` reconstructs
+`prompt_tokens = input + cache_read + cache_write`, the value seeds the usage
+anchor (`agent/usage_anchor.py`), and the anchored figure is never deferred by
+the preflight-compaction gate (`agent/turn_context.py::_preflight_request_tokens`).
+The ACP `session/prompt` result `usage` is a per-turn **consumption sum** over
+the server's internal model calls — `cachedReadTokens` accumulates each hop's
+cached prefix — and is never a verified single-request occupancy reading. No
+field on the current ACP surface is one. Pinning `completion.usage=None` routes
+Core to its designed local-estimate fallback (`estimate_request_tokens_rough`),
+and normal context compaction keeps working off the adapter's transcript.
 
-When the final result has no valid usage, `completion.usage` stays `None` and
-Hermes Core's display-only estimate fallback remains in charge (issue #6
-AC4-1). The separate `antigravity_usage_telemetry` attribute still uses
-`status="unavailable"` and null `request_usage` buckets; those fields do not
-describe the separate `completion.usage` value.
+The rule is semantic, not numeric: no magnitude gate can make a consumption sum
+safe as an occupancy anchor. The decision is hardcoded in both engines
+(`parked/client.py::_completion`, `client.py` prompt-result handling); there is
+no eligibility flag, no configuration, and no compatibility layer. If a future
+ACP surface ever exposes a verified occupancy source, admitting it is a design
+change to `parked/usage_contract.py` first — never a local engine fork.
 
-## Growth-consistency gate on `session/prompt` result usage
+### Why: the 2026-11-26 production samples (anonymized S1–S4)
 
-Server-reported `inputTokens` feeds Hermes Core's compression preflight
-(`should_defer_preflight_to_real_usage`), so an inflated report triggers
-premature compaction. The server binary is opaque (a 714MB ELF; static audit
-is impossible), so every reported turn-usage value must correlate with the
-adapter's own local transcript estimate (`native_tokens`) before it is
-forwarded. Ahead of the 8x gates, when the server has confirmed a positive finite context
-window (`usage_update.size` emitted during an active `session/prompt` turn for
-the current active model, persisted across turns that omit `usage_update` and
-cleared immediately on model switch), any report with
-`inputTokens > context_limit` is rejected immediately (`report_within_context_limit`
-in `parked/usage_contract.py`) without seeding or updating the baseline (issue #99:
-proportional multi-turn inflation inside the 8x tolerance that exceeded the
-model's physical window). When no confirmed window limit exists yet, the check
-passes through to the 8x gates rather than guessing a limit.
+The server's per-turn `cachedReadTokens` reached 861,529 against a ~57K durable
+transcript (15x) and 6.03M against ~140K (43x). The cache bucket alone seeded
+anchors up to 1.09M against a 1,048,576 window, firing premature compactions
+while the real transcript was small. S4's shape defeats every magnitude gate:
+`inputTokens≈0` passes growth gates and 861,529 passes any window cap — the
+inflation mode moves the mass into the ungated field. This is why #6, #87 and
+#99 (plausibility, 8x growth, window cap) each passed CI and still lost: they
+policed a channel that must not exist.
 
-Per affinity key the adapter keeps the last trusted
-`(reported, local)` pair; a turn passes only when the reported growth stays
-within `max(8x, local growth + 64K)` of the local growth (negative growth is
-tolerated within the same slack for context rotation). Proportional inflation
-that remains strictly below the active model's confirmed context window is still
-bounded only by this 8x tolerance. A rejected turn is
-dropped (`dropped_inflated_turn_usage`), the identity's canary verdict is
-demoted, and `completion.usage` becomes `None` for that turn — Core falls back
-to its local estimate instead of a number this adapter cannot vouch for. The
-2026-11-23 incident (1.07M reported against a ~31K transcript on 1.5.2,
-forcing two premature compressions) and issue #99 window-overflow samples are
-the regression cases this gate replays in
-`tests/test_dynamic_usage_semantics_canary.py` and
-`tests/test_usage_contract_single_owner.py`.
+## Retired machinery (issue #102 debt cleanup)
 
-## Issue #6: no fabricated split in `completion.usage`
+With `completion.usage` pinned to `None`, the following are removed from both
+engines (not dormant — deleted; history lives in git):
 
-Earlier builds (v0.7.4–v0.7.8) synthesized `completion.usage` from
-`usage_update` frames — latest call as `prompt_tokens`, earlier same-turn
-calls as `completion_tokens`. That split was fabricated: the server reports
-one undifferentiated per-call consumption number, and pricing it as an
-input/output pair corrupted `/usage`, `state.db` stats, and cost views
-(issue #6). The synthesis is removed. `completion.usage` is now populated
-exclusively from the server's own `session/prompt` result `usage` breakdown.
+- the 8x growth-consistency gate and its tolerance constants (#87/#6);
+- the first-turn plausibility gate (#87);
+- the active-model context-window cap and its per-model limit tracking (#99);
+- per-conversation `(reported, local)` baseline storage;
+- the machine-wide consumption-semantics **verdict** store, `agentInfo`
+  identity extraction, and `server_consumption_semantics` telemetry key (#6);
+- the drop counters `dropped_semantics_unverified` and
+  `dropped_inflated_turn_usage`;
+- the prompt-result usage parser (`_turn_usage_from_prompt_result` /
+  `_consumption_from_prompt_result`) — the breakdown is no longer parsed at all.
 
-The official server streams `usage_update` frames whose `used` is the
-consumption of the latest model call (per-call, not cumulative; see below).
-Observed frames feed two honest surfaces instead:
+## What consumption telemetry still exists (and what it does NOT claim)
 
-- `context_occupancy` in the telemetry attribute (latest valid observation,
-  non-billing, ungated), and
-- `turn_consumption` in the telemetry attribute plus the durable
-  `usage_totals` store: the sum of gated per-call deltas observed during the
-  turn, explicitly scoped, never priced.
+`usage_update` frames remain visible as explicitly-scoped, non-billing
+telemetry. Nothing here is an invoice, a quota reading, or a context-occupancy
+claim; the scope label is the static `unverified_server_semantics` for every
+identity (the behavioral-verdict ladder that used to promote it is retired):
 
-Accumulation (turn sum and durable totals) is gated on three conditions,
-each with its own drop counter:
+### Two different data classes — what is kept, what is lost
 
-1. **Behaviorally-verified server semantics** — the `initialize` result's
-   `agentInfo` `(name, title, version)` identifies the server, and the
-   consumption verdict for that identity is EARNED at runtime, never pinned to
-   a version string (`server_consumption_semantics: "verified"` only once
-   earned). An identity starts `unverified` and is promoted to
-   `behaviorally_verified` after `SEMANTICS_PROMOTE_AFTER` (5) consecutive
-   prompt turns whose reported `inputTokens` growth stays consistent with the
-   adapter's own local transcript-token estimate (see the growth gate below);
-   a single divergent turn demotes it back and the streak restarts. Verdicts
-   persist in a MACHINE-WIDE store (`<hermes-root>/shared/antigravity-acp-semantics.json`,
-   `usage_semantics_verdicts`, LRU-capped, `HERMES_ANTIGRAVITY_ACP_SEMANTICS_FILE`
-   override) and survive restarts: the verdict describes the server's
-   behavior, so one profile home earning it serves every profile under the
-   same root, and verdicts earned in the retired per-home location bridge in
-   until the identity's first shared-store record. The version-pinned frozenset this replaced went stale on
-   the day 1.5.2 shipped (2026-11-21) and silently starved accumulation while
-   an inflated `prompt_result.usage` reached compression unguarded
-   (2026-11-23 incident: 1.07M reported against a ~31K transcript); spec- or
-   source-audits of older releases (1.4.0 stage-3 canary frames, 1.4.4
-   [clean-room e2e](official-server-1.4.4-clean-room-e2e-2026-11-07.md))
-   remain historical evidence, but no longer grant the verdict. Unknown or
-   unearned servers are never summed.
-2. **Prompt-turn window** — frames are counted only between sending
-   `session/prompt` and receiving its response. This is event-order
-   correlation against the adapter's own request, NOT value equality: two
-   real calls with identical `used` both accumulate, while a model-switch
-   re-report of `last_reported_used` (emitted outside the window with zero
-   consumption) is excluded.
-3. **Nonzero** — the server's own `_maybe_send_usage_update` never reports a
-   zero delta; a zero frame can only be the new-session placeholder. Zero is
-   classified by value before the identity and window gates, so a
-   placeholder is always `dropped_zero` regardless of server identity.
+- **Prompt-result usage** (the `usage` object inside the `session/prompt`
+  RESULT: `inputTokens`/`outputTokens`/`thoughtTokens`/`cachedReadTokens`/
+  `totalTokens`) is DISCARDED by both engines: only `stopReason` is read from
+  the result; the numeric breakdown is parsed nowhere, stored nowhere, and
+  exported nowhere (the parked engine's former parser was deleted as dead
+  code with #102). This is the cumulative-consumption class that poisoned
+  Core's occupancy anchor (S1–S4); its loss is intentional and it must never
+  be re-admitted into any path reaching `completion.usage`.
+- **`usage_update` frames** (per-model-call `used`/`size` observations
+  streamed as `session/update` notifications) are KEPT, per engine:
+  - Replay: `context_occupancy` + `turn_consumption` on the completion's
+    `antigravity_usage_telemetry` attribute, plus durable `usage_totals` in
+    `cache/antigravity-acp-sessions.json` (below).
+  - Parked-MCP: the completion's `antigravity_usage_observations` attribute
+    (latest occupancy reading plus frame token fields), explicitly
+    unverified; nothing is persisted to disk by the parked engine.
+- **Core `/usage` and downstream token statistics**: because
+  `completion.usage` is `None`, Core's `record_response_usage` takes its
+  usage-less path and records NO per-model usage rows for ACP turns; session
+  token totals stay at their schema defaults. `/usage` and any report built
+  on those rows therefore show zero token consumption for ACP sessions —
+  honestly zero, where before #102 they carried inflated sums (S2: 6.03M
+  cache-read tokens on a ~140K-token transcript). Rendering "this provider
+  reports no billing usage" distinctly from "this session consumed nothing"
+  is a downstream reporting concern, not a provider-boundary one (see
+  Downstream ownership).
 
-Known limits, stated so nobody re-reads these numbers as invoices: the server
-omits zero-delta frames and excludes subagent calls, so the sum may
-under-report; there is no true input/output split; failover-replayed attempts'
-frames are not merged into the surfaced turn (the plugin's own usage store
-still records them). When no valid frames are observed, `usage` stays `None`
-and Hermes' estimate fallback remains in charge — a fabricated zero would
-suppress it.
+No new telemetry system was introduced: every kept field rides the
+pre-existing attributes and state file above.
 
-Every completed response uses this JSON-compatible shape:
+- `context_occupancy` in `antigravity_usage_telemetry`: the latest valid
+  in-turn frame reading (`used`/`size`), `is_billing_usage: false`.
+- `turn_consumption`: sum of valid nonzero frames observed inside the
+  adapter's own in-flight `session/prompt` window, this turn.
+- durable `usage_totals` in `cache/antigravity-acp-sessions.json`:
+  per-Hermes-session sums keyed ONLY by the explicit Hermes session ID
+  (never guessed; absent ID → no entry). Schema
+  `antigravity-acp-usage-totals-v1` with `summed_tokens`, `by_model`,
+  `frames_observed`, timestamps, opaque native-session hash, and provenance
+  `acp.usage_update.delta_sum(main-agent-only, may under-report, semantics
+  unverified)`.
+
+Accumulation is gated on structural lifecycle only, each rejection naming
+itself in `usage_drop_counters`: whole-frame validity (`dropped_invalid`),
+prompt-turn window (`dropped_outside_prompt_turn` — model-switch re-reports
+and session-init placeholders land here), zero placeholders (`dropped_zero`),
+missing identities (`dropped_no_session_identity`, `dropped_no_native_session`).
+Frames are protocol-validated once in `parked/usage_contract.py`
+(`usage_update_valid`, `nonnegative_usage_number`) — the single owner shared by
+both engines; neither engine may re-bind these names (AST-enforced in
+`tests/test_usage_contract_single_owner.py`).
+
+Known limits: the server omits zero-delta frames and excludes subagent calls,
+so sums may under-report; there is no input/output split; failover-replayed
+attempts' frames are not merged into the surfaced turn. When no valid frame is
+observed the fields are `null` — a fabricated zero would suppress Core's
+estimate, so it is never emitted.
+
+Telemetry shape (all-null `request_usage` is the steady state, by contract):
 
 ```json
 {
   "schema_id": "antigravity-acp-usage-v1",
   "status": "unavailable",
   "provider": "antigravity-acp",
-  "model": "gemini-3.8-flash-high",
+  "model": "<requested model>",
   "request_usage": {
-    "input_tokens": null,
-    "output_tokens": null,
-    "cache_read_tokens": null,
-    "cache_write_tokens": null,
-    "reasoning_tokens": null
+    "input_tokens": null, "output_tokens": null, "cache_read_tokens": null,
+    "cache_write_tokens": null, "reasoning_tokens": null
   },
-  "provenance": {
-    "source": "official_acp_v1.4.0",
-    "request_usage": "populated in completion.usage ONLY from the server's own session/prompt result usage breakdown; never synthesized from usage_update frames (issue #6 AC4-1)",
-    "context_occupancy": "usage_update.used is per-model-call consumption, not billing usage; size is the context window",
-    "turn_consumption": "sum of gated per-model-call consumption deltas observed this turn (main-agent-only, may under-report); observed processing, not unique-context size, billed tokens, or account quota"
-  },
-  "server_consumption_semantics": "verified",
   "native_session_id_hash": "sha256:<opaque>",
   "turn_id_hash": "sha256:<opaque>",
   "context_occupancy": null,
@@ -147,145 +135,99 @@ Every completed response uses this JSON-compatible shape:
 }
 ```
 
-The status vocabulary is `measured`, `estimated`, and `unavailable` for forward
-compatibility. This adapter currently emits only `unavailable`; it does not claim
-estimated or measured request usage. The model value identifies the requested
-model (or `antigravity-acp` when none is supplied).
+The native ACP session ID and per-turn correlation are SHA-256 opaque hashes
+only. No prompt text, raw native IDs, credentials, or vendor payloads.
 
-## Per-model-call consumption deltas and context window
+## Existing-anchor lifecycle (operational note)
 
-The official server's `usage_update.used` is the consumption delta for the
-latest model call, not cumulative native-session context occupancy. `size` is
-the context window. The response keeps the existing latest-valid observation
-under `context_occupancy`, with
-`source="acp.session/update:usage_update"` and `is_billing_usage=false`.
-The `scope` label states the reading's MEANING, which depends on the server's
-semantics: `per_model_call_consumption_delta` only for a behaviorally-verified
-identity; `unverified_server_semantics` for everything else (the value is
-retained as an opaque observation whose meaning this adapter has not
-earned).
-Only numeric, finite, nonnegative `used`/`size` values are retained for this
-response field; booleans, strings, negative values, NaN, and infinities are
-invalid. A frame carrying any present-but-invalid field is rejected as a whole
-for occupancy, so a corrupt frame never contributes its otherwise-valid
-sibling. Valid frames merge field-wise into the active prompt turn's latest
-valid observation; malformed later frames never erase it, and a valid partial
-frame updates only the fields it carries. An observation from an aborted
-attempt is not carried into the next response. If no valid update is observed,
-the field is `null`.
+`completion.usage=None` prevents NEW anchors only. An in-memory
+`agent._usage_anchor` captured before this fix is NOT cleared by usage-less
+responses (Core's usage-less path never touches it) and keeps matching while
+the transcript prefix is stable. Already-tainted live sessions therefore need
+a gateway/process restart (or a natural re-anchor) at rollout — no silent
+database rewrite is performed. This is pinned by
+`test_tainted_anchor_persists_through_real_usage_less_recording` in the
+upstream lane, which drives Core's real `record_response_usage` for both the
+poisoning turn and the later usage-less turns.
 
-Separately, every observed `usage_update` with a valid nonnegative `used` value
-is added to a durable per-Hermes-session total in
-`cache/antigravity-acp-sessions.json`, under the additive top-level `usage_totals`
-key. The key is only the explicit Hermes session ID from
-`hermes_compat.get_runtime_session_env()` (its first return value); if that ID
-is absent or empty, the adapter does not guess an identity and does not create
-a totals entry. Each entry uses schema `antigravity-acp-usage-totals-v1` and
-records the Hermes session ID, `summed_tokens` across all observed model calls,
-`by_model` token totals keyed by model name, and `model` only when the aggregate
-contains exactly one attributable model (it is `null` for mixed-model or
-unattributed totals). For a legacy multi-frame scalar total that cannot be
-reconstructed safely, the prior sum is retained under the reserved
-`by_model.__unattributed__` bucket rather than being assigned to the latest
-model. Entries also record `frames_observed`, numeric Unix-second
-`first_seen`/`last_seen` timestamps, an opaque SHA-256 hash of the native ACP
-session ID, and exact provenance
-`acp.usage_update.delta_sum(main-agent-only, may under-report)`. The existing
-`states` structure and store version remain unchanged and readable; totals
-updates use the same atomic replace strategy. No entry is created before the
-first observed valid frame.
+## Validation strategy: CI vs live canary
 
-The official server intentionally omits or loses some calls: zero-delta frames
-are omitted; a cumulative-decrease re-anchor skips a call; an unknown context
-window suppresses a frame; and subagent usage is excluded. These are known
-under-reporting limits, not grounds for estimation. The stored sum is therefore
-only the sum of valid updates actually observed by this main-agent adapter.
-Replay, resume, tool-use continuations, retry/failover, and proactive rotation
-do not convert history into request billing usage. `native_tokens` remains an
-adapter-side context-rotation estimate only. An interrupted/partial turn does
-not return a completed response telemetry object.
+CI PASS is not equivalent to "the production outage is solved"; the layers and
+their honest limits are recorded here so nobody re-conflates them.
 
-The native ACP session ID and per-prompt turn correlation are SHA-256 opaque
-hashes only. The response does not contain prompt text, raw native IDs, account
-credentials, quota endpoints, or vendor payloads.
+### CI (credential-free, every PR — no new workflows)
 
-## Downstream ownership and correlation
+- Engine contract (both engines + stateless `llm_backend`):
+  `tests/test_130_client_delta.py`, `tests/test_fake_acp_e2e.py` (incl. the
+  S4-shaped e2e), `tests/design_c/test_c_usage_semantics.py`,
+  `tests/test_llm_backend_policy_e2e.py`, `tests/test_121_client_stabilization.py`.
+  These prove: no `completion.usage` on ANY server-reported shape (plausible,
+  inflated, S4, malformed), consumption telemetry survives with the honest
+  scope, and no gate state exists (`RETIRED_NAMES` removal pin in
+  `tests/test_usage_contract_single_owner.py`).
+- Core boundary (upstream-compatibility job, unmodified Hermes):
+  `tests/test_upstream_hermes_runtime_contracts.py` — FULL-PATH regressions
+  on the measured S1–S4 incident reports plus C1/C2 controls. RED feeds the
+  pre-#102 completion shape through Core's real `record_response_usage`
+  (normalize_usage → anchor → `_preflight_request_tokens` →
+  `ContextCompressor.should_compress`): all four incidents poison the anchor
+  and fire the compression gate against the true transcript. GREEN drives the
+  SHIPPED Replay and Parked-MCP engines against the same reports: no anchor
+  forms, the local estimate governs, the gate never fires early. A lifecycle
+  test pins that an existing tainted anchor survives usage-less turns through
+  the same real recording path.
+- Red→Green evidence: the contract tests fail against `c52bc8e` (pre-fix)
+  — verified in a throwaway worktree — and pass on this branch.
+
+### Live credentialed canary (`scripts/acp_live_canary.py --parked-mcp`)
+
+The canary is a SMOKE + semantic-regression lane against the real server, not
+an endurance test:
+
+- Smoke: connection, model selection, plain response, one parked MCP tool
+  round with sentinel delivery, same-session follow-up, cancellation,
+  direct-child teardown.
+- Semantic regression (`usage_contract` verdict): for EVERY judged turn, the
+  server's actual prompt-result usage is read off the wire and the engine's
+  surfaced `completion.usage` is inspected. Server reported + engine
+  suppressed → `suppressed` PASS. Engine surfaced the sum (or invented usage)
+  → FAIL, exactly reproducing the production breach shape. Server never
+  reported usage → `unavailable` = NOT OBSERVED (inconclusive) — never a PASS.
+- NOT covered by the canary (CI-only or unverified): long multi-hour
+  endurance, real Core-side compaction decisions in the canary process, and
+  anchor lifecycle across restarts. Treat those as NOT RUN unless separately
+  executed.
+
+## Downstream ownership
 
 This repository owns only the provider-boundary attribute and the fake-ACP
-contract tests. It does not change or deploy Hermes Core, Hermes GitHub Kanban
-(HGK), installed PAR files, user profiles, databases, or running services.
+contract tests. It does not change or deploy Hermes Core, installed PAR
+files, user profiles, databases, or running services.
 
-- Hermes Core owns extraction and persistence of the response-level metadata.
-  It must preserve provider/model identity and an explicit unavailable status
-  rather than normalize missing request usage to numeric zero. It should attach
-  the active profile/account-home context from Core's execution context, not
-  infer it from this adapter payload.
-- HGK owns reporting. It should consume the explicit status, exclude
-  `unavailable` from numeric token totals, and render it as unavailable rather
-  than treating a sessions-table default zero/NULL provider as known
-  `unknown/<model>: 0` usage. Context occupancy may be displayed separately and
-  must not enter billing totals.
-- The adapter supplies provider/model plus opaque ACP session/turn correlations.
-  Core/HGK own profile, board, task, run, and worker-session attribution from the
-  scheduler/worker execution context. Those IDs are not inferable from ACP's
-  prompt protocol and must not be fabricated by the provider.
+- Hermes Core owns extraction and persistence of the response-level
+  metadata. It must preserve provider/model identity and an explicit
+  unavailable status rather than normalize missing request usage to numeric
+  zero, and it owns how its own usage recording, session rows, and reporting
+  surfaces interpret a provider that reports no billing usage.
+- The adapter supplies provider/model plus opaque ACP session/turn
+  correlations. Downstream attribution (profiles, tasks, runs, worker
+  sessions) comes from the caller's execution context; those IDs are not
+  inferable from ACP's prompt protocol and must not be fabricated here.
 
-`tests/fixtures/acp-usage-hgk-boundary.json` is a sanitized, reproducible boundary
-example: `usage=null` and no per-model usage rows coexist with a sessions row
-whose default input/output values are zero and provider is NULL; the current HGK
-fallback can consequently project `unknown/gemini-3.8-flash-high: 0`. The hashes
-in that fixture are synthetic placeholders. It documents the observed Core/HGK
-seam; its fixture-shape test is not an execution test of Core or HGK. Their
-owners must add the executable persistence/reporting regressions in their own
-repositories.
+Downstream consumers that need persistence or reporting regressions for the
+"provider reports no billing usage" case must add executable tests in their
+own repositories; this repository pins only the provider-side boundary.
 
-The observed 173 `worker_session_id`-missing runs are a separate
-run-attribution diagnostic class. They are not evidence of zero usage and are
-not caused by ACP's lack of request usage. Core/HGK owners should resolve that
-attribution class independently; this harness change does not alter it.
-
-## Credential-free validation and bounded canary
-
-Run the protocol regressions without Google credentials:
+## Credential-free quick run
 
 ```sh
 python -m pytest -q \
   tests/test_130_client_delta.py \
   tests/test_fake_acp_e2e.py \
   tests/test_121_client_stabilization.py \
-  tests/test_usage_telemetry_contract.py
+  tests/test_usage_telemetry_contract.py \
+  tests/test_usage_contract_single_owner.py
 ```
 
-A live credentialed ACP canary is not authorized by this delivery. Once the
-Core/HGK owner seams are implemented and separately approved, a bounded canary
-plan is: run one isolated Antigravity worker turn; inspect only the status,
-provider/model, opaque correlation hashes, and whether the result is measured,
-explicitly estimated, or unavailable; verify HGK excludes unavailable values
-from known token totals; then stop. Do not log prompts, credentials, raw native
-session IDs, or vendor payloads. This plan is not an authorization to deploy,
-query production databases, or run the canary now.
-
-## Fleet diagnostics: `usage_drop_counters`
-
-Every `usage_update` frame that carries a `used` value is a usage-delta
-candidate. Each candidate increments `usage_drop_counters.frames_seen`; a
-candidate rejected before `add_usage_delta` increments exactly one reason
-counter: `dropped_invalid` (whole-frame validity failure — a present-but
-invalid `used` or `size`, or missing activity stats; identical to the
-occupancy and turn-sum validity contract),
-`dropped_semantics_unverified` (server identity has not yet earned the
-behavioral verdict), `dropped_outside_prompt_turn` (frame observed outside the adapter's own
-in-flight `session/prompt` window — model-switch re-reports, session-init
-placeholders, late-drained frames), `dropped_zero` (zero-value placeholder),
-`dropped_no_session_identity` (no explicit Hermes session ID at capture time),
-or `dropped_no_native_session` (no native session ID to correlate). Frames
-that are not candidates are never counted. The counters live additively in
-the same state document beside `usage_totals` and never gate the response
-path. Separately, `dropped_inflated_turn_usage` counts `session/prompt`
-result usages rejected by the growth-consistency gate above (a different
-surface from the `usage_update` candidate counters). A store with
-`frames_seen > 0` but no totals for a session proves the
-drop happened after frame delivery; `frames_seen == 0` while the adapter is
-known to serve that session proves the adapter build itself predates the
-capture code (profile fleet drift — redeploy with
-`scripts/deploy_hermes_profiles.py`).
+The upstream-boundary file runs only in the upstream-compatibility job
+against an installed official Hermes checkout.

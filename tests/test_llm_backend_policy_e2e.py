@@ -755,13 +755,10 @@ def test_mux_launch_detection_follows_the_packaging_bundle_list(
     assert not client_module._acp_launch_is_mux(sys.executable, [])
 
 
-
-def test_backend_mode_enforces_window_cap_and_first_turn_gate_without_sharing_state(
-    monkeypatch, tmp_path
-) -> None:
-    """Issue #99 P1: stateless llm_backend requests must still run window-cap and first-turn
-    gates using only the current request's confirmed limit, with zero cross-request baseline or
-    context-limit sharing."""
+def test_backend_mode_never_exposes_usage_and_shares_no_state(monkeypatch, tmp_path) -> None:
+    """Issue #102 (stateless llm_backend): every request surfaces completion.usage=None
+    regardless of what the server reports (plausible, inflated, or S4-shaped), with zero
+    cross-request state: no registry traffic, no gate state (removed), no durable states."""
     script = tmp_path / "fake_backend_usage_server.py"
     counter_path = tmp_path / "backend_usage_counter"
     script.write_text(
@@ -802,24 +799,20 @@ for line in sys.stdin:
         emit({"jsonrpc": "2.0", "id": rid, "result": {}})
     elif method == "session/prompt":
         update({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": f"ok-{turn}"}})
+        # Diverse server-reported shapes: plausible, inflated, and the production
+        # S4 hop-sum (inputTokens=0 with a huge cachedReadTokens). None of them
+        # may surface as completion.usage on any turn.
         if turn == 1:
-            # Turn 1: current request reports 20_000 window and 25_000 inputTokens -> must reject (window cap).
             update({"sessionUpdate": "usage_update", "used": 500, "size": 20_000})
             usage = {"inputTokens": 25_000, "outputTokens": 5, "totalTokens": 25_005}
         elif turn == 2:
-            # Turn 2: no usage_update; 25_000 is within 64K first-turn slack -> must NOT inherit turn 1's 20_000 cap.
             usage = {"inputTokens": 25_000, "outputTokens": 5, "totalTokens": 25_005}
         elif turn == 3:
-            # Turn 3: no usage_update; 100_000 exceeds first-turn 8x+64K gate against tiny prompt -> must reject.
             usage = {"inputTokens": 100_000, "outputTokens": 5, "totalTokens": 100_005}
         elif turn == 4:
-            # Turn 4: 20_000 window with plausible 15_000 inputTokens -> recovers cleanly without seeding baseline.
-            update({"sessionUpdate": "usage_update", "used": 500, "size": 20_000})
-            usage = {"inputTokens": 15_000, "outputTokens": 5, "totalTokens": 15_005}
+            usage = {"inputTokens": 0, "outputTokens": 306, "thoughtTokens": 17_000,
+                     "totalTokens": 878_835, "cachedReadTokens": 861_529}
         else:
-            # Turn 5: 200_000 window with 90_000 inputTokens against tiny prompt -> independent first-turn gate
-            # (must NOT treat turn 4's 15_000 as a prior baseline where +75K might be compared differently, and
-            # still rejects 90_000 vs ~20 local tokens).
             update({"sessionUpdate": "usage_update", "used": 500, "size": 200_000})
             usage = {"inputTokens": 90_000, "outputTokens": 5, "totalTokens": 90_005}
         emit({"jsonrpc": "2.0", "id": rid, "result": {"stopReason": "end_turn", "usage": usage}})
@@ -828,9 +821,9 @@ for line in sys.stdin:
     )
 
     module, client_module = _load_module(monkeypatch, tmp_path)
-    client_module._TURN_USAGE_BASELINES.clear()
-    if hasattr(client_module, "_CONVERSATION_CONTEXT_LIMITS"):
-        client_module._CONVERSATION_CONTEXT_LIMITS.clear()
+    # Removal pin (issue #102): the gate state is gone from the engine.
+    assert not hasattr(client_module, "_TURN_USAGE_BASELINES")
+    assert not hasattr(client_module, "_CONVERSATION_CONTEXT_LIMITS")
     counters = _instrument_registry(client_module, monkeypatch)
     backend_client = module.antigravity_acp_replay.create_client(
         command=sys.executable,
@@ -841,25 +834,12 @@ for line in sys.stdin:
     )
 
     msgs = [{"role": "user", "content": "summarize this note"}]
-    r1 = backend_client.chat.completions.create(model="fake-model-a", messages=msgs, timeout=10)
-    assert r1.usage is None
-
-    r2 = backend_client.chat.completions.create(model="fake-model-a", messages=msgs, timeout=10)
-    assert r2.usage is not None and r2.usage.prompt_tokens == 25_000
-
-    r3 = backend_client.chat.completions.create(model="fake-model-a", messages=msgs, timeout=10)
-    assert r3.usage is None
-
-    r4 = backend_client.chat.completions.create(model="fake-model-a", messages=msgs, timeout=10)
-    assert r4.usage is not None and r4.usage.prompt_tokens == 15_000
-
-    r5 = backend_client.chat.completions.create(model="fake-model-a", messages=msgs, timeout=10)
-    assert r5.usage is None
+    for _ in range(5):
+        r = backend_client.chat.completions.create(model="fake-model-a", messages=msgs, timeout=10)
+        assert r.usage is None
 
     assert counters == {"get": 0, "put": 0}
-    assert client_module._TURN_USAGE_BASELINES == {}
-    if hasattr(client_module, "_CONVERSATION_CONTEXT_LIMITS"):
-        assert client_module._CONVERSATION_CONTEXT_LIMITS == {}
     state_file = tmp_path / "acp-conversation-state.json"
     if state_file.exists():
-        assert json.loads(state_file.read_text(encoding="utf-8")).get("states", {}) == {}
+        payload = json.loads(state_file.read_text(encoding="utf-8"))
+        assert payload.get("states", {}) == {}

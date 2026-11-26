@@ -14,7 +14,6 @@ from typing import Any
 from ._hermes_seam import _conversation_affinity, _DualModeCompletionCreate, completion_to_stream_chunks
 from .acp_connection import AcpConnection
 from .conversation import (
-    _nonnegative_int,
     Conversation,
     Registry,
 )
@@ -98,29 +97,16 @@ def _completion(result: dict, model: str) -> SimpleNamespace:
                               reasoning_details=None)
     completion = SimpleNamespace(
         choices=[SimpleNamespace(message=message, finish_reason=result["finish_reason"])],
-        usage=_usage(result.get("usage")), model=model)
+        # Issue #102: completion.usage is ALWAYS None. The prompt-result breakdown is a
+        # per-turn consumption sum, never a verified single-request occupancy reading, and
+        # Core treats prompt_tokens as its occupancy anchor; None lets Hermes' own estimate
+        # stand (docs/acp-usage-telemetry.md).
+        usage=None, model=model)
     # One honest observation channel (never billing): the latest usage_update frame readings, explicitly
     # labelled semantically-unverified per docs/acp-usage-telemetry.md — NOT a verified occupancy claim.
     obs = result.get("usage_observation")
     completion.antigravity_usage_observations = obs
     return completion
-
-
-def _usage(u: dict | None) -> SimpleNamespace | None:
-    """The gated ``session/prompt`` result breakdown as OpenAI-style usage; None when absent or rejected.
-
-    All three totals must be present (the old-engine required-field contract); nothing is invented here
-    and there is NO fallback to frame ``used``. None lets Hermes' own estimate stand.
-    """
-    if not u:
-        return None
-    prompt, completion, total = u.get("input_tokens"), u.get("output_tokens"), u.get("total_tokens")
-    if not all(_nonnegative_int(v) for v in (prompt, completion, total)):
-        return None
-    ns = SimpleNamespace(prompt_tokens=prompt, completion_tokens=completion, total_tokens=total)
-    if _nonnegative_int(u.get("cached_read_tokens")):
-        ns.prompt_tokens_details = SimpleNamespace(cached_tokens=u["cached_read_tokens"])
-    return ns
 
 
 class AntigravityAcpMcpClient:
