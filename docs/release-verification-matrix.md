@@ -108,11 +108,11 @@ the real-Core probe assumes POSIX UID/launcher semantics. macOS and Linux
 ARM now have real-Core registration/factory evidence, but not dedicated-UID
 isolation. No lane claims live-account validation or authenticated inference.
 The mandatory Hermes release lanes use the stable official Core baseline
-(`v0.23.3`, as pinned in [hermes-core-baseline.json](../release/hermes-core-baseline.json))
+(`v0.23.4`, as pinned in [hermes-core-baseline.json](../release/hermes-core-baseline.json))
 and the minimum `v0.21.6` strict seam. Latest upstream `main` is a separate
 advisory diagnostic; it is not evidence for the stable baseline. The pin's
 Docker image digest records provenance, not execution of that image. See
-[the compatibility policy](hermes-compatibility.md#baseline-policy--stable-v0233-current-2026-11-21).
+[the compatibility policy](hermes-compatibility.md#baseline-policy--stable-v0234-current-2026-11-25).
 The native probes keep their separately reviewed Core pin.
 
 ## Tests, cost and the subsequent main-push change
