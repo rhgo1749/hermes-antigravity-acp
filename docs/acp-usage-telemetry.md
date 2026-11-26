@@ -166,16 +166,17 @@ their honest limits are recorded here so nobody re-conflates them.
   scope, and no gate state exists (`RETIRED_NAMES` removal pin in
   `tests/test_usage_contract_single_owner.py`).
 - Core boundary (upstream-compatibility job, unmodified Hermes):
-  `tests/test_upstream_hermes_runtime_contracts.py` — S1–S4 regressions and
-  C1/C2 controls run through Core's real
-  `capture_usage_anchor` / `anchored_context_tokens` /
-  `_preflight_request_tokens`. The RED witness replays the exact production
-  payload at the boundary (old shape ⇒ ~15x inflated occupancy); the GREEN
-  test drives the REAL plugin client against an S4 fake server and asserts the
-  completion fails Core's usage-ingestion gate so the anchor is never seeded;
-  C1/C2 assert needed compaction still sees the true transcript size with and
-  without a valid anchor.
-- Red→Green evidence: the new contract tests fail against `c52bc8e` (pre-fix)
+  `tests/test_upstream_hermes_runtime_contracts.py` — FULL-PATH regressions
+  on the measured S1–S4 incident reports plus C1/C2 controls. RED feeds the
+  pre-#102 completion shape through Core's real `record_response_usage`
+  (normalize_usage → anchor → `_preflight_request_tokens` →
+  `ContextCompressor.should_compress`): all four incidents poison the anchor
+  and fire the compression gate against the true transcript. GREEN drives the
+  SHIPPED Replay and Parked-MCP engines against the same reports: no anchor
+  forms, the local estimate governs, the gate never fires early. A lifecycle
+  test pins that an existing tainted anchor survives usage-less turns through
+  the same real recording path.
+- Red→Green evidence: the contract tests fail against `c52bc8e` (pre-fix)
   — verified in a throwaway worktree — and pass on this branch.
 
 ### Live credentialed canary (`scripts/acp_live_canary.py --parked-mcp`)
