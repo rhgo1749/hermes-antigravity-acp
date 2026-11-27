@@ -31,10 +31,10 @@ through Hermes' own approval-gated terminal and file tools.
 |---|---|
 | Hermes version | `plugin.yaml` declares `requires_hermes: ">=0.21.6"` — a CI-proven floor re-run on every change (`catalog-floor-gate`); the latest upstream Hermes release is `v0.23.4`. |
 | OS support | **Ubuntu 24.04 x86_64** is the only OS with real-binary, dedicated-OS-UID clean-room execution evidence (GitHub-hosted CI; see [OS support and verification tiers](#os-support-and-verification-tiers)). **Windows x64 and Windows arm64** have real-binary hosted-CI execution evidence (actual installer + provider registration + unauthenticated ACP `initialize` on `windows-2022`/`windows-11-arm` runners) — one tier below clean-room, still executed. **Linux aarch64 and macOS arm64** are registry-pinned with publisher digests and have executed native hosted-CI lifecycle evidence (Actions run [43198795406](https://github.com/rhgo1749/hermes-antigravity-acp/actions/runs/43198795406) at `8c054be1eaa4230a87b4e5f9f23a56e3fe74ae09`: native-arch assert, publisher-pinned download + SHA-256, install → status → verify, unauthenticated ACP `initialize`, uninstall → confirmed absence) — promoted from pinned-only, still below the clean-room tier, with no authentication or model-inference coverage. Provider registration and selection/client-factory were additionally executed in Phase B run [43321929587](https://github.com/rhgo1749/hermes-antigravity-acp/actions/runs/43321929587) at `93db79996c56f6c1455b25ec29fea54bbc86c558`; these remain hosted evidence, not dedicated-UID isolation or approval of a later release SHA. |
-| Public plugin catalog | **Listed for Linux at `0.7.12`** ([official entry](https://github.com/NousResearch/hermes-agent/blob/main/plugin-catalog/antigravity-acp-provider.yaml), [admission PR](https://github.com/NousResearch/hermes-agent/pull/153182)). The catalog installs the provider only; install the matching official server separately. Publishing a repository release does not change the catalog pin. |
-| Official server binary | The current standalone release (`0.9.3`) pins ACP server `1.5.2`; the current catalog provider `0.7.12` pairs with server `1.4.4` from its pinned checkout. Both are fetched **only during an explicit install command** over HTTPS from `dl.google.com`; the publisher-pinned SHA-256 digest is verified **before** the archive is opened, extracted, or installed. No self-update; no redistribution. |
+| Public plugin catalog | **Listed for Linux at `0.8.0`** ([official entry](https://github.com/NousResearch/hermes-agent/blob/main/plugin-catalog/antigravity-acp-provider.yaml), [admission PR](https://github.com/NousResearch/hermes-agent/pull/153182)). The catalog installs the provider only; install the matching official server separately. Publishing a repository release does not change the catalog pin. |
+| Official server binary | The current standalone release (`0.9.3`) pins ACP server `1.5.2`; the current catalog provider `0.8.0` pairs with server `1.5.2` from its pinned checkout. Both are fetched **only during an explicit install command** over HTTPS from `dl.google.com`; the publisher-pinned SHA-256 digest is verified **before** the archive is opened, extracted, or installed. No self-update; no redistribution. |
 | Authentication & first model call | Credential-free CI does not validate authentication or real inference. A supervised one-prompt canary produced a real response on an earlier client version; there is no published end-to-end authentication or inference result for this candidate. This observation does not establish terms compliance for other uses. |
-| `/quota` | Unavailable / unsupported: the official server reports no billed request tokens. Since v0.7.9, `completion.usage` is populated **only** when the server itself supplies a valid per-turn usage payload — the official server currently never does, so completions carry `completion.usage=None` and Hermes uses its designed estimation fallback (`/usage` reports token records as unavailable rather than fabricated numbers). The adapter previously synthesized a prompt/completion split from `usage_update` frames; that fabrication was removed (issue #6). Durable session totals accumulate only source-verified per-call consumption deltas (see `docs/acp-usage-telemetry.md`), with `antigravity_usage_telemetry.status="unavailable"` for per-call fields; no quota command ships in the plugin. Usage, context occupancy, and billed tokens are different things — see `docs/acp-usage-telemetry.md`. |
+| Usage and quota | Both engines always return `completion.usage=None` (since v0.9.2); prompt-result usage is discarded to protect Hermes Core's context-occupancy anchor. `usage_update` observations are retained separately as non-billing, unverified telemetry. Core records no per-model usage rows for ACP turns; zero totals do not mean zero consumption. `/quota` is unsupported. See [usage telemetry](docs/acp-usage-telemetry.md). |
 
 ## Delegated children: ACP affinity fix (v0.7.9)
 
@@ -273,8 +273,8 @@ and refuses untouched any unmanaged launcher file.
 2. Check the [official catalog entry](https://github.com/NousResearch/hermes-agent/blob/main/plugin-catalog/antigravity-acp-provider.yaml)
    and check out this repository at that entry's exact `sha` (not `main`).
    From that checkout, run `python3 scripts/install_official.py` to install
-   the matching server and launcher. For example, the catalog's `0.7.12`
-   entry pins ACP server `1.4.4`; the standalone `0.9.3` release pins
+   the matching server and launcher. For example, the catalog's `0.8.0`
+   entry pins ACP server `1.5.2`; the standalone `0.9.3` release pins
    `1.5.2`. Do not use `scripts/install_acp.py install` for this step: it
    also attempts to manage provider files owned by the catalog.
 
@@ -361,8 +361,9 @@ In brief:
   prompts, tool-call payloads, session references, and media you attach reach
   the `agy_acp_server` child over stdio; every model/protocol request that
   this runtime sends onward to Google originates from that
-  Google-distributed binary. The plugin itself opens no network connections
-  and holds no credentials. Distinct from that runtime traffic: the
+  Google-distributed binary. The plugin does not connect directly to Google's
+  model service or handle Google credentials. Parked-MCP opens a per-session
+  authenticated loopback HTTP endpoint on `127.0.0.1` for Hermes tool calls. Distinct from that runtime traffic: the
   standalone installer fetches the pinned server archive over HTTPS from
   `dl.google.com` during an explicit install command — installer asset
   retrieval, not model/protocol traffic. This repository neither observes
@@ -375,15 +376,16 @@ In brief:
   continuation and affinity values — never Google credentials); Hermes-side
   file access stays behind Hermes' path-safety, redaction, and write-denial
   policy.
-- **Persisted state.** Opaque hashed session-continuation and learned-limit
-  checkpoints under `~/.hermes/cache/` (0600, bounded, expiring), installer
+- **Persisted state.** Replay session-continuation checkpoints (including the native ACP
+  session ID needed for resume) and learned-limit state under the selected
+  Hermes home's `cache/` (0600, bounded, expiring; see the detailed data
+  disclosure). Telemetry uses hashes rather than raw native session IDs, installer
   state under `~/.local/opt`, `~/.local/bin`, and the plugin tree. Google
   sign-in state is managed by Google's runtime in your user environment.
 - **Telemetry.** This plugin sends no telemetry of its own; usage reporting is
-  truthful (`completion.usage` is populated only when the server itself
-  supplies a valid per-turn usage payload — currently it never does, so
-  `completion.usage=None` and `status="unavailable"`; no counts are ever
-  synthesized). Any independent
+  separate from billing: both engines always return `completion.usage=None`;
+  prompt-result usage is discarded and `usage_update` observations are kept
+  separately as unverified, non-billing telemetry. Any independent
   network or background behavior inside the proprietary vendor binary is
   attributed to Google's runtime and is neither observed nor speculated about
   in this repository.
@@ -688,31 +690,20 @@ redaction; `fs/write` callbacks are denied. Review
 [`docs/data-and-permissions.md`](docs/data-and-permissions.md)
 before use.
 
-**Usage telemetry is explicit and truthful:** the pinned official ACP server
-does not report actual billed request tokens. When ACP's final prompt response
-includes a valid usage breakdown, `completion.usage` carries its input, output,
-reasoning, and cache-read counts where available. The official server currently
-never supplies such a breakdown, and since v0.7.9 the adapter no longer
-synthesizes any prompt/completion split from `usage_update` frames (the
-pre-v0.7.9 consumption-proxy split was removed as fabricated; see issue #6 and
-`docs/acp-usage-telemetry.md`). With no valid server-provided per-turn usage,
-completions keep `completion.usage=None` and Hermes applies its designed
-estimation fallback for context management, while `/usage` reports token
-records as unavailable rather than fabricated numbers. Every response also
-carries a response-level
-`antigravity_usage_telemetry` attribute with `status="unavailable"` and null
-request-usage buckets: the telemetry attribute never populate request usage
-buckets. Official
-`usage_update` counters are retained only as non-billing
-`context_occupancy` readings, and durable session totals accumulate only
-source-verified per-call consumption deltas from verified server identities.
-See `docs/acp-usage-telemetry.md` for the
-contract and credential-free tests. **Quota visibility (`/quota`) is
-unavailable/unsupported in this public product:** the official ACP server
-exposes no permitted quota data source or supported extension point, so no
-quota command ships in the plugin and none is planned here without a
-vendor-sanctioned surface. Do not
-conflate reported usage, context occupancy, and billed tokens.
+**Usage telemetry:** since v0.9.2, both engines always return
+`completion.usage=None`. The ACP prompt-result usage breakdown is discarded:
+per-turn consumption sums are not context-occupancy readings and must not
+seed Hermes Core's occupancy anchor. Existing contaminated anchors can
+survive gateway restarts. Core records no per-model usage rows for ACP turns;
+zero totals are not evidence of zero consumption.
+
+Valid `usage_update` observations are retained separately as non-billing,
+unverified server telemetry. Replay exposes `antigravity_usage_telemetry`
+and persists per-session frame sums; Parked-MCP exposes
+`antigravity_usage_observations` without persisting those observations.
+See [usage telemetry](docs/acp-usage-telemetry.md) for the exact contract.
+Quota visibility (`/quota`) is unsupported; do not conflate observations,
+context occupancy, consumption, and billed tokens.
 
 ## Troubleshooting
 
