@@ -46,7 +46,9 @@ harness-owned MCP tool (`canary_echo`) plus a throwaway cancellation probe.
    lost, not the cancel contract.
 8. **`normal_teardown`** — confirms every direct ACP child spawned during the run
    exited (`[]` → `inconclusive`; unexited child → `fail`). F-3 descendant-tree
-   reaping (issue #94) is out of scope (`not asserted`).
+   reaping (issue #94) is not asserted by the live canary (`not asserted`);
+   descendant-tree contracts are verified offline by `tests/test_parked_process_tree_native.py`
+   and `tests/design_c/` (`test_c_connection.py`, `test_c_conversation.py`).
 
 ## Lanes and usage
 

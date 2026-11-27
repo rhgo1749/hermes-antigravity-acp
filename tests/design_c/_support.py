@@ -69,3 +69,19 @@ def make_conv(tmp_path: Path, script: list[Any], new_delay: float = 0, **kw: Any
         return conn
 
     return Conversation("k1", spawn, **kw), log
+
+
+def tree_helpers():
+    import importlib.util
+    import sys
+    mod = sys.modules.get("test_parked_process_tree_native")
+    if mod is not None:
+        return mod
+    spec = importlib.util.spec_from_file_location(
+        "test_parked_process_tree_native", ROOT / "tests" / "test_parked_process_tree_native.py"
+    )
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["test_parked_process_tree_native"] = mod
+    spec.loader.exec_module(mod)
+    return mod

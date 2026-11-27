@@ -1,4 +1,8 @@
+import contextlib
 import json
+import os
+import signal
+import types
 import sys
 import threading
 
@@ -7,7 +11,7 @@ import pytest
 from antigravity_acp_mcp.acp_connection import AcpConnection, AcpProcessExit, AcpRpcError
 from antigravity_acp_mcp.conversation import Conversation, ProviderError
 
-from ._support import SYS, TOOLS, dump
+from ._support import SYS, TOOLS, dump, tree_helpers
 
 
 def test_early_update_before_session_new_reply_is_buffered_and_flushed(connect):
@@ -216,3 +220,131 @@ def test_close_reaps_the_child(connect):
     conn = connect()
     conn.close()
     assert conn._proc.poll() is not None
+
+
+def test_cgroup_containment_hook_dispatches_and_falls_back(tmp_path, monkeypatch):
+    import antigravity_acp_mcp.acp_connection as mod
+
+    h = tree_helpers()
+    events = []
+
+    class _FakeContainment:
+        def __init__(self, ok: bool) -> None:
+            self._ok = ok
+
+        def wrap_argv(self, argv):
+            events.append(("wrap", list(argv)))
+            return list(argv)
+
+        def pass_fds(self):
+            return ()
+
+        def confirm(self):
+            events.append(("confirm", self._ok))
+            return self._ok
+
+        def abort(self):
+            events.append(("abort", None))
+
+    orig_td = mod._process_teardown.terminate_process_tree
+
+    def _fake_contained_td(proc, c, graceful_stdin=False):
+        events.append(("contained", graceful_stdin))
+        res = orig_td(proc, graceful_stdin=graceful_stdin, session_leader=True)
+        if res is None and os.name != "nt":
+            # Simulate cgroup.kill sweeping survivors even after poll() reaped leader.
+            with contextlib.suppress(OSError):
+                os.killpg(proc.pid, signal.SIGKILL)
+            return True
+        return res
+
+    monkeypatch.setattr(mod._process_teardown, "terminate_contained_tree", _fake_contained_td)
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+
+    for name, confirm_ok, cfg in (
+        ("cg_ok", True, {}),
+        ("cg_waitid_fb", True, {"wrapper_exits_early": True, "wrapper_exit_code": 11, "hang_init": True}),
+        ("cg_abort", False, {}),
+    ):
+        events.clear()
+        sdir, _, cmd, args = h._write_fixture(tmp_path, name, cfg)
+        fake = _FakeContainment(confirm_ok)
+        monkeypatch.setattr(mod._cgroup_containment.Containment, "begin", classmethod(lambda cls, f=fake: f))
+        orig_enabled = mod._process_teardown._non_reaping_enabled
+        if name == "cg_waitid_fb":
+            monkeypatch.setattr(mod._process_teardown, "_non_reaping_enabled", False)
+        conn = AcpConnection(cmd, args, str(cwd))
+        pids = []
+        try:
+            conn.start()
+            pids = h._tree_pids(sdir)
+            if name == "cg_waitid_fb":
+                with pytest.raises(AcpProcessExit) as exc_info:
+                    conn.initialize(timeout=6.0)
+                assert exc_info.value.exit_status == 11
+                assert ("contained", False) in events
+            else:
+                if not confirm_ok:
+                    assert ("abort", None) in events and conn._containment is None
+                conn.initialize(timeout=15)
+                assert conn.close() is True
+                assert (("contained", False) in events) is confirm_ok
+            assert h._wait_until(lambda: all(not h._pid_alive(p) for p in pids), timeout=5.0)
+        finally:
+            mod._process_teardown._non_reaping_enabled = orig_enabled
+            with contextlib.suppress(Exception):
+                conn.close()
+            h._cleanup_state(sdir, pids, conn._proc)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX stdout-close behavior")
+def test_posix_stdout_close_while_alive_terminates_and_unblocks_threads(tmp_path):
+    h = tree_helpers()
+    sdir, _, cmd, args = h._write_fixture(tmp_path, "close_stdout", {"close_stdout_then_wait": True, "ignore_sigterm": True})
+    cwd = tmp_path / "cwd_co"
+    cwd.mkdir()
+    conn = AcpConnection(cmd, args, str(cwd))
+    pids = []
+    try:
+        conn.start()
+        pids = h._tree_pids(sdir)
+        conn.close()
+        assert h._wait_until(lambda: all(not h._pid_alive(p) for p in pids), timeout=5.0)
+        assert all(not t.is_alive() for t in conn._threads)
+    finally:
+        with contextlib.suppress(Exception):
+            conn.close()
+        h._cleanup_state(sdir, pids, conn._proc)
+
+
+def test_windows_spawn_contract_uses_hide_flags_and_no_new_session(tmp_path, monkeypatch):
+    import antigravity_acp_mcp.acp_connection as mod
+
+    captured = []
+
+    class _FakeProc:
+        pid = 424242
+        returncode = None
+        stdin = types.SimpleNamespace(closed=True, close=lambda: None)
+        stdout = iter(())
+        stderr = types.SimpleNamespace(readline=lambda _n=0: b"")
+
+        def poll(self):
+            return 0
+
+        def wait(self, timeout=None):
+            return 0
+
+    monkeypatch.setattr(mod.os, "name", "nt")
+    monkeypatch.setattr(mod, "_build_subprocess_env", lambda: {})
+    monkeypatch.setattr(mod, "_windows_hide_flags", lambda: 0x08000000)
+    monkeypatch.setattr(mod._cgroup_containment.Containment, "begin", classmethod(lambda cls: None))
+    monkeypatch.setattr(mod.subprocess, "Popen", lambda argv, **kw: (captured.append(kw), _FakeProc())[-1])
+    conn = AcpConnection("fake.exe", ["--acp"], str(tmp_path))
+    conn.start()
+    try:
+        assert captured[0]["start_new_session"] is False
+        assert captured[0]["creationflags"] == 0x08000000
+    finally:
+        conn.close()

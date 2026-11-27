@@ -10,12 +10,19 @@ Security posture (PlanC components 1, H2, H3, L1):
 from __future__ import annotations
 
 import collections
+import contextlib
+import importlib
+import importlib.util
 import itertools
 import json
 import logging
+import os
 import subprocess
+import sys
 import threading
+import time
 from collections.abc import Callable, Mapping, Sequence
+from pathlib import Path
 from typing import Any
 
 from ._upstream import (
@@ -24,6 +31,41 @@ from ._upstream import (
     _build_subprocess_env,
     _redact_acp_error_detail,
 )
+
+
+def _load_parent_module(name: str) -> Any:
+    """Load sibling module from the parent plugin package under both package layouts."""
+    if __package__ and "." in __package__:
+        return importlib.import_module(f"..{name}", __package__)
+    cache_name = f"_antigravity_acp_parent.{name}"
+    cached = sys.modules.get(cache_name)
+    if cached is not None:
+        return cached
+    module_path = Path(__file__).resolve().parents[1] / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(cache_name, module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load {name} from {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[cache_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(cache_name, None)
+        raise
+    return module
+
+
+_process_teardown = _load_parent_module("process_teardown")
+_cgroup_containment = _load_parent_module("cgroup_containment")
+_windows_hide_flags = _load_parent_module("hermes_compat").windows_hide_flags
+
+
+def _non_reaping_active() -> bool:
+    return bool(
+        getattr(_process_teardown, "_NON_REAPING_SUPPORTED", False)
+        and getattr(_process_teardown, "_non_reaping_enabled", False)
+    )
+
 
 log = logging.getLogger(__name__)
 
@@ -50,6 +92,8 @@ CANCELLED_OUTCOME = {"outcome": {"outcome": "cancelled"}}
 _STDERR_KEEP_LINES = 200
 _STDERR_LINE_CHARS = 4096
 _UPDATE_BUFFER_LIMIT = 10_000
+_CLOSE_STDIN_LOCK_TIMEOUT = 0.5
+_REQUEST_POLL_INTERVAL = 0.1
 
 # on_permission(params) -> response result, or None to leave the request pending until
 # ``cancel_session`` (or ``respond``) answers it.
@@ -135,6 +179,14 @@ class AcpConnection:
         self._exit_error: AcpProcessExit | None = None
         self._exited = threading.Event()
         self._threads: list[threading.Thread] = []
+        self._teardown_lock = threading.Lock()
+        self._teardown_done = False
+        self._teardown_verified: bool | None = None
+        self._stdin_close_attempted = False
+        self._exit_finalized = False
+        self._close_requested = threading.Event()
+        self._containment: Any = None
+        self._spawned_session_leader = False
         self.agent_info: dict[str, Any] = {}
         self.agent_capabilities: dict[str, Any] = {}
         self.supports_images = False
@@ -148,20 +200,62 @@ class AcpConnection:
     def start(self) -> None:
         env = _build_subprocess_env()
         env.update(self._mux_env)
-        self._proc = subprocess.Popen(
-            self._argv,
-            cwd=self._cwd,
-            env=env,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
+        popen_kwargs: dict[str, Any] = {
+            "cwd": self._cwd,
+            "env": env,
+            "stdin": subprocess.PIPE,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            # Own session/process group on POSIX so process_teardown verifies
+            # leadership (pgid == proc.pid) and sweeps wrapper descendants.
+            "start_new_session": os.name != "nt",
+        }
+        if os.name == "nt":
+            hide_flags = _windows_hide_flags()
+            if hide_flags:
+                popen_kwargs["creationflags"] = hide_flags
+        containment = _cgroup_containment.Containment.begin()
+        argv = self._argv
+        if containment is not None:
+            argv = containment.wrap_argv(self._argv)
+            popen_kwargs["pass_fds"] = containment.pass_fds()
+        try:
+            proc = subprocess.Popen(argv, **popen_kwargs)
+        except BaseException:
+            if containment is not None:
+                containment.abort()
+            raise
+        if containment is not None and not containment.confirm():
+            with contextlib.suppress(OSError):
+                proc.kill()
+            with contextlib.suppress(Exception):
+                proc.wait(timeout=5.0)
+            containment.abort()
+            containment = None
+            popen_kwargs.pop("pass_fds", None)
+            proc = subprocess.Popen(self._argv, **popen_kwargs)
+        if proc.stdin is None or proc.stdout is None or proc.stderr is None:
+            self._terminate_owned_tree(proc, containment=containment)
+            if containment is not None:
+                containment.abort()
+            raise RuntimeError("ACP child process did not expose stdio pipes.")
+        self._containment = containment
+        self._spawned_session_leader = bool(popen_kwargs.get("start_new_session"))
+        if containment is not None:
+            with contextlib.suppress(AttributeError):
+                _cgroup_containment.attach(proc, containment)
+        self._proc = proc
         self._threads = [
             threading.Thread(target=self._read_stdout, name="acp-stdout", daemon=True),
             threading.Thread(target=self._read_stderr, name="acp-stderr", daemon=True),
         ]
-        for t in self._threads:
-            t.start()
+        try:
+            # Start stderr drainer before stdout so _on_exit never joins an unstarted stderr thread.
+            for t in reversed(self._threads):
+                t.start()
+        except BaseException:
+            self.close()
+            raise
 
     def _build_client_capabilities(self) -> dict[str, Any]:
         # Per ACP v1 spec, only advertise fs/* or terminal when the corresponding client handlers are registered.
@@ -197,27 +291,92 @@ class AcpConnection:
         self.supports_http_mcp = bool(mcaps.get("http"))
         return result
 
-    def close(self) -> None:
-        """Reap the child: stdin EOF, then terminate, then kill."""
+    def _close_stdin(
+        self,
+        proc: subprocess.Popen[bytes],
+        *,
+        timeout: float = _CLOSE_STDIN_LOCK_TIMEOUT,
+    ) -> bool:
+        if not self._write_lock.acquire(timeout=timeout):
+            # Never call proc.stdin.close() without _write_lock: CPython's
+            # BufferedWriter acquires an internal I/O lock and would block
+            # indefinitely behind a stalled writer on a live child pipe.
+            log.warning(
+                "ACP stdin close skipped for pid %s: write lock held after %.2fs",
+                getattr(proc, "pid", None),
+                timeout,
+            )
+            return False
+        try:
+            if proc.stdin and not proc.stdin.closed:
+                proc.stdin.close()
+            return True
+        except (OSError, ValueError):
+            return True
+        finally:
+            self._write_lock.release()
+
+    def _terminate_owned_tree(
+        self,
+        proc: subprocess.Popen[bytes],
+        *,
+        containment: Any = None,
+    ) -> bool | None:
+        active = containment if containment is not None else (self._containment or _cgroup_containment.of(proc))
+        if active is not None:
+            return _process_teardown.terminate_contained_tree(proc, active, graceful_stdin=False)
+        return _process_teardown.terminate_process_tree(
+            proc,
+            graceful_stdin=False,
+            session_leader=self._spawned_session_leader,
+        )
+
+    def close(self) -> bool | None:
+        """Tear down and reap the ACP child and plugin-owned descendants (idempotent)."""
         proc = self._proc
         if proc is None:
-            return
-        try:
-            with self._write_lock:
-                if proc.stdin and not proc.stdin.closed:
-                    proc.stdin.close()
-        except (OSError, ValueError):
-            pass
-        for stop in (None, proc.terminate, proc.kill):
-            if stop:
-                stop()
-            try:
-                proc.wait(timeout=2.0)
-                break
-            except subprocess.TimeoutExpired:
-                continue
+            return None
+        self._close_requested.set()
+        with self._teardown_lock:
+            if not self._teardown_done:
+                # Terminate the owned tree before closing stdin: on Windows taskkill /T
+                # requires a live parent PID, and acquiring _write_lock first could block
+                # behind a concurrent _send() stalled on a hung child pipe.
+                verified = self._terminate_owned_tree(proc)
+                stdin_closed = self._close_stdin(proc)
+                self._stdin_close_attempted = True
+                if not stdin_closed and verified is True:
+                    verified = False
+                self._teardown_verified = verified
+                if verified is not True:
+                    log.warning(
+                        "ACP teardown for pid %s was not verified (result=%r, stdin_closed=%s)",
+                        getattr(proc, "pid", None),
+                        verified,
+                        stdin_closed,
+                    )
+                self._teardown_done = True
+            elif not self._stdin_close_attempted:
+                self._stdin_close_attempted = True
+                if not self._close_stdin(proc) and self._teardown_verified is True:
+                    self._teardown_verified = False
+            elif proc.stdin and not proc.stdin.closed:
+                # Non-blocking retry to reclaim fd if an earlier stalled writer has since exited.
+                self._close_stdin(proc, timeout=0.0)
+        join_budget = 2.0 if self._teardown_verified is True else 0.25
+        deadline = time.monotonic() + join_budget
+        current = threading.current_thread()
         for t in self._threads:
-            t.join(timeout=2.0)
+            if t is not current and t.is_alive():
+                remaining = deadline - time.monotonic()
+                if remaining > 0:
+                    t.join(timeout=remaining)
+        self._finalize_exit(proc, join_stderr=False, wait_for_exit=False)
+        return self._teardown_verified
+
+    @property
+    def teardown_verified(self) -> bool | None:
+        return self._teardown_verified
 
     @property
     def cwd(self) -> str:
@@ -238,6 +397,12 @@ class AcpConnection:
 
     # -- client -> agent -----------------------------------------------------------
 
+    def _poll_dead_child(self, proc: subprocess.Popen[bytes] | None) -> AcpProcessExit | None:
+        if proc is None or not _process_teardown.proc_dead_unreaped(proc):
+            return None
+        self._finalize_exit(proc, join_stderr=False, wait_for_exit=False)
+        return self._exit_error
+
     def request(
         self,
         method: str,
@@ -247,25 +412,52 @@ class AcpConnection:
         on_response: Callable[[], None] | None = None,
     ) -> Any:
         slot = _Pending(on_response=on_response)
+        proc = self._proc
+        if self._exit_error is None and not self._close_requested.is_set():
+            if (dead_err := self._poll_dead_child(proc)) is not None:
+                raise dead_err
         with self._lock:
             if self._exit_error is not None:
                 raise self._exit_error
-            rid = next(self._ids)
-            self._pending[rid] = slot
+            close_in_progress = self._close_requested.is_set()
+            if not close_in_progress:
+                rid = next(self._ids)
+                self._pending[rid] = slot
+        if close_in_progress:
+            wait_limit = 5.0 if timeout is None else min(5.0, max(0.0, timeout))
+            self._exited.wait(wait_limit)
+            raise self._exit_error or AcpProcessExit(
+                "ACP connection closed",
+                exit_status=getattr(proc, "returncode", None),
+                retry_class=self._stderr_class,
+            )
         try:
             self._send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
         except (OSError, ValueError):
-            self._exited.wait(5.0)  # the reader builds the typed error
+            if not self._close_requested.is_set():
+                self._poll_dead_child(proc)
+            self._exited.wait(2.0 if self._close_requested.is_set() else 5.0)
             with self._lock:
                 self._pending.pop(rid, None)
             raise self._exit_error or AcpError("ACP child stdin closed") from None
-        if not slot.event.wait(timeout):
-            with self._lock:
-                self._pending.pop(rid, None)
-            raise TimeoutError(f"ACP request {method} timed out after {timeout}s")
-        if slot.error is not None:
-            raise slot.error
-        return slot.result
+        deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
+        while True:
+            step = (
+                _REQUEST_POLL_INTERVAL
+                if deadline is None
+                else min(_REQUEST_POLL_INTERVAL, max(0.0, deadline - time.monotonic()))
+            )
+            if slot.event.wait(step):
+                if slot.error is not None:
+                    raise slot.error
+                return slot.result
+            if deadline is not None and time.monotonic() >= deadline:
+                break
+            if not self._exited.is_set() and not self._close_requested.is_set():
+                self._poll_dead_child(proc)
+        with self._lock:
+            self._pending.pop(rid, None)
+        raise TimeoutError(f"ACP request {method} timed out after {timeout}s")
 
     def notify(self, method: str, params: dict[str, Any]) -> None:
         try:
@@ -436,8 +628,13 @@ class AcpConnection:
         if cancel_client:
             self._send_error(req_id, -32800, "Request cancelled")
 
-    def _dispatch_client_handler(self, request_id: Any, method: str, handler: ClientHandler,
-                                 params: dict[str, Any]) -> None:
+    def _dispatch_client_handler(
+        self,
+        request_id: Any,
+        method: str,
+        handler: ClientHandler,
+        params: dict[str, Any],
+    ) -> None:
         cancelled = threading.Event()
         with self._lock:
             self._active_client_reqs[request_id] = cancelled
@@ -501,21 +698,72 @@ class AcpConnection:
     def _on_exit(self) -> None:
         proc = self._proc
         assert proc is not None
-        try:
-            status = proc.wait(timeout=5.0)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            status = proc.wait()
-        self._threads[1].join(timeout=2.0)  # let stderr finish so the diagnostic is complete
-        error = AcpProcessExit(
-            f"ACP child exited with status {status}; {_acp_stderr_diagnostic(list(self._stderr))}",
-            exit_status=status,
-            retry_class=self._stderr_class or _acp_stderr_retry_class(list(self._stderr)),
-        )
+        # On supported POSIX (waitid WNOWAIT), wait briefly without reaping so natural
+        # exit codes and zombie group leadership survive until tree sweep. Without
+        # non-reaping waitid on POSIX, skip polling so _terminate_owned_tree runs first.
+        if not self._teardown_done and (_non_reaping_active() or os.name == "nt"):
+            deadline = time.monotonic() + 2.0
+            while (
+                not self._teardown_done
+                and not self._close_requested.is_set()
+                and not _process_teardown.proc_dead_unreaped(proc)
+                and time.monotonic() < deadline
+            ):
+                self._close_requested.wait(0.02)
+        self._finalize_exit(proc, join_stderr=True)
+
+    def _finalize_exit(
+        self,
+        proc: subprocess.Popen[bytes],
+        *,
+        join_stderr: bool = True,
+        wait_for_exit: bool = True,
+    ) -> None:
+        resolved: int | None = None
+        with self._teardown_lock:
+            if not self._teardown_done:
+                if _non_reaping_active():
+                    resolved = _process_teardown.proc_exit_status_unreaped(proc)
+                verified = self._terminate_owned_tree(proc)
+                self._teardown_verified = verified
+                if verified is not True:
+                    log.warning(
+                        "ACP teardown on exit for pid %s was not verified (result=%r)",
+                        getattr(proc, "pid", None),
+                        verified,
+                    )
+                self._teardown_done = True
         with self._lock:
+            if self._exit_finalized:
+                return
+        if resolved is None:
+            resolved = proc.returncode
+        if resolved is None:
+            if wait_for_exit and not (self._close_requested.is_set() and self._teardown_verified is not True):
+                with contextlib.suppress(Exception):
+                    resolved = proc.wait(timeout=1.0)
+            else:
+                with contextlib.suppress(Exception):
+                    resolved = proc.poll()
+        if (
+            (join_stderr or self._teardown_verified is True)
+            and len(self._threads) > 1
+            and self._threads[1].ident is not None
+            and self._threads[1] is not threading.current_thread()
+        ):
+            self._threads[1].join(timeout=2.0 if join_stderr else 0.3)
+        with self._lock:
+            if self._exit_finalized:
+                return
+            self._exit_finalized = True
+            error = AcpProcessExit(
+                f"ACP child exited with status {resolved}; {_acp_stderr_diagnostic(list(self._stderr))}",
+                exit_status=resolved,
+                retry_class=self._stderr_class or _acp_stderr_retry_class(list(self._stderr)),
+            )
             self._exit_error = error
             pending, self._pending = list(self._pending.values()), {}
-        for slot in pending:
-            slot.error = error
-            slot.event.set()
-        self._exited.set()
+            for slot in pending:
+                slot.error = error
+                slot.event.set()
+            self._exited.set()

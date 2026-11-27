@@ -776,6 +776,8 @@ class Conversation:
                 raise self._fail(gen, "cancelled", CancelledByUser("request cancelled"))
             if self.gen != gen and th.is_alive():
                 raise ProviderError("superseded by a newer request")
+        if token.is_set():
+            raise self._fail(gen, "cancelled", CancelledByUser("request cancelled"))
         error = done.get("error")
         if error is not None:
             with self.lock:
@@ -792,21 +794,24 @@ class Conversation:
         never kept. The vendor's compute stop after ``session/cancel`` is not
         observable here, and Core's request-slot worker may exit before a daemon
         retiree could signal the tree — so the interrupt path itself closes the
-        connection (stdin EOF, terminate, kill; the reader thread reaps the
-        zombie). Warm reuse across turns stays for supersede/deadline/replay.
-        Fast in practice: no protocol response is awaited, only local signals.
+        connection (bounded grace for an in-flight ``session/cancel`` flush, then
+        owned-tree terminate, kill, and reap). Warm reuse across turns stays for
+        supersede/deadline/replay.
         """
         if token is not None:
             token.set()
-        conn, cwd, owns_cwd = None, None, False
+        conn, cwd, owns_cwd, prompt_thread = None, None, False, None
         with self.lock:
             if token is None or self.owner_token is token:
+                prompt_thread = self.prompt_thread
                 self._retire("cancelled")
                 self.closed = True
                 conn, self.conn = self.conn, None
                 cwd, owns_cwd = self.cwd, self._owns_cwd
         try:
             if conn is not None:
+                if prompt_thread is not None and prompt_thread is not threading.current_thread() and not conn.exited:
+                    prompt_thread.join(timeout=0.5)
                 conn.close()
         finally:
             if owns_cwd and cwd is not None:
@@ -1020,13 +1025,17 @@ class Conversation:
         return obs
 
     def _fail(self, gen: int, reason: str, exc: ProviderError, *, drop_conn: bool = False) -> ProviderError:
+        prompt_thread = None
         with self.lock:
             if self.gen == gen:
+                prompt_thread = self.prompt_thread
                 self._retire(reason)
             conn = None
             if drop_conn or (self.conn is not None and self.conn.exited):
                 conn, self.conn = self.conn, None
         if conn is not None:
+            if prompt_thread is not None and prompt_thread is not threading.current_thread() and not conn.exited:
+                prompt_thread.join(timeout=0.5)
             conn.close()  # a fresh child next time (clears a sticky rate-limit flag, a dead process)
         return exc
 
@@ -1034,8 +1043,11 @@ class Conversation:
         while True:
             if token.is_set():
                 raise self._fail(gen, "cancelled", CancelledByUser("request cancelled"))
-            if self.gen != gen:
-                raise ProviderError(f"Antigravity session ended ({self.retire_reason})")
+            with self.lock:
+                retired = self.gen != gen
+                retire_reason = self.retire_reason
+            if retired:
+                raise ProviderError(f"Antigravity session ended ({retire_reason})")
             self._drain_updates(gen)
             conn = self.conn
             if conn is not None and conn.saw_rate_limit:
@@ -1052,6 +1064,17 @@ class Conversation:
                 if kind == "call":
                     payload.answer("session retired", is_error=True)
                 continue
+            if token.is_set():
+                if kind == "call":
+                    payload.answer("session retired", is_error=True)
+                raise self._fail(gen, "cancelled", CancelledByUser("request cancelled"))
+            with self.lock:
+                retired = self.gen != gen
+                retire_reason = self.retire_reason
+            if retired:
+                if kind == "call":
+                    payload.answer("session retired", is_error=True)
+                raise ProviderError(f"Antigravity session ended ({retire_reason})")
             if kind == "call":
                 calls = [payload] if payload.state == "parked" else []
                 until = time.monotonic() + self.collect_window

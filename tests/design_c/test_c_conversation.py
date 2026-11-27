@@ -5,21 +5,24 @@ import json
 import os
 import sys
 import threading
+import subprocess
 import time
+import types
 
 import pytest
 
-from antigravity_acp_mcp.acp_connection import AcpConnection
-from antigravity_acp_mcp.client import AntigravityAcpMcpClient
+from antigravity_acp_mcp.acp_connection import AcpConnection, AcpProcessExit
+from antigravity_acp_mcp.client import AntigravityAcpMcpClient, _spawn_factory
 from antigravity_acp_mcp.conversation import (
     GUARD_TEXT,
     CancelledByUser,
     Conversation,
     RateLimited,
+    Registry,
     StepTimeout,
 )
 
-from ._support import FAKE_AGY as FAKE, SYS, TOOLS, asst, events, make_conv, tool_rows
+from ._support import FAKE_AGY as FAKE, SYS, TOOLS, asst, events, make_conv, tool_rows, tree_helpers
 
 U1 = {"role": "user", "content": "check a and b"}
 SAMPLE_429 = ("E1123 02:31:21.478230     119 errorreport.go:273] Error 429, Message: Resource has been exhausted "
@@ -861,3 +864,217 @@ def test_rhgo1749_concurrent_same_name_sibling_completion_does_not_evict_retry(t
         assert [e["n"] for e in ev if e["ev"] == "prompt"] == [0]
     finally:
         conv.close()
+
+
+def test_await_prefers_cancelled_over_process_exit_error_race(tmp_path):
+    conv = Conversation("k1", lambda *_a: None, cwd=str(tmp_path))
+    try:
+        token = threading.Event()
+        gen = conv.gen
+        orig_get = conv.events.get
+
+        def raced_get(*args, **kwargs):
+            item = orig_get(*args, **kwargs)
+            # Simulate cancel() setting token + advancing gen right as teardown
+            # kills the child and emits AcpProcessExit(-15) into events.
+            token.set()
+            with conv.lock:
+                conv.gen += 1
+                conv.retire_reason = "cancelled"
+            return item
+
+        conv.events.put((gen, "error", AcpProcessExit("killed", exit_status=-15, retry_class=None)))
+        conv.events.get = raced_get
+        with pytest.raises(CancelledByUser):
+            conv._await([SYS, U1], gen, token)
+    finally:
+        conv.close()
+
+
+def test_open_interruptibly_prefers_cancelled_when_opener_exits_on_teardown(tmp_path, monkeypatch):
+    conv = Conversation("k1", lambda *_a: None, cwd=str(tmp_path))
+    try:
+        token = threading.Event()
+        gen = conv.gen
+
+        def fake_open(*_args, **_kwargs):
+            token.set()
+            raise AcpProcessExit("killed", exit_status=-15, retry_class=None)
+
+        monkeypatch.setattr(conv, "_open_and_prompt", fake_open)
+        with pytest.raises(CancelledByUser):
+            conv._open_interruptibly(gen, [SYS, U1], [], "m", "[]", token)
+    finally:
+        conv.close()
+
+
+def test_cancel_allows_prompt_thread_to_flush_session_cancel_before_conn_close(tmp_path):
+    conv = Conversation("k1", lambda *_a: None, cwd=str(tmp_path))
+    try:
+        events_seq: list[str] = []
+        cancel_sent = threading.Event()
+        prompt_done = threading.Event()
+
+        class _FakeConn:
+            exited = False
+
+            def close(self):
+                events_seq.append(f"conn_close:prompt_done={prompt_done.is_set()}")
+
+        class _FakeSession:
+            def cancel(self):
+                events_seq.append("session_cancel")
+                cancel_sent.set()
+
+            def close(self):
+                pass
+
+        def _prompt_worker():
+            if cancel_sent.wait(timeout=2.0):
+                time.sleep(0.05)
+                prompt_done.set()
+                events_seq.append("prompt_finished")
+
+        th = threading.Thread(target=_prompt_worker, daemon=True)
+        th.start()
+
+        token = threading.Event()
+        with conv.lock:
+            conv.owner_token = token
+            conv.conn = _FakeConn()
+            conv.session = _FakeSession()
+            conv.prompt_thread = th
+
+        conv.cancel(token)
+        assert events_seq == [
+            "session_cancel",
+            "prompt_finished",
+            "conn_close:prompt_done=True",
+        ]
+    finally:
+        conv.close()
+
+
+def test_cancel_idle_reap_and_concurrent_external_isolation(tmp_path):
+    h = tree_helpers()
+    s_a, script, cmd_a, args_a = h._write_fixture(tmp_path, "conv_a", {"ignore_sigterm": True, "hang_prompt": True})
+    s_b, _, cmd_b, args_b = h._write_fixture(tmp_path, "conv_b", {"ignore_sigterm": True})
+    s_live, _, cmd_l, args_l = h._write_fixture(tmp_path, "conv_live", {"ignore_sigterm": True})
+    s_idle, _, cmd_i, args_i = h._write_fixture(tmp_path, "conv_idle", {"ignore_sigterm": True})
+    s_ext = tmp_path / "ext"
+    s_ext.mkdir()
+    ext_kw = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+    if os.name != "nt":
+        ext_kw["start_new_session"] = True
+    ext = subprocess.Popen([sys.executable, str(script), "gc", str(s_ext), json.dumps({"max_seconds": 30.0})], **ext_kw)
+    cmds = {"b": (cmd_l, args_l), "idle": (cmd_i, args_i)}
+    reg = Registry(lambda k, c: _spawn_factory(*cmds[k])(k, c), idle_ttl=0.05)
+    conv_a = Conversation("a", _spawn_factory(cmd_a, args_a))
+    conv_b = Conversation("b", _spawn_factory(cmd_b, args_b))
+    pids_a, pids_b, pids_idle, pids_reg_b = [], [], [], []
+    try:
+        assert conv_b.run([SYS, {"role": "user", "content": "b"}], TOOLS, "fake-model-a")["text"] == "ok"
+        pids_b = h._tree_pids(s_b)
+        token, err = threading.Event(), {}
+
+        def _go():
+            try:
+                conv_a.run([SYS, {"role": "user", "content": "a"}], TOOLS, "fake-model-a", token)
+            except BaseException as exc:  # noqa: BLE001
+                err["exc"] = exc
+
+        th = threading.Thread(target=_go)
+        th.start()
+        pids_a = h._tree_pids(s_a)
+        time.sleep(0.2)
+        conv_a.cancel(token)
+        th.join(timeout=8.0)
+        assert not th.is_alive() and isinstance(err.get("exc"), CancelledByUser)
+        assert h._wait_until(lambda: all(not h._pid_alive(p) for p in pids_a), timeout=5.0)
+        ext_pid = h._read_pid(s_ext / "grandchild.pid")
+        assert all(h._pid_alive(p) for p in pids_b) and h._pid_alive(ext_pid)
+        conv_a.close()
+        conv_a.close()
+        conv_b.close()
+
+        c_idle = reg.get("idle")
+        assert c_idle.run([SYS, {"role": "user", "content": "i"}], TOOLS, "fake-model-a")["text"] == "ok"
+        pids_idle = h._tree_pids(s_idle)
+        time.sleep(0.15)
+        c_live = reg.get("b")
+        assert h._wait_until(lambda: all(not h._pid_alive(p) for p in pids_idle), timeout=5.0)
+        assert c_live.run([SYS, {"role": "user", "content": "live"}], TOOLS, "fake-model-a")["text"] == "ok"
+        pids_reg_b = h._tree_pids(s_live)
+        assert all(h._pid_alive(p) for p in pids_reg_b)
+    finally:
+        with contextlib.suppress(Exception):
+            conv_a.close()
+            conv_b.close()
+        reg.close_all()
+        ext.terminate()
+        with contextlib.suppress(Exception):
+            ext.wait(timeout=3.0)
+        for sdir, pids in ((s_a, pids_a), (s_b, pids_b), (s_live, pids_reg_b), (s_idle, pids_idle), (s_ext, [ext.pid])):
+            h._cleanup_state(sdir, pids)
+
+
+def test_failed_handshake_and_discover_models_reap_wrapper_descendants(tmp_path, monkeypatch):
+    h = tree_helpers()
+    monkeypatch.delenv("HERMES_ANTIGRAVITY_ACP_MCP_COMMAND", raising=False)
+    monkeypatch.delenv("HERMES_ANTIGRAVITY_ACP_COMMAND", raising=False)
+    if "providers" not in sys.modules:
+        class _StubProviderProfile:
+            def __init__(self, **kw):
+                for k, v in kw.items():
+                    setattr(self, k, v)
+        p_mod = types.ModuleType("providers")
+        p_mod.register_provider = lambda *_a, **_kw: None
+        p_base = types.ModuleType("providers.base")
+        p_base.ProviderProfile = _StubProviderProfile
+        monkeypatch.setitem(sys.modules, "providers", p_mod)
+        monkeypatch.setitem(sys.modules, "providers.base", p_base)
+    from antigravity_acp_mcp._plugin_entry import AntigravityAcpMcpProfile
+
+    if os.name != "nt":
+        s1, _, cmd1, args1 = h._write_fixture(tmp_path, "fail_init", {"fail_init_after_spawn": True, "init_exit_code": 5, "ignore_sigterm": True})
+        cwd1 = tmp_path / "cwd1"
+        cwd1.mkdir()
+        pids1 = []
+        try:
+            with pytest.raises(AcpProcessExit) as exc_info:
+                _spawn_factory(cmd1, args1)("k-init", str(cwd1))
+            assert exc_info.value.exit_status == 5
+            pids1 = h._tree_pids(s1)
+            assert h._wait_until(lambda: all(not h._pid_alive(p) for p in pids1), timeout=5.0)
+        finally:
+            h._cleanup_state(s1, pids1)
+
+    sh, _, cmd_h, args_h = h._write_fixture(tmp_path, "hang_init", {"hang_init": True, "ignore_sigterm": True, "shell_wrapper": True})
+    cwd_h = tmp_path / "cwd_h"
+    cwd_h.mkdir()
+    conn_h, pids_h = AcpConnection(cmd_h, args_h, str(cwd_h)), []
+    try:
+        conn_h.start()
+        pids_h = [conn_h._proc.pid, *h._tree_pids(sh)]
+        with pytest.raises(TimeoutError):
+            conn_h.initialize(timeout=0.3)
+        conn_h.close()
+        assert h._wait_until(lambda: all(not h._pid_alive(p) for p in pids_h), timeout=5.0)
+    finally:
+        with contextlib.suppress(Exception):
+            conn_h.close()
+        h._cleanup_state(sh, pids_h, conn_h._proc)
+
+    s2, _, cmd2, args2 = h._write_fixture(tmp_path, "fail_disc", {"fail_session_new": True, "ignore_sigterm": True})
+    pids2 = []
+    try:
+        prof = AntigravityAcpMcpProfile(
+            name="antigravity-acp", display_name="Antigravity ACP", description="test",
+            api_mode="chat_completions", base_url="acp://antigravity", auth_type="external_process",
+            process_command=cmd2, process_args=tuple(args2),
+        )
+        assert prof.discover_models() is None
+        pids2 = h._tree_pids(s2)
+        assert h._wait_until(lambda: all(not h._pid_alive(p) for p in pids2), timeout=5.0)
+    finally:
+        h._cleanup_state(s2, pids2)

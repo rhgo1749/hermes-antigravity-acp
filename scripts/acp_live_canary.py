@@ -1777,7 +1777,7 @@ def run_parked(args, module, recorder: FrameRecorder, evidence_dir: Path,
         summary["teardown"] = {
             "acp_connections": len(connections),
             "direct_children_exited": all(exited) if exited else None,
-            "descendant_tree": "not asserted (issue #94 F-3 is out of scope)",
+            "descendant_tree": "not asserted by live canary (F-3 verified offline in test_parked_process_tree_native and tests/design_c/)",
         }
         verdicts["normal_teardown"] = _teardown_verdict(exited)
         recorder._fh.close()
