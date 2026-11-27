@@ -72,13 +72,9 @@ ARM_TRIGGER_EXACT = (
 # scripts/ that is neither listed here nor packaging-named (below) fails
 # closed to the full matrix.
 NON_PACKAGING_SCRIPTS_EXACT = (
-    "scripts/acp_gate_c_turn.py",
     "scripts/acp_live_canary.py",
     "scripts/acp_login.py",
     "scripts/acp_probe.py",
-    "scripts/acp_session_model_probe.py",
-    "scripts/acp_surface_dump.py",
-    "scripts/audit_exposure.py",
     "scripts/audit_public_tree.py",
     "scripts/candidate_identity.py",
     "scripts/ci_change_scope.py",
@@ -87,7 +83,6 @@ NON_PACKAGING_SCRIPTS_EXACT = (
     "scripts/deploy_hermes_profiles.py",
     "scripts/hermes_canary_env.py",
     "scripts/hosted_clean_room_ci.py",
-    "scripts/publication_gate.py",
     "scripts/release_gate_check.py",
     "scripts/release_matrix.py",
 )

@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""historical reference rework: hosted fresh-UID clean-room driver (GitHub Actions).
+"""Hosted fresh-UID clean-room driver (GitHub Actions).
 
 This driver executes the credential-free real-binary clean-room chain for
 the official Google ACP 1.5.2 server inside a GitHub-hosted ``ubuntu-24.04``
 runner VM, and it MUST run as a dedicated non-privileged OS UID created by
 the workflow with ``useradd`` — never as root and never as the runner user.
-The venue criteria (historical reference isolation ruling) are enforced here and
+The venue criteria (dedicated-UID isolation ruling) are enforced here and
 fail closed: dedicated UID, Ubuntu 24.04 userland, empty disposable
 ``HOME``/``HERMES_HOME``, and a scrubbed allowlisted process environment.
 
-Output contract (historical reference `_server_stderr_summary` lineage, hardened):
+Output contract (`_server_stderr_summary` lineage, hardened):
 untrusted text — server output, probe streams, anything not authored by
 this repository — is never echoed, excerpted, or written into the evidence
 JSONL. Every captured stream contributes only a bounded
@@ -43,7 +43,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(SCRIPTS))
 
 import audit_public_tree as audit  # noqa: E402
-import install_acp  # noqa: E402  (reuse of the historical reference redaction contract)
+import install_acp  # noqa: E402  (reuse of the install_acp redaction contract)
 
 EXPECTED_ACP_VERSION = "1.5.2"
 EXPECTED_AGENT_INFO = {
@@ -145,7 +145,7 @@ def _shape_classes(text: str) -> list[str]:
 
 
 def _suppressed(text: str) -> dict[str, object]:
-    """Bounded non-echoing summary for any captured stream (historical reference contract).
+    """Bounded non-echoing summary for any captured stream (evidence contract).
 
     Identical to the runtime's `_server_stderr_summary` shape: counts, a
     sha256-16 fingerprint for correlation, and credential-shape class names

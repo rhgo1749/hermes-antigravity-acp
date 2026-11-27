@@ -189,7 +189,7 @@ def test_generic_deploy_refuses_before_any_write_when_a_tree_carries_overlays(tm
     """A generic deploy never silently strips overlays.
 
     A redeploy must not report success while removing an unmanaged overlay. The
-    rework turns that silent loss into a pre-mutation refusal: zero writes
+    guard turns that silent loss into a pre-mutation refusal: zero writes
     anywhere, and the unmanaged files stay live with unchanged bytes.
     """
     deploy = _deploy()

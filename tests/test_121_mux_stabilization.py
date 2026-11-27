@@ -272,7 +272,7 @@ def test_mcp_config_guard_blocks_spawn_and_pins_gemini_home(tmp_path) -> None:
         '{"mcpServers": {"also-evil": {}}}', encoding="utf-8"
     )
     proc = _run_wrapper(tmp_path, _write_fake(tmp_path, "plain"), account_home, "plain")
-    # historical reference re-pin: the poisoned lane must fail CLOSED at exit 2 instead
+    # Re-pin: the poisoned lane must fail CLOSED at exit 2 instead
     # of the old exit 1 reached through a silent re-bind attempt onto the
     # default home.  The default lane is never even consulted now.
     assert proc.returncode == 2

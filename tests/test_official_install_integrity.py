@@ -204,7 +204,7 @@ def test_interrupted_download_fails_closed_without_state_mutation(
     prefix = tmp_path / "opt" / "antigravity-acp"
     bin_dir = tmp_path / "bin"
 
-    # historical reference: an interrupted download surfaces as a safe, actionable
+    # An interrupted download surfaces as a safe, actionable
     # download-failure diagnostic (chained from the transport error) instead
     # of a bare transport traceback.
     with pytest.raises(RuntimeError, match="download failed or was interrupted") as excinfo:

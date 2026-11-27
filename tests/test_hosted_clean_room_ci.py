@@ -1,7 +1,7 @@
-"""historical reference rework: the hosted fresh-UID clean-room CI job is a contract.
+"""The hosted fresh-UID clean-room CI job is a contract.
 
 The `acp-clean-room` job on GitHub-hosted `ubuntu-24.04` is the venue the
-maintainer ruling (historical reference historical reference) chose to re-instrument the
+maintainer ruling chose to re-instrument the
 separate-OS-UID criterion that the private dev container could not satisfy.
 This suite keeps that venue honest WITHOUT running it:
 
@@ -12,7 +12,7 @@ This suite keeps that venue honest WITHOUT running it:
 - the driver must refuse the wrong venue (root, non-24.04, no runner home,
   readable runner-private canary, unexpected env vars) and keep the exact
   fail-closed exit-code table for the lifecycle chain;
-- the historical reference redaction lineage is re-proved for the new job: credential-
+- the redaction lineage is re-proved for the new job: credential-
   shaped material is summarized as counts/fingerprints/class names and is
   never disclosed verbatim by any driver or probe output path;
 - the probe must contain no authentication code path at all;

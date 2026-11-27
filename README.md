@@ -248,8 +248,7 @@ version mismatches, tampered downloads, profile conflicts and gateway failures.
 
 - [Hermes compatibility](docs/hermes-compatibility.md) · [ACP path contract](docs/acp-path-contract.md)
 - [Server protocol notes](docs/official-server-1.2.1-contract.md) · [model surfaces](docs/official-server-1.4.4-model-surface.md)
-- [Web research bridge](docs/web-research-bridge.md) · [Exposure audit](docs/read-only-exposure-audit.md)
-- [Development retrospective](docs/development-retrospective.md)
+- [Web research bridge](docs/web-research-bridge.md)
 
 ## License
 

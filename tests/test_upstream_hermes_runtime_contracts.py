@@ -73,7 +73,7 @@ def test_real_upstream_credential_policy_success_is_narrowed_for_acp_child(
     child environment must be narrowed by an ACP-specific minimum contract
     before any of it reaches the official Google ACP child.
 
-    This is the non-mockable proof of the maintainer-requested rework: it runs
+    This is the non-mockable proof of the unstubbed seam contract: it runs
     against the official Hermes venv at both ``main`` and the declared
     compatibility floor ``v0.21.6``, with the upstream source untouched
     (verified afterwards by the job's unmodified-core git checks).
@@ -586,7 +586,7 @@ def test_real_upstream_contexts_deny_acp_file_write(monkeypatch, tmp_path, surfa
 def test_real_upstream_lane_provenance_separates_affinity_and_fails_closed(
     monkeypatch, tmp_path
 ):
-    """Gate B.5 (historical reference) scenario coverage: lane provenance.
+    """Gate B.5 scenario coverage: lane provenance.
 
     The plugin composes the runtime conversation identity from the REAL
     ``tools.skill_provenance`` lane ContextVar, so a background-review fork can

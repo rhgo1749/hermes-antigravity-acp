@@ -1,4 +1,4 @@
-"""historical reference: opt-in ``postprocessing_policy="llm_backend"`` E2E regressions.
+"""Opt-in ``postprocessing_policy="llm_backend"`` E2E regressions.
 
 All tests drive the real client against a fake ACP subprocess (no network,
 no credentials, no live Antigravity). They pin the six acceptance-critical

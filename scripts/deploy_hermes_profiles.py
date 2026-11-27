@@ -5,7 +5,7 @@ This installer copies *code only*; it never imports or copies credentials,
 profile settings, session state, or model/account registry files.
 It can run in a standard user environment against an explicit Hermes home.
 
-Ownership boundary (historical reference): the official Hermes plugin catalog owns every
+Ownership boundary: the official Hermes plugin catalog owns every
 provider directory installed through ``hermes plugins install``. This standalone
 installer never overwrites, upgrades, or deletes a catalog-managed (or any other
 installer-managed) provider, and it also refuses directories whose ownership it
@@ -16,7 +16,7 @@ set byte-matching a verified pre-marker release, or legacy installer artifacts
 (``par.txt``/``launch_config.json``) and remain updatable. Catalog installs are
 exclusively through ``hermes plugins update``/``hermes plugins remove``.
 
-Ownership boundary (historical reference rework): update propagation never carries
+Ownership boundary: update propagation never carries
 unmanaged files forward, and a run that WOULD strip them now refuses before
 any mutation. Before touching a single profile, every target provider tree is
 scanned for entries outside the managed fileset and this installer's own
@@ -26,7 +26,7 @@ to the dedicated private-ops deployment tooling (see ``operator-managed deployme
 which stages overlays as explicitly managed files, or to the explicit
 ``--allow-unmanaged-overlays`` operator-approved override.
 
-Migration boundary (historical reference rework-r4): the public provider client's
+Migration boundary: the public provider client's
 fail-closed start trusts exactly two pieces of deployment evidence — the
 in-tree ``install-provenance.json`` and the per-home policy obligation record.
 This installer therefore also refuses (zero writes) while any provider home
@@ -388,7 +388,7 @@ def _ownership_refusal(profile: str, target: Path, kind: str, reason: str) -> st
     )
 
 
-# Pre-mutation private-overlay guard (historical reference rework). Python bytecode
+# Pre-mutation private-overlay guard. Python bytecode
 # caches are regenerable artifacts, never user content; everything else in a
 # deployed provider tree beyond the managed fileset and this installer's own
 # preserved state is unmanaged and must never be replaced silently.
@@ -504,7 +504,7 @@ def _overlay_refusal(findings: list[tuple[str, Path, list[str]]]) -> str:
     )
 
 
-# Legacy policy-obligation migration gate (historical reference rework-r4). A
+# Legacy policy-obligation migration gate. A
 # policy-required deployment keeps its provider-side fail-closed refusal only
 # while its home carries an explicit obligation record
 # (``policy-obligation.json``, written at deploy time by the private-ops
@@ -662,7 +662,7 @@ def install(
                 "pre-deploy verification failed; no files were touched: "
                 + "; ".join(pre)
             )
-        # Ownership gate (historical reference): catalog-managed, installer-managed, and
+        # Ownership gate: catalog-managed, installer-managed, and
         # unverifiable provider directories are refused across every target
         # before a single write happens. A byte-identical "already current"
         # tree is a no-op for any owner, so it needs no ownership claim.
@@ -675,7 +675,7 @@ def install(
                 raise ValueError(
                     _ownership_refusal(profile, target, kind, reason) + "; no files were touched"
                 )
-        # Pre-mutation private-overlay guard (historical reference rework): refuse while
+        # Pre-mutation private-overlay guard: refuse while
         # ANY target this run would replace still carries files outside the
         # managed fileset plus installer-owned state. Zero writes across all
         # profiles; unmanaged overlay bytes stay live and unchanged.
@@ -695,7 +695,7 @@ def install(
                 raise ValueError(
                     _overlay_refusal(overlay_findings) + "; no files were touched"
                 )
-            # Legacy policy-obligation migration gate (historical reference rework-r4):
+            # Legacy policy-obligation migration gate:
             # refuse while ANY provider home still carries a legacy policy
             # signature without its obligation record. Zero writes across all
             # profiles; migrate (private-ops tooling) or waive explicitly.
@@ -747,7 +747,7 @@ def install(
                 (candidate / name).parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source / name, candidate / name)
             if target.exists():
-                # historical reference boundary: update propagation carries ONLY this
+                # Boundary: update propagation carries ONLY this
                 # installer's own preserved state (legacy launch settings;
                 # the par.txt pin is carried below). Unmanaged files in an
                 # existing target — opt-in private overlay modules, personal

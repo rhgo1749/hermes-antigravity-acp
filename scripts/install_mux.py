@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Opt-in packaging manager for the Antigravity ACP mux launcher (historical reference).
+"""Opt-in packaging manager for the Antigravity ACP mux launcher.
 
 The public default install (scripts/install_acp.py) stays **Single-only**: it
 never imports, installs, configures, or runs MUX.  This script is the separate

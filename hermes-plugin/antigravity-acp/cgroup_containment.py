@@ -1,7 +1,7 @@
 """Linux cgroup-v2 containment seam for the plugin-spawned mux tree.
 
-Issue #25 (F4 Gate B candidate B).  The spike (``tests/test_issue25_cgroup_spike.py``,
-docs/issue25-cgroup-spike-preflight.md §8) CONFIRMED on a real kernel that cgroup
+Issue #25 (F4 Gate B candidate B).  The issue #25 cgroup spike CONFIRMED on a
+real kernel that cgroup
 membership is a containment primitive strictly stronger than the process group:
 membership survives ``setsid``/``setpgid``/``exec``, and ``cgroup.kill`` sweeps
 escaped descendants while a sibling cgroup is untouched.  This module turns that

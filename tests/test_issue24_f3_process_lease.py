@@ -646,7 +646,7 @@ def test_mux_graceful_exit_releases_lease_into_grace(lanes, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 6. Independent-review counterexamples B1-B4 (issue #24 rework).
+# 6. Independent-review counterexamples B1-B4 (independent review of issue #24).
 # ---------------------------------------------------------------------------
 
 def _longlived_fake_vendor(tmp_path: Path, lease_path: str) -> Path:

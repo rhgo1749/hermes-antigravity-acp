@@ -1,4 +1,4 @@
-"""historical reference (Lane A): credential, approval, and unattended-execution isolation.
+"""Lane A: credential, approval, and unattended-execution isolation.
 
 Every scenario below is credential-free: synthetic tmp homes, injected FAKE
 environment values that are structurally secret-shaped but carry no meaning,
@@ -7,7 +7,7 @@ under test: every ACP child-process launch, file-bridge operation, and
 permission decision fail closed against credential inheritance, unapproved
 mutation, and unattended blocking, regardless of runtime host.
 
-Coverage map (historical reference criteria 2/4/5/7 boundary tests):
+Coverage map (Lane A criteria 2/4/5/7 boundary tests):
 - child env: injected API_KEY/TOKEN/auth-class entries never reach the ACP
   child, and the locale/XDG admission is an explicit enumeration (no
   wildcard ``LC_``/``XDG_`` prefix) with XDG bases verified against the
@@ -39,7 +39,7 @@ from test_standalone_client import _load
 
 # Synthetic markers: secret-shaped for policy purposes, meaningless values.
 # They intentionally never match audit_public_tree's credential patterns.
-# The ``XDG_*``/``LC_*`` entries are the maintainer-P2 (historical reference)
+# The ``XDG_*``/``LC_*`` entries are the maintainer-requested P2 additions
 # regression class: names the old wildcard prefix filter silently authorized.
 FAKE_SECRET_MARKERS = {
     "OPENAI_API_KEY": "synthetic-openai-value-not-a-key",

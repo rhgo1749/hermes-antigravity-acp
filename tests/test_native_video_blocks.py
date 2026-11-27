@@ -741,7 +741,7 @@ def test_video_data_url_resume_miss_replay(monkeypatch, tmp_path):
         client_mod._cleanup_temp_video_files(temp_files)
 
 
-# --- historical reference (Lane B): default-off is the fail-closed boundary -----------
+# --- Lane B: default-off is the fail-closed boundary ----------------------------------
 # HERMES_ANTIGRAVITY_ACP_NATIVE_VIDEO activates ONLY on the exact value "1".
 # Unset, empty, "0", or any junk value must emit ZERO resource_link blocks for
 # every note shape - legitimate current-profile, cross-profile, or forged -

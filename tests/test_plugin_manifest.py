@@ -123,7 +123,7 @@ def test_no_secret_environment_reads_outside_declared_surface() -> None:
     assert not offenders, f"undeclared environment reads (declare or remove): {sorted(offenders)}"
 
 
-# --- hermes_compat.py core-import inventory (issue #12) ---------------------- (reworked after review)
+# --- hermes_compat.py core-import inventory (issue #12) ----------------------
 # docs/hermes-compatibility.md (module dependency register + Public API
 # promotion record, 2026-11-12) is the register; this test is its BLOCKING
 # enforcer in the credential-free lane. The upstream `hermes plugins validate`

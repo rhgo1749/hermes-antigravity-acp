@@ -50,7 +50,7 @@ SENSITIVE_DIRS = {
     "build",
 }
 
-# historical reference distribution boundary. The Hermes plugin catalog and the default
+# Distribution boundary. The Hermes plugin catalog and the default
 # install ship exactly the canonical provider fileset; personal host-deploy,
 # mux, and portfolio-ops tooling must never be referenced from the public
 # distribution closure. These rules enforce that boundary from the same
@@ -102,8 +102,8 @@ PUBLIC_CLOSURE_FILES = frozenset(
     }
 )
 # Exact personal-ops tokens (private script paths, container identities,
-# account-registry filenames, and the overlay module filename). Rework-r4
-# (historical reference): the provider tree lost its token-scan exemption — with the
+# account-registry filenames, and the overlay module filename). The provider
+# tree carries no token-scan exemption — with the
 # public client now carrying a domain-neutral obligation-evidence contract,
 # there is no fail-closed naming rationale left, so PERSONAL_OPS_TOKENS are
 # findings in the provider tree AND the public distribution closure alike.
@@ -161,16 +161,16 @@ def _repository_files(root: Path) -> list[Path]:
 
 
 def _public_surface_findings(relative: str, text: str) -> list[str]:
-    """historical reference boundary rules over the public distribution surface."""
+    """Boundary rules over the public distribution surface."""
     rules: list[str] = []
     if relative.startswith(PUBLIC_PROVIDER_DIR):
-        # Rework-r2: exact relative path from the provider root, not the
+        # Exact relative path from the provider root, not the
         # basename. A nested file whose basename happens to be canonical
         # (extra/client.py, private_secrets/__init__.py, ...) is NOT part of
         # the public provider contract and is a finding.
         if relative[len(PUBLIC_PROVIDER_DIR) :] not in PUBLIC_PROVIDER_FILES:
             rules.append("public_provider_tree_file")
-        # Rework-r4: the provider tree is token-scanned like the rest of the
+        # The provider tree is token-scanned like the rest of the
         # public closure; it carries no personal-ops naming whatsoever.
         if any(token in text for token in PERSONAL_OPS_TOKENS):
             rules.append("personal_ops_reference")
