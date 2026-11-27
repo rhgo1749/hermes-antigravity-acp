@@ -225,6 +225,30 @@ def _sweep_group(
     return False
 
 
+def _confirm_unreaped_zombie_ownership(proc: subprocess.Popen) -> bool | None:
+    """Recover group ownership for an unreaped session-leader zombie on BSD/macOS.
+
+    On Darwin/XNU, ``os.getpgid(pid)`` raises ``ProcessLookupError`` once the
+    leader enters zombie state, even before anything has reaped it.  For a
+    process spawned with ``start_new_session=True`` whose ``returncode`` is
+    still ``None``, verify via non-reaping ``waitid(WNOWAIT)`` that the child
+    remains an unreaped zombie so ``pgid == proc.pid`` stays safe against
+    PID/PGID reuse:
+    - ``True``: confirmed unreaped zombie via ``waitid(WNOWAIT)`` (the zombie
+      is NOT reaped, so the PID remains pinned in the kernel process table).
+    - ``False``: child is still alive (caller should re-check ``getpgid``).
+    - ``None``: already externally reaped, ``waitid(WNOWAIT)`` is unavailable
+      or disabled (cannot prove ownership without reaping via ``waitpid``),
+      or ownership is otherwise unverifiable.
+    """
+    if proc.returncode is not None:
+        return None
+    probe = _non_reaping_probe(proc)
+    if probe is _ALREADY_REAPED or probe is _FALLBACK:
+        return None
+    return False if probe is None else True
+
+
 def terminate_process_tree(
     proc: subprocess.Popen,
     *,
@@ -234,6 +258,7 @@ def terminate_process_tree(
     kill_timeout: float = _KILL_TIMEOUT_SECONDS,
     sweep_grace: float = _SWEEP_GRACE_SECONDS,
     sweep_timeout: float = _SWEEP_TIMEOUT_SECONDS,
+    session_leader: bool = False,
 ) -> bool | None:
     """Terminate ``proc`` and reap its whole tree where that is verifiable.
 
@@ -250,8 +275,26 @@ def terminate_process_tree(
             kill_timeout=kill_timeout,
         )
     # Capture group ownership BEFORE anything can reap the leader: Popen.poll()
-    # reaps, and a reaped leader makes ownership unverifiable forever.
+    # reaps, and a reaped leader makes ownership unverifiable forever (including
+    # PID reuse after an internal or external reap).
+    probe = _non_reaping_probe(proc) if proc.returncode is None else _ALREADY_REAPED
+    if probe is _ALREADY_REAPED or (probe is _FALLBACK and proc.poll() is not None):
+        logger.warning(
+            "ACP teardown for pid %d started after the leader was already "
+            "reaped; group ownership unverifiable — no group signal will "
+            "be sent (PID/PGID reuse guard)",
+            proc.pid,
+        )
+        return None
     pgid = _group_id_if_resolvable(proc)
+    if pgid is None and session_leader and proc.returncode is None:
+        zombie_owned = _confirm_unreaped_zombie_ownership(proc)
+        if zombie_owned is False:
+            pgid = _group_id_if_resolvable(proc)
+            if pgid is None and proc.returncode is None:
+                zombie_owned = _confirm_unreaped_zombie_ownership(proc)
+        if zombie_owned is True:
+            pgid = proc.pid
     owned = pgid is not None and pgid == proc.pid
 
     if proc.poll() is not None:
@@ -419,6 +462,14 @@ def terminate_contained_tree(
     return True
 
 
+def _kill_windows_direct_child(proc: subprocess.Popen, kill_timeout: float) -> None:
+    if proc.poll() is None:
+        with contextlib.suppress(OSError):
+            proc.kill()
+        with contextlib.suppress(Exception):
+            proc.wait(timeout=kill_timeout)
+
+
 def _terminate_windows(
     proc: subprocess.Popen,
     *,
@@ -456,6 +507,7 @@ def _terminate_windows(
             "ACP taskkill /T /F for pid %d raised; tree reaping NOT "
             "guaranteed", proc.pid, exc_info=True,
         )
+        _kill_windows_direct_child(proc, kill_timeout)
         return None
     with contextlib.suppress(Exception):
         proc.wait(timeout=kill_timeout)
@@ -467,5 +519,15 @@ def _terminate_windows(
             result.returncode,
             (result.stderr or b"").decode(errors="replace").strip()[:200],
         )
+        _kill_windows_direct_child(proc, kill_timeout)
         return None
+    if proc.poll() is None:
+        logger.warning(
+            "ACP taskkill /T /F for pid %d exited 0 but direct child is still "
+            "alive after %.1fs; escalating to direct kill, tree reaping UNVERIFIED",
+            proc.pid,
+            kill_timeout,
+        )
+        _kill_windows_direct_child(proc, kill_timeout)
+        return False
     return True

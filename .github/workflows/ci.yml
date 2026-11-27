@@ -378,6 +378,14 @@ jobs:
           # by the ARM lane.
           & $python scripts/verify_process_tree_teardown.py
           if ($LASTEXITCODE -ne 0) { throw 'Process-tree teardown verification failed' }
+      - name: Verify Parked-ACP native process-tree teardown regressions (x64)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $python = Get-ChildItem "$env:HERMES_HOME\tools\python-*\python.exe" | Select-Object -Last 1 -ExpandProperty FullName
+          if (-not $python) { throw 'Hermes managed Python is missing' }
+          & $python -m unittest discover -s tests -p test_parked_process_tree_native.py -v
+          if ($LASTEXITCODE -ne 0) { throw 'Parked-ACP native process-tree teardown regression failed' }
       - name: Verify the login helper execution path without authenticating
         shell: pwsh
         run: |
@@ -506,6 +514,14 @@ jobs:
           }
           & $python scripts/install_acp.py verify
           if ($LASTEXITCODE -ne 0) { throw 'Unauthenticated ACP initialization failed' }
+      - name: Verify Parked-ACP native process-tree teardown regressions (arm64)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $python = Get-ChildItem "$env:HERMES_HOME\tools\python-*\python.exe" | Select-Object -Last 1 -ExpandProperty FullName
+          if (-not $python) { throw 'Hermes managed Python is missing' }
+          & $python -m unittest discover -s tests -p test_parked_process_tree_native.py -v
+          if ($LASTEXITCODE -ne 0) { throw 'Parked-ACP native process-tree teardown regression failed' }
       - name: Verify the login helper execution path without authenticating
         shell: pwsh
         run: |
@@ -656,14 +672,18 @@ jobs:
           test -z "$(git -C upstream-hermes status --porcelain --untracked-files=no)"
       - name: Verify installed lifecycle, delete and confirm absence
         run: python scripts/ci_provider_lifecycle.py --hermes-home "$RUNNER_TEMP/acp-provider-home"
+      - name: Verify Parked-ACP process-tree teardown regressions (macOS arm64)
+        run: |
+          python -m unittest discover -s tests -p test_parked_process_tree_native.py -v
+          upstream-hermes/.venv/bin/python -m pytest -v tests/design_c/test_c_connection.py tests/design_c/test_c_conversation.py
       - name: Record the executed-evidence boundary
         run: |
           {
             echo "### macOS arm64 native lifecycle"
             echo "- runner: macOS $(sw_vers -productVersion) / $(uname -m)"
             echo "- tested HEAD: \`$(git rev-parse HEAD)\`"
-            echo "- executed: download + publisher-digest pin, install, status, verify, unauthenticated initialize, uninstall, confirmed absence, Hermes provider registration/enabled, provider selection + client factory under pinned official Hermes Core"
-            echo "- NOT executed: authentication, model inference, dedicated-UID clean-room isolation"
+            echo "- executed: download + publisher-digest pin, install, status, verify, unauthenticated initialize, uninstall, confirmed absence, Hermes provider registration/enabled, provider selection + client factory under pinned official Hermes Core, Parked-ACP process-tree teardown regressions (test_parked_process_tree_native.py + test_c_connection.py + test_c_conversation.py)"
+            echo "- NOT executed: authentication, model inference, dedicated-UID clean-room isolation, Linux cgroup v2 containment"
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Attest tested SHA and verified stages
         id: attest
@@ -753,13 +773,17 @@ jobs:
           test -z "$(git -C upstream-hermes status --porcelain --untracked-files=no)"
       - name: Verify installed lifecycle, delete and confirm absence
         run: python scripts/ci_provider_lifecycle.py --hermes-home "$RUNNER_TEMP/acp-provider-home"
+      - name: Verify Parked-ACP process-tree teardown regressions (Linux aarch64)
+        run: |
+          python -m unittest discover -s tests -p test_parked_process_tree_native.py -v
+          upstream-hermes/.venv/bin/python -m pytest -v tests/design_c/test_c_connection.py tests/design_c/test_c_conversation.py
       - name: Record the executed-evidence boundary
         run: |
           {
             echo "### Linux aarch64 native lifecycle"
             echo "- runner: $(lsb_release -ds) / $(uname -m)"
             echo "- tested HEAD: \`$(git rev-parse HEAD)\`"
-            echo "- executed: download + publisher-digest pin, install, status, verify, unauthenticated initialize, uninstall, confirmed absence, Hermes provider registration/enabled, provider selection + client factory under pinned official Hermes Core"
+            echo "- executed: download + publisher-digest pin, install, status, verify, unauthenticated initialize, uninstall, confirmed absence, Hermes provider registration/enabled, provider selection + client factory under pinned official Hermes Core, Parked-ACP process-tree teardown regressions (test_parked_process_tree_native.py + test_c_connection.py + test_c_conversation.py)"
             echo "- NOT executed: authentication, model inference, dedicated-UID clean-room isolation"
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Attest tested SHA and verified stages
