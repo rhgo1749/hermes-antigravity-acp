@@ -209,6 +209,10 @@ See [data and permissions](docs/data-and-permissions.md) and
 | macOS arm64 | Native hosted CI |
 | Windows x64 / arm64 | Native hosted CI |
 
+Historical [clean-room evidence](docs/official-server-1.4.4-clean-room-e2e-2026-11-07.md):
+the earlier shared-UID container lifecycle was NOT EXECUTED as clean-room
+acceptance evidence; an environment scrub does not establish a separate OS UID.
+
 The [v0.9.3 release gate](https://github.com/rhgo1749/hermes-antigravity-acp/actions/runs/45870027033)
 passed all five platforms on the exact release SHA. Hosted checks do not prove
 auth, live model discovery, real inference or support for other architectures.
