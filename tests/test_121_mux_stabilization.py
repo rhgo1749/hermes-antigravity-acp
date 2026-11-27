@@ -143,6 +143,14 @@ for line in sys.stdin:
         elif mode == "connection-lost":
             emit(_u("Agent connection was lost and could not be"
                     " re-established: (code 429: boom)"))
+        elif mode == "quota-after-tool":
+            emit({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {"update": {"sessionUpdate": "tool_call", "toolCallId": "tc-1"}},
+            })
+            emit(_u("Usage Limit Reached\n\nYou have reached your current"
+                    " quota for this period."))
         elif mode == "ordinary":
             emit(_u("Debug note: "))
             emit(_u("Usage Limit Reached\n\nYou have reached your current"
@@ -176,7 +184,8 @@ def _registry(tmp_path: Path, home: Path) -> Path:
 
 
 def _run_wrapper(tmp_path: Path, fake: Path, account_home: Path, mode: str,
-                 extra_env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+                 extra_env: dict[str, str] | None = None,
+                 entrypoint: Path = GUARD_PATH) -> subprocess.CompletedProcess:
     env = os.environ.copy()
     env.update(
         {
@@ -207,7 +216,7 @@ def _run_wrapper(tmp_path: Path, fake: Path, account_home: Path, mode: str,
         ]
     ) + "\n"
     return subprocess.run(
-        [sys.executable, str(GUARD_PATH)],
+        [sys.executable, str(entrypoint)],
         input=requests, text=True, capture_output=True, env=env, timeout=15,
         check=False,
     )
@@ -251,6 +260,49 @@ def test_ordinary_answer_mentioning_quota_passes_through(tmp_path) -> None:
     account_home.mkdir()
     proc = _run_wrapper(tmp_path, _write_fake(tmp_path, "ordinary"), account_home,
                         "ordinary")
+    messages = [json.loads(raw) for raw in proc.stdout.splitlines() if raw.strip()]
+    updates = [m for m in messages if m.get("method") == "session/update"]
+    assert len(updates) == 2
+    replies = [m for m in messages if m.get("id") == 3]
+    assert len(replies) == 1 and "result" in replies[0]
+    assert not (tmp_path / "state.json").exists() or json.loads(
+        (tmp_path / "state.json").read_text()
+    )["accounts"] == {}
+
+
+def test_quota_digest_after_tool_call_suppresses_replay(tmp_path) -> None:
+    account_home = tmp_path / "account-a"
+    account_home.mkdir()
+    proc = _run_wrapper(
+        tmp_path,
+        _write_fake(tmp_path, "quota-after-tool"),
+        account_home,
+        "quota-after-tool",
+    )
+    assert proc.returncode == 0, proc.stderr
+    messages = [json.loads(raw) for raw in proc.stdout.splitlines() if raw.strip()]
+    updates = [m for m in messages if m.get("method") == "session/update"]
+    assert [u["params"]["update"]["sessionUpdate"] for u in updates] == ["tool_call"]
+    replies = [m for m in messages if m.get("id") == 3]
+    assert len(replies) == 1 and "error" in replies[0]
+    message = replies[0]["error"]["message"]
+    assert "native tool calls; automatic replay is suppressed." in message
+    assert "resource_exhausted" not in message
+    health = json.loads((tmp_path / "state.json").read_text())["accounts"]
+    assert health[f"a\t{account_home}"]["reason"] == "quota"
+
+
+def test_base_mux_passes_through_inband_quota_digest_unchanged(tmp_path) -> None:
+    account_home = tmp_path / "account-a"
+    account_home.mkdir()
+    proc = _run_wrapper(
+        tmp_path,
+        _write_fake(tmp_path, "quota-split"),
+        account_home,
+        "quota-split",
+        entrypoint=ROOT / "scripts" / "acp_mux.py",
+    )
+    assert proc.returncode == 0, proc.stderr
     messages = [json.loads(raw) for raw in proc.stdout.splitlines() if raw.strip()]
     updates = [m for m in messages if m.get("method") == "session/update"]
     assert len(updates) == 2
