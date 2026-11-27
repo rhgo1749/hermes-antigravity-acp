@@ -34,7 +34,7 @@ def _load(name: str, rel: str):
     return module
 
 
-audit = _load("apt_issue83_docs", "scripts/audit_public_tree.py")
+audit = _load("apt_public_docs", "scripts/audit_public_tree.py")
 
 
 def _read(relative: str) -> str:

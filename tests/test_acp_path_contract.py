@@ -1,4 +1,4 @@
-"""historical reference: portable ACP home, registry, and account-layout contract.
+"""Portable ACP home, registry, and account-layout contract.
 
 Credential-free regressions for the path contract documented in
 docs/acp-path-contract.md.  Every scenario runs a fresh process (paths are
