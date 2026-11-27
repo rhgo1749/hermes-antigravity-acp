@@ -2,6 +2,20 @@
 
 Standalone integration for Google's official Antigravity ACP server. Keep vendor authentication inside the official ACP runtime; do not extract or reimplement OAuth tokens. Prefer standard ACP JSON-RPC over CLI/TUI scraping or proprietary stream-json bridges. Keep host-specific deployment glue optional and documented. Tests should exercise protocol behavior with fake ACP subprocesses and must not require live credentials.
 
+## Engineering principles
+
+- Prefer the smallest correct implementation. Do not build abstractions, configuration options, compatibility layers, or fallback paths for hypothetical requirements.
+- Keep one authoritative implementation per responsibility. Reuse existing mechanisms before introducing new ones.
+- When replacing an implementation, remove the superseded code, tests, and documentation unless an active compatibility or evidence requirement justifies retention.
+- Test observable behavior and meaningful failure boundaries. Avoid redundant fixtures, implementation-coupled assertions, exhaustive prose mutations, and speculative regression tests.
+- Keep documentation focused on current contracts, installation, operation, and reproducible evidence. Development history belongs in GitHub issues, pull requests, and commit history.
+- Keep personal operational requirements outside the public plugin unless they serve a demonstrated general-purpose need.
+- Add retries, exception handling, and fallback behavior only for identified failure modes. Never compromise credential, permission, process-ownership, or side-effect safety boundaries for simplicity.
+- Keep changes focused. Explain significant complexity increases and consider simpler alternatives before implementation.
+- Retire obsolete rules and their enforcers when the underlying contract changes, preserving meaningful regression coverage. Do not accumulate permanent gates for retired implementations.
+
+These principles guide engineering review. They do not require new automated enforcement or override the explicit safety and CI contracts below.
+
 ## Rules and their enforcers
 
 A rule without an enforcer is a judgment call for review, not a gate.
