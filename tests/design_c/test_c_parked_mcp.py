@@ -455,6 +455,11 @@ def test_delivery_failure_inflight_sends_images_and_error_skip(make):
     status, body = Client(server).call(3)
     assert status == 200 and body["result"]["content"][0]["text"] == "recovered"
     assert parked.empty()
+    deadline = time.monotonic() + 5
+    while (
+        not entry.delivery_ok or entry.delivery_failed or entry.inflight_sends != 0
+    ) and time.monotonic() < deadline:
+        time.sleep(0.01)
     assert entry.delivery_ok is True and entry.delivery_failed is False and entry.inflight_sends == 0
     assert server.mark_completed("terminal") is True
     assert server._completed == {} and server._completed_bytes == 0
@@ -499,6 +504,11 @@ def test_delivery_failure_inflight_sends_images_and_error_skip(make):
     send2_finish.set()
     tb.join(5)
     assert outb[0][1]["result"]["content"][0]["text"] == "slow-rst-1"
+    deadline = time.monotonic() + 5
+    while (
+        not entry2.delivery_ok or entry2.delivery_failed or entry2.inflight_sends != 0
+    ) and time.monotonic() < deadline:
+        time.sleep(0.01)
     assert entry2.delivery_ok is True and entry2.delivery_failed is False and entry2.inflight_sends == 0
     assert server.mark_completed("terminal") is True
 
@@ -524,6 +534,9 @@ def test_delivery_failure_inflight_sends_images_and_error_skip(make):
     status_d, body_d = Client(server).call(33)
     assert status_d == 200 and body_d["result"]["content"][0]["text"] == "slow-rst-2"
     entry3 = next(iter(server._completed.values()))
+    deadline = time.monotonic() + 5
+    while (not entry3.delivery_ok or entry3.inflight_sends != 1) and time.monotonic() < deadline:
+        time.sleep(0.01)
     assert entry3.delivery_ok is True and entry3.inflight_sends == 1
     send3_fail.set()
     tc.join(5)
