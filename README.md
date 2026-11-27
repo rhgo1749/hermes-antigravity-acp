@@ -29,7 +29,7 @@ or emulates Google OAuth tokens.
 
 | Topic | Status |
 |---|---|
-| Standalone | [v0.9.3](https://github.com/rhgo1749/hermes-antigravity-acp/releases/tag/v0.9.3), ACP server 1.5.2 |
+| Standalone | [v0.9.4](https://github.com/rhgo1749/hermes-antigravity-acp/releases/tag/v0.9.4), ACP server 1.5.2 |
 | Hermes | `>=0.21.6` CI-proven floor; stable baseline v0.23.4 |
 | OS evidence | Ubuntu 24.04 x86_64 dedicated-UID clean room; Linux aarch64, macOS arm64, Windows x64/arm64 native hosted-CI lifecycle evidence |
 | Catalog (checked 2026-11-27) | Listed for Linux at 0.8.0; see [official entry](https://github.com/NousResearch/hermes-agent/blob/main/plugin-catalog/antigravity-acp-provider.yaml) for the current pin |
@@ -45,7 +45,7 @@ No Docker, sudo, account mux, or Hermes fork is needed.
 On Linux or macOS:
 
 ```bash
-git clone --branch v0.9.3 https://github.com/rhgo1749/hermes-antigravity-acp.git
+git clone --branch v0.9.4 https://github.com/rhgo1749/hermes-antigravity-acp.git
 cd hermes-antigravity-acp
 python3 scripts/install_acp.py install
 python3 scripts/install_acp.py status
@@ -65,7 +65,7 @@ hermes plugins validate hermes-plugin/antigravity-acp --install-deps
 
 **What is verified:** the hosted clean-room runs the install and handshake
 route (see [historical evidence](docs/official-server-1.4.4-clean-room-e2e-2026-11-07.md)).
-There is no published end-to-end authentication or inference result for v0.9.3.
+There is no published end-to-end authentication or inference result for v0.9.4.
 
 **Harness behavior (observable, ours):** `verify` requires no credentials, its
 own code reads no credential stores, and the probe sends exactly one
@@ -97,7 +97,7 @@ a provider refusal does not roll back a completed server install.
 
 Do not use `scripts/install_acp.py install` for this step: the combined installer
 would attempt to manage catalog-owned provider files. Use Hermes plugin
-update/remove for those files. The catalog 0.8.0 and standalone 0.9.3 pins
+update/remove for those files. The catalog 0.8.0 and standalone 0.9.4 pins
 both use ACP server 1.5.2; always follow the catalog SHA rather than guessing.
 
 The server-only installer supports `--status`, `--verify`, and `--uninstall`.
