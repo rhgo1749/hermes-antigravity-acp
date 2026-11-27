@@ -14,7 +14,7 @@ Pins the opt-in trace contract agreed in the issue investigation:
 
 The mux half (lane_bound with a lane fingerprint instead of the raw label,
 plus process_exit) is exercised against a fake official server through BOTH
-mux bodies: the base engine (``scripts/acp_mux.py``) and the shipped
+mux entrypoints: the base engine (``scripts/acp_mux.py``) and the shipped
 entrypoint (``scripts/antigravity-acp-mux.py``). Testing only the base engine
 let the entrypoint ship without the trace seams at all — the launcher ships
 the entrypoint, so a base-only test proves nothing about production.
@@ -39,7 +39,7 @@ PLUGIN_DIR = ROOT / "hermes-plugin" / "antigravity-acp"
 BASE_MUX = ROOT / "scripts" / "acp_mux.py"
 SHIPPED_MUX_ENTRYPOINT = ROOT / "scripts" / "antigravity-acp-mux.py"
 
-# Every mux trace assertion must hold for both bodies; the shipped
+# Every mux trace assertion must hold for both entrypoints; the shipped
 # entrypoint is what installers deploy.
 MUX_BODIES = pytest.mark.parametrize(
     "mux_body",

@@ -3110,7 +3110,7 @@ def run_doctor(env: Mapping[str, str] | None = None) -> int:
     return 2 if fatal else (1 if warnings else 0)
 
 
-def main() -> int:
+def main(relay_guard: Any = None) -> int:
     if sys.argv[1:2] in (["doctor"], ["--doctor"]):
         return run_doctor()
     if sys.argv[1:2] in (["inventory"], ["--inventory"]):
@@ -3133,17 +3133,33 @@ def main() -> int:
     def pump_upstream_out() -> None:
         assert upstream is not None
         for line in upstream.stdout or ():
-            failure = _classify_json_error(line)
-            if failure:
-                _mark_failure(bound_home, bound_label, failure[0], failure[1])
-            sys.stdout.write(owner_relay.after(line, bound_home, bound_label))
-            sys.stdout.flush()
+            if relay_guard is None:
+                failure = _classify_json_error(line)
+                if failure:
+                    _mark_failure(bound_home, bound_label, failure[0], failure[1])
+                sys.stdout.write(owner_relay.after(line, bound_home, bound_label))
+                sys.stdout.flush()
+                continue
+            out_lines = relay_guard.on_upstream_stdout(
+                line,
+                bound_home,
+                bound_label,
+                lambda raw: owner_relay.after(raw, bound_home, bound_label),
+            )
+            if out_lines:
+                for out_line in out_lines:
+                    sys.stdout.write(out_line)
+                sys.stdout.flush()
+
+    classify_stderr = (
+        relay_guard.classify_stderr if relay_guard is not None else _classify_failure
+    )
 
     def pump_upstream_err() -> None:
         assert upstream is not None
         for line in upstream.stderr or ():
             redacted = _redact(line.rstrip("\n"))
-            kind = _classify_failure(redacted)
+            kind = classify_stderr(redacted)
             if kind:
                 _mark_failure(bound_home, bound_label, kind, redacted)
             sys.stderr.write(redacted + "\n")
@@ -3266,10 +3282,13 @@ def main() -> int:
             if line is None:
                 break
             method = ""
+            request_id: object | None = None
             payload: object = None
             try:
                 payload = json.loads(line)
-                method = str(payload.get("method") or "") if isinstance(payload, dict) else ""
+                if isinstance(payload, dict):
+                    method = str(payload.get("method") or "")
+                    request_id = payload.get("id")
             except (json.JSONDecodeError, ValueError):
                 pass
             if upstream is None:
@@ -3347,6 +3366,15 @@ def main() -> int:
                     )
                     return 2
                 _log(f"selected {bound_label} via {reason} for {method or 'unknown'}")
+
+            if relay_guard is not None:
+                guard_error = relay_guard.before_upstream(
+                    payload, method, request_id, bound_home, bound_label
+                )
+                if guard_error is not None:
+                    sys.stdout.write(guard_error)
+                    sys.stdout.flush()
+                    continue
 
             owner_error = owner_relay.before(payload, bound_home, bound_label)
             if owner_error is not None:
