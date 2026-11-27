@@ -310,7 +310,7 @@ def test_core_provenance_oracle_rejects_substituted_core_modules(monkeypatch) ->
     """Negative contract, deliberately separate from the positive proof above:
     the provenance oracle must reject hand-built Core substitutes.
 
-    ``types.ModuleType`` instantiation is exactly how the pre-rework seam
+    ``types.ModuleType`` instantiation is exactly how the defective earlier seam
     substituted ``run_agent`` and ``hermes_state_pidns``.  Type identity
     proves nothing — every genuine imported module is also a
     ``types.ModuleType`` instance — so only resolved-file provenance

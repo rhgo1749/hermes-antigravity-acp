@@ -421,7 +421,7 @@ def test_unadvertised_tool_in_read_evidence_fails_closed_without_correction(monk
     assert len(turns) == 2
 
 
-# --- P1 rework (independent review of PR #29): strict same-session transport ---
+# --- strict same-session transport (independent review of PR #29) ---
 #
 # The malformed regeneration inside _extract_with_malformed_recovery must never
 # let _run_prompt's transport fall back to a resume-miss full replay or a

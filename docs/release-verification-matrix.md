@@ -54,13 +54,14 @@ PR HEAD dispatch. Branch movement after certification also invalidates use of
 that result for a different candidate: a later publishing integration must
 consume the recorded exact SHA and revalidate its current target.
 
-### Existing publication gate: separate responsibility
+### Publication gate: separate responsibility
 
 This repository has **no `publication-gate.yml` or release/tag publisher**.
-`scripts/publication_gate.py` is the existing privacy/exposure and explicit
-human-authorization gate; it is not a native-platform result aggregator and
-is preserved unchanged. Neither a privacy decision nor a candidate PASS
-supplies the other's authorization. Phase B implements executable CI candidate
+Publication-time privacy/exposure review and explicit human authorization
+were a separate, one-off gate (retired after the public transition via
+issue #108); they are not native-platform result aggregators and were never
+run in CI. Neither a privacy decision nor a candidate PASS supplies the
+other's authorization. Phase B implements executable CI candidate
 certification, not a new publisher or permission to bypass maintainer review.
 
 ## Platform contract and honest evidence boundaries
@@ -131,7 +132,8 @@ push and dispatch forced all native lanes. The separate
 path policy for trusted fast-forward pushes; unknown paths or uncertain
 metadata still widen to full coverage. Every dispatch remains full-matrix.
 Measured Actions records, queue/runner definitions and estimated-vs-measured
-boundaries are documented in [ci-cost-phase-b.md](ci-cost-phase-b.md).
+boundaries were documented in the retired Phase B cost snapshot (issue #28
+historical record, removed via issue #108).
 
 After independent review and successful post-merge exact-main verification,
 the separate Phase A follow-up changes `ci_change_scope.py::scope_for_event`'s push policy and its

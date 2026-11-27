@@ -1,4 +1,4 @@
-"""historical reference review: deployer must not leak artifacts into plugin discovery and
+"""Deployer must not leak artifacts into plugin discovery and
 must not silently drop the per-home par.txt canary pin."""
 
 from __future__ import annotations
@@ -65,7 +65,7 @@ def _home(tmp_path: Path) -> tuple[Path, dict[str, Path]]:
                 (target / name).parent.mkdir(parents=True, exist_ok=True)
                 (target / name).write_text(f"# old {name}\n")
         # Ownership evidence of a genuine pre-marker installer deploy (the
-        # post-historical reference gate refuses canonical trees with no provable provenance).
+        # provenance gate refuses canonical trees with no provable provenance).
         (target / "par.txt").write_text("/opt/pin/legacy.par\n")
         targets[label] = target
     return home, targets

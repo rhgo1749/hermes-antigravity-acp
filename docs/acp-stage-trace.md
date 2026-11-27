@@ -115,8 +115,8 @@ Never recorded anywhere in trace output: prompt or model response text,
 OAuth tokens or credentials, raw native session UUIDs (only salted hashes),
 raw account labels or identifying account information, private filesystem
 paths, or unbounded request history. Correlation identifiers are ephemeral
-per attempt/request. The repo's read-only exposure audit
-(`scripts/audit_exposure.py`) covers the committed trace code like any other
+per attempt/request. The repo's repository-hygiene audit
+(`scripts/audit_public_tree.py`) covers the committed trace code like any other
 surface, and `tests/test_issue26_stage_trace.py` asserts zero leakage of
 marked prompt text, session ids, labels, and paths from real fake-ACP runs.
 

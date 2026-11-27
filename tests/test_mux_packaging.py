@@ -1,4 +1,4 @@
-"""historical reference packaging guards for the strictly opt-in ACP mux bundle.
+"""Packaging guards for the strictly opt-in ACP mux bundle.
 
 These tests cover packaging/install semantics only; engine routing behavior is
 covered by test_acp_mux.py / test_acp_mux_guard.py / test_mux_wrapper.py.

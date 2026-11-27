@@ -173,7 +173,7 @@ def test_clean_vanilla_install_and_provider_registration(monkeypatch, tmp_path, 
     client = provider.antigravity_acp_replay.create_client()
     assert client._acp_command == str(bin_dir / installer._launcher_name())
     assert client._acp_args == []
-    # R7 (historical reference rework-r4): the generic install is NOT banned — the clean
+    # The generic install is NOT banned — the clean
     # obligation-evidence path loads the provider with zero overlays.
     assert sys.modules[provider.__name__ + ".client"].policy_overlays == ()
 
@@ -270,7 +270,7 @@ def _seed_outdated_provider_tree(plugin, deployer) -> None:
 def test_generic_install_refuses_before_any_write_when_a_late_profile_carries_an_overlay(
     tmp_path,
 ):
-    """historical reference rework-r2 RED1: pre-mutation refusal across ALL targets.
+    """Pre-mutation refusal across ALL targets.
 
     The overlay-bearing profile ("zeta") sorts LAST in ``homes()`` iteration
     order. The generic deploy must still refuse before a single write to any
@@ -308,7 +308,7 @@ def test_generic_install_refuses_before_any_write_when_a_late_profile_carries_an
 
 
 def test_provider_upgrade_preserves_legacy_launch_config_and_pin(monkeypatch, tmp_path):
-    """historical reference rework-r2: an upgrade refuses over overlays, carries state.
+    """An upgrade refuses over overlays, carries state.
 
     The generic upgrade now refuses while a live opt-in overlay sits in the
     target tree (zero writes). Under the explicit operator-approved override
@@ -350,7 +350,7 @@ register_provider(antigravity_acp)
     )
     expected_policy = legacy_policy.read_bytes()
 
-    # Rework-r2 pre-mutation guard: the generic upgrade refuses while the
+    # Pre-mutation guard: the generic upgrade refuses while the
     # overlay is live; the pin and overlay keep their exact bytes.
     with pytest.raises(ValueError, match="unmanaged file"):
         deployer.install(deployer.SOURCE, hermes_home, apply=True, all_profiles=False)
@@ -384,7 +384,7 @@ register_provider(antigravity_acp)
     client_module = sys.modules[provider.__name__ + ".client"]
     assert client_module._read_par_pin() == str(pinned_server)
     assert client_module.policy_overlays == ()
-    # Rework-r2/r4: the profile-name identity match is gone from client.py,
+    # The profile-name identity match is gone from client.py,
     # so this operator-overridden tree (whose provenance declares no overlay
     # and whose home carries no obligation record) starts by explicit
     # operator choice instead of via public identity matching. The fail-closed

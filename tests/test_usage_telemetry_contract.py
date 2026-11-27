@@ -295,7 +295,7 @@ def test_single_usage_delta_is_recorded_and_absent_identity_is_not_guessed(monke
 
     # The second tuple value is a session key, not the explicit Hermes session
     # ID. A native id or session key must never be guessed as the totals key.
-    # The drop itself is persisted as a diagnostic counter (historical reference): a silent
+    # The drop itself is persisted as a diagnostic counter: a silent
     # drop is the exact failure mode this store must keep observable.
     state_path.unlink()
     monkeypatch.setattr(

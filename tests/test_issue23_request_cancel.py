@@ -466,7 +466,7 @@ def test_mux_stdin_close_tears_down_inflight_child(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# P1 rework (independent review of PR #31): the plugin -> mux -> official-server
+# Independent review of PR #31: the plugin -> mux -> official-server
 # child teardown boundary.  The plugin's terminate grace (2 s) was shorter than
 # the mux's own bounded child teardown (worst case ~5.25 s), so a child that
 # ignores the mux's stdin-EOF cooperative path could be orphaned when the
@@ -675,7 +675,7 @@ def test_terminate_process_tree_reaps_sigterm_ignoring_grandchild(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# P1 rework round 2 (independent re-review of PR #31): proc.wait() only
+# Independent re-review of PR #31: proc.wait() only
 # guarantees the DIRECT child; the group SIGKILL escalation ran only when the
 # direct child outlived the grace.  A leader that exits immediately on SIGTERM
 # while its grandchild ignores SIGTERM returned from the teardown with the

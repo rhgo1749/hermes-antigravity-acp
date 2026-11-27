@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""historical reference rework: hosted clean-room Hermes selection + discovery probe.
+"""Hosted clean-room Hermes selection + discovery probe.
 
 Runs ONLY under the official, unmodified upstream Hermes virtualenv (the
 commit pinned by the ``acp-clean-room`` workflow job) and ONLY as the
@@ -15,7 +15,7 @@ Exercises exactly two evidence classes and no others:
 2. Model-discovery entry — the production seam
    ``AntigravityACPClient.list_models`` -> real official server, attempted
    with zero credential state. Whatever the server answers is summarized
-   through the historical reference fingerprint-only contract: the probe prints counts,
+   through the fingerprint-only contract: the probe prints counts,
    boolean boundary flags, sha256-16 fingerprints, and credential-shape
    class names — never server-authored text, never model ids, never raw
    exception messages. Zero ``authenticate``/login/OAuth frames are sent by

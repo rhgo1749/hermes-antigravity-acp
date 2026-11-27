@@ -5,7 +5,7 @@ This path is user-scoped and does not use Docker, sudo, account muxes, or privat
 profile/policy deployment wrappers. It manages only the versioned official server,
 its launcher, and the provider code under the selected Hermes home.
 
-historical reference boundary: the official server lifecycle is independent of provider
+Boundary: the official server lifecycle is independent of provider
 registration — installing, updating, verifying, or deleting the server never
 touches catalog-managed plugin bytes, and the provider step refuses to overwrite
 catalog-managed or unverifiable provider directories before writing anything.

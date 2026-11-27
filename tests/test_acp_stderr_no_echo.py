@@ -1,4 +1,4 @@
-"""historical reference: the runtime ACP client must never echo raw child-process stderr.
+"""The runtime ACP client must never echo raw child-process stderr.
 
 The vendor ACP child process is untrusted output: a login/headless-auth
 surface can dump credential-shaped material onto stderr.  The runtime
@@ -14,7 +14,7 @@ fragments so the public repository tree stays audit-clean.  These are
 synthetic-shape behavior tests: they prove no-echo propagation, not any
 vendor-policy compliance, and they assert no real credential was exposed.
 
-Rework (Reviewer review-record / run 455): suppressing the stderr echo must
+Follow-up review finding: suppressing the stderr echo must
 not suppress previously-eligible retry/failover.  When the early-exit
 stderr carries a rate-limit or authentication signature (exit code 3 in
 the pre-fix evidence), the client must still classify the attempt as
@@ -303,7 +303,7 @@ def test_early_exit_without_stderr_keeps_timeout_error_class(
 
 
 # ---------------------------------------------------------------------------
-# historical reference rework (Reviewer review-record / run 455): the no-echo fix must not
+# Follow-up review: the no-echo fix must not
 # suppress previously-eligible retry/failover for rate-limit / authentication
 # early-exit stderr.
 # ---------------------------------------------------------------------------
@@ -407,7 +407,7 @@ _LEAK_MARKERS = (
 def test_early_exit_retryable_stderr_recovers_via_failover(
     monkeypatch, tmp_path, caplog, sig_line: str, expected_class: str
 ) -> None:
-    """Rework RED oracle: pre-historical reference, exit code 3 with rate-limit / auth
+    """RED oracle: before the fix, exit code 3 with rate-limit / auth
     stderr was classified retryable because the raw text sat in the
     exception; the no-echo fix must keep that failover eligibility through
     a structured signal: the second spawn completes the turn."""
@@ -560,7 +560,7 @@ def test_stderr_retry_class_helper_returns_only_fixed_class_names(
 
 
 # ---------------------------------------------------------------------------
-# historical reference rework 2 (Reviewer review-record / run 458, reviewed head
+# Second follow-up review (reviewed head
 # 3a91d47f1968bda5fefa9852f1f273326788bb44): ``_is_failover_error`` fell
 # through to parsing the GENERATED no-echo diagnostic whenever the
 # structured retry class was absent.  The diagnostic embeds the captured

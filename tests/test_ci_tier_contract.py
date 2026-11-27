@@ -541,7 +541,7 @@ def test_registry_keeps_all_five_native_targets() -> None:
     }
 
 
-# -- P0-1 (issue #9 rework): scope outputs are validated strictly ---------
+# -- scope outputs are validated strictly ---------------------------------
 #
 # A malformed `change-scope` output must never read as "false" (that would
 # silently narrow validation). Only the exact strings "true"/"false" are
@@ -583,7 +583,7 @@ def test_gate_accepts_every_valid_scope_combination() -> None:
         assert ok, (os_value, arm_value, report)
 
 
-# -- P1-1 runtime half (2nd review): jobs the policy does not know --------
+# -- runtime half: jobs the policy does not know --------------------------
 #
 # `results` is toJSON(needs): every job wired into ci-gate appears here.
 # A job that is not in the gate's tier policy must fail the gate no
@@ -617,7 +617,7 @@ def test_gate_lane_policy_covers_every_contract_lane() -> None:
     )
 
 
-# -- P0-2 (issue #9 rework): renames may never narrow the scope -----------
+# -- renames may never narrow the scope -----------------------------------
 #
 # `git diff --name-only` with rename detection reports only the NEW path,
 # so scripts/install_acp.py -> docs/install_acp.md would read as a docs
@@ -712,7 +712,7 @@ def test_docs_only_diff_in_a_real_repo_stays_fast(tmp_path) -> None:
     assert (scope.os_lanes, scope.extended_arm) == (False, False), scope
 
 
-# -- P1-1 (issue #9 rework): gate needs stay synced with workflow jobs ----
+# -- gate needs stay synced with workflow jobs ----------------------------
 
 
 # Issue #28 Phase B: these jobs exist ONLY to certify a release-candidate
@@ -774,7 +774,7 @@ def test_gate_needs_sync_detects_a_new_unlisted_job(ci: str) -> None:
     )
 
 
-# -- P1-2 (issue #9 rework): scripts/ packaging classification ------------
+# -- scripts/ packaging classification ------------------------------------
 
 
 def test_new_packaging_scripts_trigger_arm() -> None:
@@ -803,7 +803,6 @@ def test_verified_non_packaging_scripts_stay_os_only() -> None:
         "scripts/deploy_hermes_profiles.py",
         "scripts/ci_change_scope.py",
         "scripts/ci_gate_check.py",
-        "scripts/publication_gate.py",
         "scripts/hosted_clean_room_ci.py",
     ):
         scope = scope_mod.classify_paths([path])

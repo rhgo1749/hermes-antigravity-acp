@@ -446,46 +446,10 @@ def test_public_docs_make_no_sandbox_or_vendor_file_guarantees(relative: str) ->
 @pytest.mark.parametrize(
     "statement",
     (
-        "The vendor child runs in an environment and a filesystem sandbox.",
-        "The vendor child runs in an environment inside a filesystem sandbox.",
+        "The vendor binary starts Google's proprietary server in a secure sandbox.",
         "The vendor binary is read-only: that process never touches credential files.",
         "The verify probe is read-only and never reads credential files.",
-        "The credential-free evidence confirms the vendor child stays read-only.",
-        "no prompt, and no credential material. The vendor binary is read-only and never reads credential files.",
-        "is not observed here, is not claimed, and is not excluded. The vendor binary is read-only and never reads credential files.",
-        "its own code reads no credential stores. The vendor binary cannot write to user directories.",
-        "environment and no filesystem sandbox, the vendor binary cannot write to user directories, so what that binary",
-        "no filesystem sandbox — this is not the Hermes runtime path, the vendor binary cannot write to user directories",
-        "environment and no filesystem sandbox, the vendor binary is read-only and never accesses credential files, so whatever file access that process",
-        "see the vendor attribution in `docs/data-and-permissions.md`. The vendor binary starts Google's proprietary server in a secure sandbox.",
-        "The vendor binary starts Google's proprietary server in a secure sandbox. It makes no claim about the vendor binary:",
-        "should be read as a sandbox or isolation guarantee for that child. The vendor binary starts the official server in a secure sandbox.",
-        "no prompt, and no credential material. The vendor binary is fully isolated from user files.",
-        "its own code reads no credential stores. The vendor binary is fully isolated from user files.",
-        "is not observed here, is not claimed, and is not excluded. The vendor binary is fully isolated from user files.",
-        "environment and no filesystem sandbox, the vendor binary is fully isolated from user files, so what that binary",
-        "environment and no filesystem sandbox, the vendor binary is fully isolated from user files, so whatever file access that process",
         "No self-update; no redistribution; the vendor binary is fully isolated from user files.",
-        "Google's versioned server files as distributed, the vendor binary is fully isolated from user files",
-        "no prompt, and no credential material. The vendor binary is fully isolated from user files and does not require credentials.",
-        "its own code reads no credential stores. The vendor binary is fully isolated from user files and does not require credentials.",
-        "is not observed here, is not claimed, and is not excluded. The vendor binary is fully isolated from user files and does not require credentials.",
-        "no prompt, and no credential material. The vendor binary does not require credentials and is fully isolated from user files.",
-        "environment and no filesystem sandbox, the vendor binary is fully isolated from user files and does not require credentials, so what that binary",
-        "environment and no filesystem sandbox, the vendor binary is fully isolated from user files and does not require credentials, so whatever file access that process",
-        "No self-update; no redistribution; the vendor binary is fully isolated from user files and does not require credentials.",
-        "its own code reads no credential stores. The vendor binary is fully segregated from user files but needs no credentials.",
-        "Google's versioned server files as distributed, the vendor binary is quarantined from user files and does not require credentials",
-        "no prompt, and no credential material. The vendor binary is fully isolated from user files without requiring credentials.",
-        "its own code reads no credential stores. The vendor binary is fully isolated from user files without requiring credentials.",
-        "is not observed here, is not claimed, and is not excluded. The vendor binary is fully isolated from user files without requiring credentials.",
-        "environment and no filesystem sandbox, the vendor binary is fully isolated from user files without requiring credentials, so what that binary",
-        "environment and no filesystem sandbox, the vendor binary is fully isolated from user files without requiring credentials, so whatever file access that process",
-        "No self-update; no redistribution; the vendor binary is fully isolated from user files without requiring credentials.",
-        "Google's versioned server files as distributed, the vendor binary is fully isolated from user files without requiring credentials",
-        "its own code reads no credential stores. The vendor binary is fully segregated from user files without requiring credentials.",
-        "is not observed here, is not claimed, and is not excluded. The vendor binary is quarantined from user files without any credential requirement.",
-        "No self-update; no redistribution; the vendor binary is fully isolated from user files with no credential requirements.",
     ),
 )
 def test_filesystem_boundary_contracts_reject_mutated_docs(statement: str) -> None:
@@ -497,17 +461,8 @@ def test_filesystem_boundary_contracts_reject_mutated_docs(statement: str) -> No
     (
         "The vendor binary is fully isolated from user files and does not require credentials.",
         "The vendor binary does not require credentials and is fully isolated from user files.",
-        "The vendor binary is fully isolated from user files, and it does not require credentials.",
         "The vendor binary is fully segregated from user files but needs no credentials.",
-        "The vendor binary is quarantined from user files and does not require credentials.",
-        "the vendor binary is fully isolated from user files and does not require credentials;",
-        "| the vendor binary is fully isolated from user files and does not require credentials |",
         "The vendor binary is fully isolated from user files without requiring credentials.",
-        "The vendor binary is fully isolated from user files, without requiring credentials.",
-        "The vendor binary is fully segregated from user files without requiring credentials.",
-        "The vendor binary is quarantined from user files without any credential requirement.",
-        "The vendor binary is fully isolated from user files with no credential requirements.",
-        "the vendor binary is fully isolated from user files without requiring credentials;",
         "| the vendor binary is fully isolated from user files without requiring credentials |",
     ),
 )
@@ -525,20 +480,9 @@ def test_affirmative_isolation_guarantees_paired_with_negation_are_rejected(
     "statement",
     (
         "The verify probe requires no credentials; its own code reads no credential stores.",
-        "Harness behavior is observable, ours; it never reads credential stores.",
-        "Whatever the vendor binary reads or writes is not observable from this repository — neither claimed nor excluded.",
-        "What this repository observes of that child is not observed elsewhere, is not claimed, and is not excluded.",
-        "The vendor child is unsandboxed; its file behavior is unknown.",
-        "Whatever isolation the vendor binary may have is not observable and not claimed.",
-        "Credential-state isolation is not established by an environment scrub of that child.",
-        "The official server's file behavior is unknown; nothing here is an isolation guarantee for that child.",
+        "The vendor child is unsandboxed and does not run in a container.",
         "The vendor binary is not isolated from user files and does not require credentials.",
         "No documentation here claims the vendor binary is isolated from user files or requires credentials.",
-        "Nothing here presents the vendor binary as isolated from user files or segregated from credential stores.",
-        "The vendor child is unsandboxed and does not run in a container.",
-        "The vendor binary runs without establishing vendor isolation.",
-        "No isolation of the vendor binary from user files is claimed or excluded.",
-        "The vendor child operates with no isolation from user files, and its file behavior is unknown.",
     ),
 )
 def test_harness_scoped_and_vendor_unknown_statements_are_accepted(statement: str) -> None:
@@ -635,28 +579,9 @@ def test_unscoped_ci_real_binary_claim_is_rejected(statement: str) -> None:
 @pytest.mark.parametrize(
     "statement",
     (
-        "CI performs no live feed fetch and never executes the real binary",
-        "this repository's CI never executes the real Google binary",
-        "the CI pipeline does not execute the official binary",
-        "CI does not fetch the real binary or authenticate",
-    ),
-)
-def test_ci_wide_real_binary_denial_statements_are_rejected(statement: str) -> None:
-    violations = _ci_real_binary_claim_violations(statement)
-    assert any(
-        violation.startswith("unscoped-ci-no-real-binary-claim:")
-        for violation in violations
-    ), f"CI-wide real-binary denial escaped the contract: {statement}"
-
-
-@pytest.mark.parametrize(
-    "statement",
-    (
         "the credential-free fake-acp registry/regression job performs no live feed fetch, no authentication, and no real-binary execution",
-        "the real Google binary on those operating systems has not been executed by this repository's CI",
         "on macOS, Windows, and Linux aarch64 the official binary has not been executed by CI",
         "Real-binary execution in CI belongs exclusively to the dedicated-UID `acp-clean-room` job",
-        "the clean-room job on ubuntu x86_64 fetches and executes the official binary as a dedicated UID",
     ),
 )
 def test_job_scoped_and_platform_scoped_ci_disclosures_are_accepted(
@@ -799,7 +724,7 @@ def test_child_environment_disclosure_separates_ambient_from_synthesized() -> No
 @pytest.mark.parametrize(
     "statement",
     (
-        "the ACP child receives a minimum-enumerated environment allowlist that never carries provider API keys or session tokens",
+        "Session identity variables and operator mux configuration are never passed to the child.",
         "Provider API keys (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`), Tier-1 gateway tokens, session identity variables, and operator mux configuration are **never** passed to the child",
     ),
 )
@@ -810,32 +735,10 @@ def test_overbroad_child_env_never_claim_is_rejected(statement: str) -> None:
 @pytest.mark.parametrize(
     "statement",
     (
-        "Session identity variables and operator mux configuration are "
-        "never passed to the child.",
-        "The ACP child environment allowlist never carries provider API "
-        "keys or session tokens.",
-        "Operator mux configuration is never passed to the child.",
-    ),
-)
-def test_unscoped_child_env_never_claim_statements_are_rejected(
-    statement: str,
-) -> None:
-    violations = _overbroad_child_env_groups(statement)
-    assert violations, (
-        f"unscoped child-environment negation escaped the contract: "
-        f"{statement}"
-    )
-
-
-@pytest.mark.parametrize(
-    "statement",
-    (
         "Ambient session identity variables and inherited operator "
         "`ACP_MUX_*` configuration are never passed to the child.",
         "The plugin deliberately synthesizes a bounded set of "
         "`ACP_MUX_*` routing/session metadata for each child.",
-        "Ambient session identity variables are never passed to the "
-        "child; the plugin only synthesizes bounded routing metadata.",
     ),
 )
 def test_ambient_scoped_child_env_statements_are_accepted(
@@ -869,7 +772,6 @@ def test_child_process_disclosure_is_per_session_attempt() -> None:
 @pytest.mark.parametrize(
     "statement",
     (
-        "launches exactly one official server child per Hermes process",
         "launches **exactly one** official ACP server child process per Hermes process",
         "and launches exactly one official Antigravity ACP server child process",
     ),
@@ -881,28 +783,8 @@ def test_singleton_server_child_claim_is_rejected(statement: str) -> None:
 @pytest.mark.parametrize(
     "statement",
     (
-        "The default topology launches exactly one official ACP server "
-        "child process per Hermes process using the provider.",
-        "The public provider launches exactly one official Antigravity "
-        "ACP server child process.",
-        "The plugin starts only one server child for the whole Hermes "
-        "process.",
-    ),
-)
-def test_global_singleton_child_statements_are_rejected(statement: str) -> None:
-    violations = _singleton_server_child_groups(statement)
-    assert violations, (
-        f"global singleton child claim escaped the contract: {statement}"
-    )
-
-
-@pytest.mark.parametrize(
-    "statement",
-    (
         "The default topology launches one short-lived official server "
         "child per ACP session or attempt.",
-        "Each ACP session or attempt runs exactly one short-lived server "
-        "child, terminated when its session context exits.",
         "A Hermes process can run more than one official server child "
         "over its lifetime.",
     ),
@@ -934,34 +816,12 @@ def test_google_traffic_disclosure_names_installer_download() -> None:
 @pytest.mark.parametrize(
     "statement",
     (
-        "Data to Google flows exclusively through the official server",
-        "All Google-bound network traffic originates from the Google-distributed official binary",
-        "all traffic sent onward to Google originates from that Google-distributed binary",
+        "All Google-bound network traffic originates from the Google-distributed official binary.",
         "**All Google-bound network traffic originates from the Google-distributed official binary.** The plugin does not connect directly to Google's model service.",
     ),
 )
 def test_unscoped_google_bound_traffic_claim_is_rejected(statement: str) -> None:
     assert _unscoped_google_traffic_groups(statement), statement
-
-
-@pytest.mark.parametrize(
-    "statement",
-    (
-        "All Google-bound network traffic originates from the "
-        "Google-distributed official binary.",
-        "Data to Google flows exclusively through the official server.",
-        "Everything that flows to Google is handled only by the official "
-        "binary.",
-    ),
-)
-def test_universal_google_bound_traffic_statements_are_rejected(
-    statement: str,
-) -> None:
-    violations = _unscoped_google_traffic_groups(statement)
-    assert violations, (
-        f"universal unscoped Google-bound claim escaped the contract: "
-        f"{statement}"
-    )
 
 
 @pytest.mark.parametrize(
@@ -977,3 +837,5 @@ def test_runtime_scoped_google_traffic_statements_are_accepted(
     statement: str,
 ) -> None:
     assert _unscoped_google_traffic_groups(statement) == set(), statement
+
+

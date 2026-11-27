@@ -314,7 +314,7 @@ def test_subprocess_environment_uses_host_policy_when_available(monkeypatch):
     assert applied == [env["HOME"]]
     assert env["TMPDIR"] == "/profile/scratch"
     assert env["PATH"] == "/bin"
-    # historical reference: a successful host policy is the base, not the contract. The
+    # A successful host policy is the base, not the contract. The
     # ACP minimum environment filter narrows even a returned provider
     # credential and any unlisted profile value out before spawn.
     assert "SAFE_PROFILE_VALUE" not in env
