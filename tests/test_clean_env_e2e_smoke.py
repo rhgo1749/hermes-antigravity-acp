@@ -1,4 +1,4 @@
-"""historical reference: credential-free clean-environment install/diagnostic E2E smoke.
+"""Credential-free clean-environment install/diagnostic E2E smoke.
 
 A fresh user with an EMPTY ``HERMES_HOME`` and no Docker, no profile-mux,
 no account-mux, no custom Hermes Core patches, and no ``/quota`` skill
@@ -10,7 +10,7 @@ built from fixture bytes; the registry pin is patched to the fixture digest.
 No test here downloads anything, touches a credential, authenticates, or
 calls a real model.
 
-Evidence-class separation (historical reference criterion — never conflated; see
+Evidence-class separation (see
 docs/clean-env-e2e-smoke.md for the delivery-time record):
 
   class (a) auth success               — never attempted here; NO-GO

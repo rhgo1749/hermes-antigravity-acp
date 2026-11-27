@@ -1,8 +1,7 @@
-"""historical reference: the official-binary clean-room evidence record is a contract.
+"""Official-binary clean-room evidence contract.
 
 The evidence document (`docs/official-server-1.4.4-clean-room-e2e-2026-11-07.md`)
-keeps two eras strictly separated (owner evidence-venue ruling, historical reference
-historical reference): the 2026-11-07 private Debian-container attempt is a
+keeps two eras strictly separated: the 2026-11-07 private Debian-container attempt is a
 historical observation log that is NOT EXECUTED as clean-room acceptance
 evidence and is never retro-promoted (its env-only `env -i`/empty-HOME
 scrub does not establish a separate OS UID or credential-state isolation),
@@ -24,8 +23,7 @@ that record honest and machine-checkable WITHOUT network access:
 - the prior private-container/Docker-era attempts must stay labeled
   historical and NOT EXECUTED, and env-only isolation must never be
   claimed as OS-user or credential-state isolation;
-- the record must state the auth boundary it did not cross, the Gate C
-  NO-GO, and the independence of historical reference/historical reference/historical reference;
+- the record must state the auth boundary it did not cross, the authentication and inference NO-GO;
 - the record itself must pass the repository's own secret-content and
   credential-shape scanners and contain no personal host paths.
 
@@ -188,7 +186,7 @@ def test_readme_and_smoke_docs_point_at_the_record(doc: str) -> None:
     assert "Real-server `initialize` executed by this suite: NOT EXECUTED" in smoke
 
 
-# -- provenance regression (Reviewer review-record run 476) -----------------
+# -- Evidence provenance ----------------------------------------------------
 # The isolation requirement forbids retro-promoting the prior in-container/
 # Docker-era attempts and forbids presenting an env-only scrub as OS-user
 # or credential-state isolation. These tests keep that correction true.

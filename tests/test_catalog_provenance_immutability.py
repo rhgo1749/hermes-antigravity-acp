@@ -1,4 +1,4 @@
-"""Catalog immutability and standalone server lifecycle separation (historical reference).
+"""Catalog immutability and standalone server lifecycle separation.
 
 Deterministic, credential-free fixtures for four provider-ownership families —
 catalog-managed, standalone-managed, ambiguous/unverified, and empty
@@ -612,7 +612,7 @@ def test_install_refuses_overwriting_catalog_shaped_tree_without_provenance(tmp_
 
 def test_catalog_shaped_tree_with_private_overlay_copy_is_still_refused(tmp_path):
     # A manually assembled provider copy may carry a private opt-in overlay
-    # module (historical reference moved it out of the public plugin tree). A portable
+    # module outside the public plugin tree. A portable
     # copy is not ownership evidence, so the tree must fail closed anyway.
     home = tmp_path / "hermes"
     home.mkdir()
@@ -778,7 +778,7 @@ def test_path_launcher_errors_are_distinct(monkeypatch, tmp_path):
     with pytest.raises(RuntimeError) as caught:
         installer._provider_command(tmp_path / "bin", require_existing=True)
     nonexecutable_message = str(caught.value)
-    # historical reference: the non-executable diagnostic is actionable (names the
+    # The non-executable diagnostic is actionable (names the
     # launcher and the recovery) while staying distinct from the missing/
     # PATH diagnostic.
     assert nonexecutable_message.startswith("provider launcher ")

@@ -1029,7 +1029,7 @@ def test_fake_actual_turn_cancellation_remains_an_error(monkeypatch, tmp_path) -
 
 
 def test_full_replay_prompt_orders_primer_before_history_e2e(monkeypatch, tmp_path) -> None:
-    """historical reference: through the real bootstrap path against a fake ACP subprocess,
+    """Through the real bootstrap path against a fake ACP subprocess,
     the wire prompt must carry the primer band ahead of history."""
     script, log_path = _write_fake_server(tmp_path)
     client = _load_client(
