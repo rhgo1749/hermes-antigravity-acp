@@ -363,8 +363,8 @@ In brief:
   this runtime sends onward to Google originates from that
   Google-distributed binary. The plugin does not connect directly to Google's
   model service or handle Google credentials. Parked-MCP opens a per-session
-  authenticated loopback HTTP endpoint on `127.0.0.1` for Hermes tool calls. Distinct from that runtime traffic: the
-  standalone installer fetches the pinned server archive over HTTPS from
+  authenticated loopback HTTP endpoint on `127.0.0.1` for Hermes tool calls.
+  Distinct from that runtime traffic: the standalone installer fetches the pinned server archive over HTTPS from
   `dl.google.com` during an explicit install command — installer asset
   retrieval, not model/protocol traffic. This repository neither observes
   nor bounds any other networking inside the proprietary binary.
@@ -376,11 +376,12 @@ In brief:
   continuation and affinity values — never Google credentials); Hermes-side
   file access stays behind Hermes' path-safety, redaction, and write-denial
   policy.
-- **Persisted state.** Replay session-continuation checkpoints (including the native ACP
-  session ID needed for resume) and learned-limit state under the selected
-  Hermes home's `cache/` (0600, bounded, expiring; see the detailed data
-  disclosure). Telemetry uses hashes rather than raw native session IDs, installer
-  state under `~/.local/opt`, `~/.local/bin`, and the plugin tree. Google
+- **Persisted state.** Replay session-continuation checkpoints (including
+  the native ACP session ID needed for resume) and learned-limit state live
+  under the selected Hermes home's `cache/` (0600, bounded, expiring; see the
+  detailed data disclosure). Telemetry uses hashes rather than raw native
+  session IDs. Installer state lives under `~/.local/opt`, `~/.local/bin`,
+  and the plugin tree. Google
   sign-in state is managed by Google's runtime in your user environment.
 - **Telemetry.** This plugin sends no telemetry of its own; usage reporting is
   separate from billing: both engines always return `completion.usage=None`;
