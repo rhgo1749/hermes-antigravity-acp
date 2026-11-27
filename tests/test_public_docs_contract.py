@@ -447,6 +447,9 @@ def test_public_docs_make_no_sandbox_or_vendor_file_guarantees(relative: str) ->
     "statement",
     (
         "The vendor binary starts Google's proprietary server in a secure sandbox.",
+        "The vendor binary is read-only: that process never touches credential files.",
+        "The verify probe is read-only and never reads credential files.",
+        "No self-update; no redistribution; the vendor binary is fully isolated from user files.",
     ),
 )
 def test_filesystem_boundary_contracts_reject_mutated_docs(statement: str) -> None:
@@ -457,6 +460,10 @@ def test_filesystem_boundary_contracts_reject_mutated_docs(statement: str) -> No
     "statement",
     (
         "The vendor binary is fully isolated from user files and does not require credentials.",
+        "The vendor binary does not require credentials and is fully isolated from user files.",
+        "The vendor binary is fully segregated from user files but needs no credentials.",
+        "The vendor binary is fully isolated from user files without requiring credentials.",
+        "| the vendor binary is fully isolated from user files without requiring credentials |",
     ),
 )
 def test_affirmative_isolation_guarantees_paired_with_negation_are_rejected(
@@ -467,6 +474,19 @@ def test_affirmative_isolation_guarantees_paired_with_negation_are_rejected(
         violation.startswith("vendor-isolation-guarantee:")
         for violation in violations
     ), f"compound vendor-isolation guarantee escaped the contract: {statement}"
+
+
+@pytest.mark.parametrize(
+    "statement",
+    (
+        "The verify probe requires no credentials; its own code reads no credential stores.",
+        "The vendor child is unsandboxed and does not run in a container.",
+        "The vendor binary is not isolated from user files and does not require credentials.",
+        "No documentation here claims the vendor binary is isolated from user files or requires credentials.",
+    ),
+)
+def test_harness_scoped_and_vendor_unknown_statements_are_accepted(statement: str) -> None:
+    assert _boundary_violations(statement) == [], statement
 
 
 _CI_REAL_BINARY_SCOPE_TOKENS = (
@@ -548,11 +568,26 @@ def test_readme_scopes_ci_no_real_binary_wording_and_names_clean_room() -> None:
 @pytest.mark.parametrize(
     "statement",
     (
+        "the CI performs no live feed fetch and never executes the real binary",
         "CI as a whole performs no live feed fetch, no authentication, and no real-binary execution.",
     ),
 )
 def test_unscoped_ci_real_binary_claim_is_rejected(statement: str) -> None:
     assert _ci_real_binary_claim_violations(statement), statement
+
+
+@pytest.mark.parametrize(
+    "statement",
+    (
+        "the credential-free fake-acp registry/regression job performs no live feed fetch, no authentication, and no real-binary execution",
+        "on macOS, Windows, and Linux aarch64 the official binary has not been executed by CI",
+        "Real-binary execution in CI belongs exclusively to the dedicated-UID `acp-clean-room` job",
+    ),
+)
+def test_job_scoped_and_platform_scoped_ci_disclosures_are_accepted(
+    statement: str,
+) -> None:
+    assert _ci_real_binary_claim_violations(statement) == [], statement
 
 
 _CHILD_ENV_SUBJECT = re.compile(
@@ -690,10 +725,26 @@ def test_child_environment_disclosure_separates_ambient_from_synthesized() -> No
     "statement",
     (
         "Session identity variables and operator mux configuration are never passed to the child.",
+        "Provider API keys (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`), Tier-1 gateway tokens, session identity variables, and operator mux configuration are **never** passed to the child",
     ),
 )
 def test_overbroad_child_env_never_claim_is_rejected(statement: str) -> None:
     assert _overbroad_child_env_groups(statement), statement
+
+
+@pytest.mark.parametrize(
+    "statement",
+    (
+        "Ambient session identity variables and inherited operator "
+        "`ACP_MUX_*` configuration are never passed to the child.",
+        "The plugin deliberately synthesizes a bounded set of "
+        "`ACP_MUX_*` routing/session metadata for each child.",
+    ),
+)
+def test_ambient_scoped_child_env_statements_are_accepted(
+    statement: str,
+) -> None:
+    assert _overbroad_child_env_groups(statement) == set(), statement
 
 
 @pytest.mark.parametrize("relative", BOUNDARY_DOCS)
@@ -721,11 +772,27 @@ def test_child_process_disclosure_is_per_session_attempt() -> None:
 @pytest.mark.parametrize(
     "statement",
     (
+        "launches **exactly one** official ACP server child process per Hermes process",
         "and launches exactly one official Antigravity ACP server child process",
     ),
 )
 def test_singleton_server_child_claim_is_rejected(statement: str) -> None:
     assert _singleton_server_child_groups(statement), statement
+
+
+@pytest.mark.parametrize(
+    "statement",
+    (
+        "The default topology launches one short-lived official server "
+        "child per ACP session or attempt.",
+        "A Hermes process can run more than one official server child "
+        "over its lifetime.",
+    ),
+)
+def test_per_session_attempt_child_statements_are_accepted(
+    statement: str,
+) -> None:
+    assert _singleton_server_child_groups(statement) == set(), statement
 
 
 @pytest.mark.parametrize("relative", BOUNDARY_DOCS)
@@ -750,9 +817,25 @@ def test_google_traffic_disclosure_names_installer_download() -> None:
     "statement",
     (
         "All Google-bound network traffic originates from the Google-distributed official binary.",
+        "**All Google-bound network traffic originates from the Google-distributed official binary.** The plugin does not connect directly to Google's model service.",
     ),
 )
 def test_unscoped_google_bound_traffic_claim_is_rejected(statement: str) -> None:
     assert _unscoped_google_traffic_groups(statement), statement
+
+
+@pytest.mark.parametrize(
+    "statement",
+    (
+        "All runtime model/protocol traffic to Google originates from "
+        "the Google-distributed official binary.",
+        "The standalone installer fetches the pinned archive from "
+        "`dl.google.com` over HTTPS.",
+    ),
+)
+def test_runtime_scoped_google_traffic_statements_are_accepted(
+    statement: str,
+) -> None:
+    assert _unscoped_google_traffic_groups(statement) == set(), statement
 
 

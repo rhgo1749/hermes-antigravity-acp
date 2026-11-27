@@ -1202,7 +1202,7 @@ def run_raw_allow(args, recorder: FrameRecorder, evidence_dir: Path) -> int:
                 # Fail closed on an empty/missing model (reviewer run 642):
                 # the prior ``if args.model`` branch let ``--model ""`` skip
                 # session/set_model, send session/prompt directly and record
-                # PASS without any model confirmation. The canary contract requires
+                # PASS without any model confirmation. historical reference requires
                 # initialize -> session/new -> confirmed session/set_model ->
                 # exactly one session/prompt, so no prompt frame is ever
                 # emitted unless a non-empty requested model exists.
