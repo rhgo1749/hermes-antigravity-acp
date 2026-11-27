@@ -464,7 +464,14 @@ class ParkedProcessTreeNativeTests(unittest.TestCase):
         teardown = acp_connection_mod._process_teardown
         orig_enabled, orig_getpgid, orig_killpg = teardown._non_reaping_enabled, teardown.os.getpgid, teardown.os.killpg
         try:
-            for case in ("zombie_recover", "waitid_disabled", "raw_waitpid", "pid_reuse", "foreign_pgid"):
+            for case in (
+                "zombie_recover",
+                "waitid_disabled",
+                "raw_waitpid",
+                "pid_reuse",
+                "waitid_disabled_pid_reuse",
+                "foreign_pgid",
+            ):
                 with self.subTest(case=case):
                     teardown._non_reaping_enabled = True
                     sdir, script, _, _ = _write_fixture(self.root, f"z_{case}", {"ignore_sigterm": True})
@@ -480,17 +487,17 @@ class ParkedProcessTreeNativeTests(unittest.TestCase):
                         pids = _tree_pids(sdir)
                         if case != "foreign_pgid":
                             proc.kill()
-                            if case in ("raw_waitpid", "pid_reuse"):
+                            if case in ("raw_waitpid", "pid_reuse", "waitid_disabled_pid_reuse"):
                                 os.waitpid(proc.pid, 0)
                             else:
                                 self.assertTrue(_wait_until(lambda: teardown.proc_dead_unreaped(proc), timeout=5.0))
-                        if case == "waitid_disabled":
+                        if case in ("waitid_disabled", "waitid_disabled_pid_reuse"):
                             teardown._non_reaping_enabled = False
 
                         def _fake_getpgid(pid: int) -> int:
                             if pid == proc.pid and case in ("zombie_recover", "waitid_disabled"):
                                 raise ProcessLookupError(errno.ESRCH, "ESRCH")
-                            if pid == proc.pid and case == "pid_reuse":
+                            if pid == proc.pid and case in ("pid_reuse", "waitid_disabled_pid_reuse"):
                                 return proc.pid
                             return orig_getpgid(pid)
 
@@ -512,7 +519,7 @@ class ParkedProcessTreeNativeTests(unittest.TestCase):
                             self.assertTrue(_pid_alive(pids[-1]))
                     finally:
                         with contextlib.suppress(Exception):
-                            if proc.poll() is None and case not in ("raw_waitpid", "pid_reuse"):
+                            if proc.poll() is None and case not in ("raw_waitpid", "pid_reuse", "waitid_disabled_pid_reuse"):
                                 proc.kill()
                         _cleanup_state(sdir, pids, proc)
         finally:

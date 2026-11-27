@@ -277,7 +277,8 @@ def terminate_process_tree(
     # Capture group ownership BEFORE anything can reap the leader: Popen.poll()
     # reaps, and a reaped leader makes ownership unverifiable forever (including
     # PID reuse after an internal or external reap).
-    if proc.returncode is not None or _non_reaping_probe(proc) is _ALREADY_REAPED:
+    probe = _non_reaping_probe(proc) if proc.returncode is None else _ALREADY_REAPED
+    if probe is _ALREADY_REAPED or (probe is _FALLBACK and proc.poll() is not None):
         logger.warning(
             "ACP teardown for pid %d started after the leader was already "
             "reaped; group ownership unverifiable — no group signal will "
