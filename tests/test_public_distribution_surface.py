@@ -1,4 +1,4 @@
-"""historical reference: personal host-deploy, mux, and portfolio policy stay off the
+"""Personal host-deploy, mux, and portfolio policy stay off the
 public distribution surface.
 
 The generalized invariant under test: the public plugin, the default install,
@@ -67,9 +67,7 @@ CANONICAL_PROVIDER_FILES = {
 
 # Personal-ops tokens that must never appear on the public distribution
 # surface (default installers, provider projection, CI, README, catalog
-# entry). Rework-r4 (historical reference): the public provider tree is token-scanned
-# TOO — client.py now carries a domain-neutral obligation-evidence contract
-# with zero personal naming (the r2-era exemption rationale is retired).
+# entry), including the public provider tree itself.
 PRIVATE_OPS_TOKENS = (
     "acp-accounts.json",
     "acp-mux-state.json",
@@ -127,7 +125,7 @@ _PROVIDER_PREFIX = "hermes-plugin/antigravity-acp/"
 def _provider_relative_names(tracked: list[str]) -> set[str]:
     """Full relative paths under the provider root; nesting is preserved.
 
-    Rework-r2 (historical reference): the witness compares exact relative paths, not
+    The witness compares exact relative paths, not
     basenames. A nested file whose basename is canonical (for example
     ``hermes-plugin/antigravity-acp/extra/client.py``) is a non-canonical
     provider path and must fail this witness, not hide inside it.
@@ -188,10 +186,9 @@ def _seed_standalone_target(home: Path) -> Path:
 
 
 def test_generic_deploy_refuses_before_any_write_when_a_tree_carries_overlays(tmp_path) -> None:
-    """historical reference rework-r2: a generic deploy never silently strips overlays.
+    """A generic deploy never silently strips overlays.
 
-    Round-1 made update propagation drop unmanaged files; a redeploy then
-    reported success while quietly removing a live private overlay. The
+    A redeploy must not report success while removing an unmanaged overlay. The
     rework turns that silent loss into a pre-mutation refusal: zero writes
     anywhere, and the unmanaged files stay live with unchanged bytes.
     """
@@ -230,8 +227,7 @@ def test_generic_deploy_refuses_before_any_write_when_a_tree_carries_overlays(tm
 def test_operator_override_deploy_still_never_propagates_unmanaged_files(tmp_path) -> None:
     """The explicit operator-approved override deploys but never adopts.
 
-    Rework-r2 preserves the round-1 propagation invariant even under the
-    override: only this installer's own preserved state carries into the new
+    Even under the override, only this installer's own preserved state carries into the new
     tree; unmanaged private files are dropped from the live tree (recoverable
     in the deployment backup) and never copied into the candidate.
     """
@@ -298,7 +294,7 @@ def checkout_steps_missing_persist_flag(workflow_text: str) -> list[str]:
     """Structural (order-independent) gate: every actions/checkout step must
     set ``persist-credentials: false`` in its own ``with:`` mapping.
 
-    historical reference criterion 6 hardening: the previous forward-window regex passed
+    A forward-window regex can pass
     as long as the literal appeared anywhere below the ``uses:`` line, so a
     reordered step (``with:`` first), a step borrowing a sibling's flag, or an
     explicit ``persist-credentials: true`` inside the window could slip
@@ -385,12 +381,12 @@ def test_public_tree_audit_flags_extra_provider_files_and_personal_tokens(tmp_pa
     provider.mkdir(parents=True)
     (provider / "plugin.yaml").write_text("name: antigravity-acp-provider\n", encoding="utf-8")
     (provider / "portfolio_policy.py").write_text("# smuggled overlay\n", encoding="utf-8")
-    # Rework-r4: a CANONICAL provider path smuggles nothing either — the
+    # A canonical provider path is not exempt — the
     # provider tree is token-scanned like the public closure.
     (provider / "client.py").write_text(
         "# domain-neutral provider client\nportfolio_policy = None\n", encoding="utf-8"
     )
-    # Rework-r2: nested paths whose BASENAME is canonical must not evade the
+    # Nested paths whose basename is canonical must not evade the
     # provider-tree rule (an allowed-name copy plus an importable nested
     # private package).
     (provider / "extra").mkdir()
@@ -411,7 +407,7 @@ def test_public_tree_audit_flags_extra_provider_files_and_personal_tokens(tmp_pa
         "hermes-plugin/antigravity-acp/extra/client.py",
         "hermes-plugin/antigravity-acp/private_secrets/__init__.py",
     }
-    # Rework-r4 RED: the token scan now covers the provider tree itself.
+    # The token scan covers the provider tree itself.
     token_findings = {
         finding.relative_path
         for finding in findings
@@ -423,7 +419,7 @@ def test_public_tree_audit_flags_extra_provider_files_and_personal_tokens(tmp_pa
 
 
 def test_real_provider_tree_carries_no_personal_ops_tokens() -> None:
-    """Rework-r4 GREEN (R6/R7): the shipped provider tree is token-clean."""
+    """The shipped provider tree is token-clean."""
     offenders: dict[str, list[str]] = {}
     for source in sorted(PLUGIN_DIR.iterdir()):
         if not source.is_file():
@@ -557,8 +553,7 @@ def test_clean_single_account_install_ships_no_personal_ops_surface(monkeypatch,
 def _declared_surface_violations(manifest_text: str) -> list[str]:
     """Fail-closed structural witness for the plugin's declared surface.
 
-    The plugin-catalog contract (catalog rules 11-13) and historical reference criterion 3
-    require this plugin's registered surface to stay pinned: exactly the
+    The plugin-catalog contract requires this plugin's registered surface to stay pinned: exactly the
     single model-provider profile a default install creates and NOTHING else: every ``provides_*`` list, any ``commands``/``skills``
     declaration, and every ``/quota`` tool/skill reference (the personal
     usage-quota surface stays unshipped and its telemetry stays
@@ -631,7 +626,7 @@ def test_public_plugin_declares_no_command_or_quota_surface() -> None:
 def test_planted_quota_or_env_surface_declaration_fails_closed(
     mutated_manifest: str, expected_fragment: str
 ) -> None:
-    """historical reference criterion 3: a planted /quota tool/skill declaration anywhere
+    """A planted /quota tool/skill declaration anywhere
     in the manifest surface is a violation, never a silent ship."""
     violations = _declared_surface_violations(mutated_manifest)
     assert violations, mutated_manifest
@@ -666,7 +661,7 @@ def test_shipped_package_carries_no_quota_tool_or_skill_manifest(tmp_path) -> No
 
 
 def test_usage_telemetry_status_stays_unavailable_on_public_surface(monkeypatch, tmp_path) -> None:
-    """historical reference criterion 3: /quota stays unshipped, so the provider can
+    """/quota stays unshipped, so the provider can
     never truthfully report billable usage; the telemetry contract pins
     ``status='unavailable'`` with every request-usage bucket left None and
     nothing marked as billing usage."""

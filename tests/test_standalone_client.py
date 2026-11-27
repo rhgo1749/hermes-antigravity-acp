@@ -1775,7 +1775,7 @@ def test_auditable_review_accepts_completed_native_read_evidence(monkeypatch) ->
 
 
 # ---------------------------------------------------------------------------
-# 2026-10-12 REA follow-up: full-replay request fidelity (historical reference-historical reference)
+# Full-replay request fidelity
 # Sanitized, credential-free fixtures shaped like the incident: a long
 # completed deployment history followed by an unrelated Korean FDE/PPT request.
 # ---------------------------------------------------------------------------
@@ -1917,7 +1917,7 @@ def test_user_quoting_the_identical_memory_block_is_undetectable(monkeypatch) ->
     is in their transcript) produces a payload that is byte-for-byte identical
     to a genuine injection.  No text-level rule can tell them apart, so any
     splitting heuristic would risk relocating genuine user text.  The only
-    sound fix is a Core-side structured provenance field (historical reference handoff).
+    sound fix is a Core-side structured provenance field.
     """
     _, _, client_module = _load(monkeypatch)
     quoted = "이 메모리 블록이 왜 들어있어?\n\n" + _MEMORY_NOTE + "\n\n해설해줘"
@@ -2055,7 +2055,7 @@ def test_progress_after_active_request_survives_primer(monkeypatch) -> None:
 
 
 def test_full_replay_diagnostics_classify_reason_and_hide_content(monkeypatch, caplog) -> None:
-    """historical reference: every full replay logs one structured line (reason + band
+    """Every full replay logs one structured line (reason + band
     sizes + opaque handle) and never logs message content."""
     import logging as _logging
 

@@ -1184,7 +1184,7 @@ def test_class_tokens_are_fixed_vocabulary_and_never_echo_raw_values():
 
 
 # ---------------------------------------------------------------------------
-# historical reference (Lane B): evidence-hygiene gate over the public repository audit.
+# Evidence-hygiene gate over the public repository audit.
 # Planted SYNTHETIC credential material must be flagged; the CI-visible output
 # must carry rule names and counts only - never the planted value, never the
 # finding path; and a clean tree must exit 0 with zero findings.

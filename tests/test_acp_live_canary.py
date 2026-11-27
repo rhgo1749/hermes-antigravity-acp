@@ -743,7 +743,7 @@ def test_valid_non_pass_stop_reason_is_preserved_without_fingerprint(
 def test_legacy_mode_passes_lane_gate_without_new_flags(
     canary, monkeypatch, tmp_path
 ):
-    """The legacy default CLI mode keeps its pre-historical reference unattended contract: no
+    """The legacy default CLI mode keeps its unattended contract: no
     lane flag is required, and execution proceeds past argument/lane validation."""
     binary = _fake(tmp_path)
     monkeypatch.setenv("ACP_FAKE_SCENARIO", "ok")
@@ -983,7 +983,7 @@ def test_raw_protocol_sanitizer_fail_closed_primitive_matrix(canary):
 def test_malformed_initialize_protocol_version_fails_closed_before_session_new(
     canary, monkeypatch, tmp_path, variant
 ):
-    """historical reference fail-closed contract: the driver advances past `initialize`
+    """The driver advances past `initialize`
     only when the result carries the required, type-correct, supported ACP
     protocol version. Missing, object-shaped, string, bool-, float-, null- or
     unsupported-integer protocolVersion values are rejected conservatively:
@@ -1027,7 +1027,7 @@ def test_valid_initialize_protocol_version_positive_control(
 def test_empty_or_missing_model_fails_closed_before_any_prompt(
     canary, monkeypatch, tmp_path, model_value
 ):
-    """historical reference ordering contract: the raw probe never sends
+    """The raw probe never sends
     `session/prompt` (and can never report PASS) unless a non-empty model
     was confirmed via `session/set_model`. The prior head skipped
     `session/set_model` for an empty/whitespace/missing model, prompted
