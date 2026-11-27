@@ -1,791 +1,255 @@
 # hermes-antigravity-acp
 
-Use Google's **official Antigravity ACP server** as a standard ACP v1 agent
-backend for Hermes, without scraping the Antigravity TUI or reimplementing its
-private transport.
+[![Release](https://img.shields.io/github/v/release/rhgo1749/hermes-antigravity-acp)](https://github.com/rhgo1749/hermes-antigravity-acp/releases/latest)
+[![CI](https://github.com/rhgo1749/hermes-antigravity-acp/actions/workflows/ci.yml/badge.svg)](https://github.com/rhgo1749/hermes-antigravity-acp/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-This repository does **not** redistribute Google's proprietary binaries and does
-**not** extract, copy, or emulate Google OAuth tokens. The installer downloads
-the official `antigravity-acp` distribution directly from Google's CDN using
-the version and platform mapping published in the Agent Client Protocol
-Registry. This is an independent project and is not affiliated with Google;
-see `NOTICE.md`.
+Use Google's **official Antigravity ACP server** as a model provider for
+[Hermes Agent](https://github.com/NousResearch/hermes-agent), through standard
+ACP v1 JSON-RPC over stdio. No Hermes Core patch, TUI scraping, or private
+transport reimplementation is required.
 
-Google now publishes a standalone Antigravity ACP server (`agy_acp_server`)
-that speaks newline-delimited JSON-RPC over stdio, so an ACP client can
-integrate the Antigravity agent runtime through a structured protocol instead
-of a PTY, TUI parser, or a custom `agy --input-format stream-json` bridge.
+The default **Parked-MCP** engine keeps tool execution in Hermes while
+preserving the official ACP session. The alternative Replay engine remains
+selectable. This is an independent project, not affiliated with Google.
+It neither redistributes Google's proprietary binaries nor extracts, copies,
+or emulates Google OAuth tokens.
 
-![How Hermes connects to the official Antigravity ACP server, and the default tool execution boundary](docs/images/how-it-works.svg)
+![How Hermes connects to the official Antigravity ACP server](docs/images/how-it-works.svg)
 
-The provider communicates with the official server over ACP JSON-RPC via stdio.
-Hermes tool calls follow Hermes policies and approvals. The ACP server's native
-coding tools are never auto-approved: native `run_command` is disabled at
-session launch and native file-mutation or command permission frames are
-answered with the server's own reject option, so shell and file work runs
-through Hermes' own approval-gated terminal and file tools.
+- **Hermes-owned tools:** native execution is not auto-approved; the default
+  engine parks MCP tool calls until Hermes returns their results.
+- **Live model discovery:** server-advertised model IDs, no curated fallback list.
+- **Session continuity:** scoped to the conversation, including delegated children.
+- **Cross-platform installer:** publisher-pinned official server downloads,
+  explicit lifecycle management, and no self-update.
+- **One provider package:** Parked-MCP by default, Replay by explicit opt-in.
 
-## Status at a glance (evidence-backed, checked 2026-11-26)
+## Status at a glance
 
-| Topic | Current status |
+| Topic | Status |
 |---|---|
-| Hermes version | `plugin.yaml` declares `requires_hermes: ">=0.21.6"` — a CI-proven floor re-run on every change (`catalog-floor-gate`); the latest upstream Hermes release is `v0.23.4`. |
-| OS support | **Ubuntu 24.04 x86_64** is the only OS with real-binary, dedicated-OS-UID clean-room execution evidence (GitHub-hosted CI; see [OS support and verification tiers](#os-support-and-verification-tiers)). **Windows x64 and Windows arm64** have real-binary hosted-CI execution evidence (actual installer + provider registration + unauthenticated ACP `initialize` on `windows-2022`/`windows-11-arm` runners) — one tier below clean-room, still executed. **Linux aarch64 and macOS arm64** are registry-pinned with publisher digests and have executed native hosted-CI lifecycle evidence (Actions run [43198795406](https://github.com/rhgo1749/hermes-antigravity-acp/actions/runs/43198795406) at `8c054be1eaa4230a87b4e5f9f23a56e3fe74ae09`: native-arch assert, publisher-pinned download + SHA-256, install → status → verify, unauthenticated ACP `initialize`, uninstall → confirmed absence) — promoted from pinned-only, still below the clean-room tier, with no authentication or model-inference coverage. Provider registration and selection/client-factory were additionally executed in Phase B run [43321929587](https://github.com/rhgo1749/hermes-antigravity-acp/actions/runs/43321929587) at `93db79996c56f6c1455b25ec29fea54bbc86c558`; these remain hosted evidence, not dedicated-UID isolation or approval of a later release SHA. |
-| Public plugin catalog | **Listed for Linux at `0.8.0`** ([official entry](https://github.com/NousResearch/hermes-agent/blob/main/plugin-catalog/antigravity-acp-provider.yaml), [admission PR](https://github.com/NousResearch/hermes-agent/pull/153182)). The catalog installs the provider only; install the matching official server separately. Publishing a repository release does not change the catalog pin. |
-| Official server binary | The current standalone release (`0.9.3`) pins ACP server `1.5.2`; the current catalog provider `0.8.0` pairs with server `1.5.2` from its pinned checkout. Both are fetched **only during an explicit install command** over HTTPS from `dl.google.com`; the publisher-pinned SHA-256 digest is verified **before** the archive is opened, extracted, or installed. No self-update; no redistribution. |
-| Authentication & first model call | Credential-free CI does not validate authentication or real inference. A supervised one-prompt canary produced a real response on an earlier client version; there is no published end-to-end authentication or inference result for this candidate. This observation does not establish terms compliance for other uses. |
-| Usage and quota | Both engines always return `completion.usage=None` (since v0.9.2); prompt-result usage is discarded to protect Hermes Core's context-occupancy anchor. `usage_update` observations are retained separately as non-billing, unverified telemetry. Core records no per-model usage rows for ACP turns; zero totals do not mean zero consumption. `/quota` is unsupported. See [usage telemetry](docs/acp-usage-telemetry.md). |
-
-## Delegated children: ACP affinity fix (v0.7.9)
-
-Issue [#2](https://github.com/rhgo1749/hermes-antigravity-acp/issues/2) is
-**closed** by the fix merged in PR #7 (released in v0.7.9). Previously,
-`delegate_task` children
-inherited the parent Hermes route key (by core design: it is the
-async-completion routing address) and the plugin keyed ACP continuation
-affinity with it, so a parent and all of its children fought over one native
-ACP continuation and overwrote each other's frontier state. Affinity now keys
-a delegated child with the child's own durable session id; a child without one
-runs stateless (empty affinity, fresh native session, resume nothing) — never
-the parent's key. Unit tests cover parent/child/sibling keying and the
-fail-closed delegation-context gate; a real-core-context E2E (fake ACP server)
-covers concurrent same-prompt siblings and runs in both the current-core and
-the v0.21.6-floor CI lanes. Real-server concurrent-resume behavior
-across sibling children is tracked as post-merge validation in
-issue [#10](https://github.com/rhgo1749/hermes-antigravity-acp/issues/10) and
-has not yet been executed-verified.
-
-## Native permissions fail-closed (v0.7.10)
-
-The Hermes catalog review (PR
-[#153182](https://github.com/NousResearch/hermes-agent/pull/153182),
-CHANGES_REQUESTED) blocked listing while the provider auto-approved native
-shell and file-mutation permission frames. v0.7.10 removes that mechanism
-entirely: native `run_command` is disabled at session launch
-(`agy.disabledTools`), every native mutation/command permission frame is
-answered with the server's own reject option (never `allow_always`), and the
-prompt preamble again instructs the model to use Hermes' approval-gated
-terminal tool through the `<tool_call>` bridge. The former
-`HERMES_ANTIGRAVITY_ACP_EXECUTION_MODE` / `HERMES_ANTIGRAVITY_ACP_WORKSPACE`
-switches are inert and no configuration re-enables native auto-approval.
-Preserved unchanged: the read-only Hermes scratch permission route and the
-v0.7.9 session-ownership, delegated-child, and usage accounting contracts.
-ACP `fs/read_text_file` remains guarded by Hermes read policy and redaction.
-ACP `fs/write_text_file` is disabled: even ordinary workspace writes must use
-Hermes `write_file` or `patch` tools. The coding-loop evidence in
-`tests/test_native_permission_policy.py` is a **scripted fake-ACP loop**: it
-checks callback denials and emits Hermes tool calls; it does not prove that a
-real Google model autonomously changes tools after a refusal.
-Whether the real Google model autonomously chooses Hermes tools after its
-native requests are rejected is **NOT RUN** until a supervised live canary
-executes it. See `docs/data-and-permissions.md` §5 and
-`tests/test_native_permission_policy.py`.
+| Standalone | [v0.9.3](https://github.com/rhgo1749/hermes-antigravity-acp/releases/tag/v0.9.3), ACP server 1.5.2 |
+| Hermes | `>=0.21.6` CI-proven floor; stable baseline v0.23.4 |
+| OS evidence | Ubuntu 24.04 x86_64 dedicated-UID clean room; Linux aarch64, macOS arm64, Windows x64/arm64 native hosted-CI lifecycle evidence |
+| Catalog (checked 2026-11-27) | Listed for Linux at 0.8.0; see [official entry](https://github.com/NousResearch/hermes-agent/blob/main/plugin-catalog/antigravity-acp-provider.yaml) for the current pin |
+| Download | Explicit install only, HTTPS from `dl.google.com`, publisher SHA-256 verified before extraction. No self-update; no redistribution. |
+| Live validation | Credential-free CI does not validate authentication or real inference. An earlier supervised canary returned a response; no published end-to-end authentication or inference result for this release. |
+| Usage | Both engines always return `completion.usage=None`; `/quota` is unavailable. |
 
 ## 5-minute Quick Start (single account, credential-free)
 
-Supported topology: one Hermes user, one Hermes home, one official server
-target (one child per ACP session; healthy children are parked up to 120s
-idle for reuse by the next session of the same conversation). Requirements: Hermes
-`>=0.21.6`, `python3`, a checkout of this
-repository, and a system in one of the OS tiers above. No Docker, no sudo, no
-account mux, no Hermes Core patch is assumed or required.
+Requires Hermes `>=0.21.6`, Python 3, Git and a supported target.
+No Docker, sudo, account mux, or Hermes fork is needed.
+
+On Linux or macOS:
 
 ```bash
-python3 scripts/install_acp.py install   # pinned official server + provider projection
-python3 scripts/install_acp.py status    # read-only presence report
-python3 scripts/install_acp.py verify    # unauthenticated initialize probe (vendor-child boundary below)
+git clone --branch v0.9.3 https://github.com/rhgo1749/hermes-antigravity-acp.git
+cd hermes-antigravity-acp
+python3 scripts/install_acp.py install
+python3 scripts/install_acp.py status
+python3 scripts/install_acp.py verify
 ```
 
-Start (or reload) Hermes and select **Antigravity ACP** from
-Hermes' provider/model selector.
+On Windows, clone the same tag and run [install-windows.cmd](install-windows.cmd)
+from the checkout (double-click or run it in Command Prompt). It uses Hermes'
+Python when available, otherwise the Windows Python launcher.
 
-Optional official admission check with your installed Hermes CLI:
+Start or reload Hermes and select **Antigravity ACP** in its provider/model
+selector. Optional provider admission validation from the checkout:
 
 ```bash
 hermes plugins validate hermes-plugin/antigravity-acp --install-deps
 ```
 
-The required CI lanes run the same validation at the Hermes floor `v0.21.6`
-and stable baseline `v0.23.4`; upstream `main` is advisory. Catalog Rule 9
-warnings are documented in
-`docs/hermes-compatibility.md`.
+**What is verified:** the hosted clean-room runs the install and handshake
+route (see [historical evidence](docs/official-server-1.4.4-clean-room-e2e-2026-11-07.md)).
+There is no published end-to-end authentication or inference result for v0.9.3.
 
-**What the Quick Start proves — and what it does not.** This is exactly the
-route the hosted clean-room executes as a dedicated OS UID on
-GitHub-hosted `ubuntu-24.04`
-(`docs/official-server-1.4.4-clean-room-e2e-2026-11-07.md`). `install`
-downloads the pinned official server from `dl.google.com` (archive SHA-256
-verified against the publisher pin before extraction), installs the versioned
-server and launcher, and projects the provider into your Hermes home. The
-claim about `verify` is deliberately split in two. **Harness behavior
-(observable, ours):** `verify` requires no credentials, its own code reads no
-credential stores, and its probe sends exactly one ACP request — an
-unauthenticated `initialize` with no auth method, no prompt, and no
-credential material. **Vendor behavior (not observed, no claim):** `verify`
-starts Google's proprietary server as a child process with the caller's
-environment and no filesystem sandbox, so what that binary reads or writes
-under your user account (its own sign-in, config, or cache state included)
-while answering the handshake is not observable from this repository — it is
-neither claimed nor excluded here; see the vendor attribution in
-`docs/data-and-permissions.md`. None of these steps is evidence of **auth
-success**, **real-server model discovery**, or **real model inference**. An
-earlier supervised canary produced a model response. There is no published
-end-to-end authentication or inference result for this candidate
-(see [OS support and verification tiers](#os-support-and-verification-tiers)
-and `docs/clean-env-e2e-smoke.md`).
+**Harness behavior (observable, ours):** `verify` requires no credentials, its
+own code reads no credential stores, and the probe sends exactly one
+unauthenticated `initialize` with no auth method, no prompt, and no credential material.
+**Vendor behavior (not observed, no claim):** `verify` starts Google's
+proprietary server as a child process with the caller's environment and no filesystem
+sandbox, so what that binary reads or writes under your account is not observable
+from this repository — it is neither claimed nor excluded here; see the vendor
+attribution in `docs/data-and-permissions.md`.
 
-**Authentication and the first model call are deliberately outside this Quick
-Start.** Google's Antigravity Terms prohibit routing your individual
-Antigravity login/OAuth through third-party software. Use only
-an authentication route the terms that apply to you permit
-(Google's FAQ names Gemini Enterprise or Google AI Studio API keys for
-third-party coding agents), and complete sign-in only inside Google's official
-runtime. There is no inferred ToS blanket approval from the distribution of
-an official ACP binary. See [the terms section](#important-personal-antigravity-oauth-and-third-party-harnesses)
-and `docs/terms-and-licensing.md`. Automating account rotation or quota
-evasion is not a supported use. The optional MUX selects among configured
-accounts for new sessions and applies cooldowns; review the applicable terms
-before enabling it.
-
-Something failing? `docs/troubleshooting.md` covers auth failures, a missing
-binary or PATH launcher, pinned-version mismatch, interrupted/tampered
-downloads, profile conflicts, and non-interactive gateway failure modes.
-Full lifecycle (update/delete/reinstall, profiles, custom paths, server-only
-management): `docs/quick-start.md`.
-
-### Attended official-server login
-
-The provider plugin ships its own interactive login driver
-(`plugins/model-providers/antigravity-acp/login.py` inside your Hermes home).
-`hermes model` runs it inline automatically when the official server reports
-it is not signed in; you can also start it yourself from the source checkout
-or directly from the installed plugin file:
-
-```bash
-python3 scripts/acp_login.py --method oauth-personal
-```
-
-This is **not** evidence that a personal-subscription route is permitted for
-your account: Google's published Terms and FAQ contain broad third-party
-restrictions, while individual forum clarifications describe a narrow
-official-server interactive scenario. Review the current terms and obtain any
-necessary vendor/administrator confirmation before using it.
-
-Use the same OS user, `HOME`, `HERMES_HOME`, and `GEMINI_HOME` (if set) that
-will run the single-account Hermes provider. The command requires a terminal
-and explicit confirmation; it sends only ACP `initialize` and `authenticate`.
-The official server owns the browser flow and credentials. It may open the
-browser or display a Google sign-in URL; never share that URL. Terminal
-recording and browser history can retain it. No token is read or saved by this
-command, and no model prompt is sent. Custom launchers, `launch_config.json`,
-and `par.txt` are refused: do not use this route with mux or account rotation.
-
-Before spawning anything, the driver accepts the launcher only when its exact
-bytes are the installer-managed form pointing at a versioned server binary
-whose SHA-256 matches the publisher digest pinned in
-`antigravity_acp/registry.py`. A successful ACP `authenticate` response is
-not proof of model access or inference. Actual OAuth and live model-response
-validation remain separately gated.
-
-### Model listing is live-only
-
-The provider declares **no curated model list**: every model id offered by
-`hermes model` and `/model` comes from the signed-in account's live official
-server surfaces. Before login (or if a listing fails) the picker offers only
-the free-text model input — never a guessed or remembered id. Consequence:
-model availability follows the account and the server, and the official
-server's two model surfaces can legitimately differ; the plugin merges both,
-labels each row with its source surface, and routes every row through the
-method that surface owns — a `configOptions` model value through
-`session/set_config_option`, a legacy `models.availableModels` id through
-`session/set_model`. So a row the server authored is always selectable, and an
-id neither surface authored is never sent. A server that adds a model family —
-including one authored as a second `configOptions` group — widens the picker
-with no plugin change.
-
-## Antigravity ACP MUX (optional, preview)
-
-MUX mode runs one Hermes provider endpoint against an explicit,
-operator-owned account registry instead of a single default account. It is
-**not** installed, imported, or activated by anything on the default Single
-path: MUX is enabled only when a Hermes profile's provider command explicitly
-points at the mux launcher. The public default product remains
-one account/environment → official Google ACP server → Hermes provider.
-
-- Lifecycle: `scripts/install_mux.py` provides `install`/`status`/`uninstall`
-  for the reviewed mux bundle; see [mux packaging](docs/mux-packaging.md).
-- `python3 scripts/install_mux.py status` reports the effective launcher/PAR
-  resolution and registry path without printing registry contents.
-- Status: preview code, distributed as an optional component. Review Google
-  terms, authentication boundaries, and privacy before enabling it.
-- MUX selects among configured accounts for new sessions, maintains session
-  affinity, and applies cooldowns after failures. It is not enabled by default.
-  Account rotation may be restricted by the vendor's terms; do not use it to
-  evade quotas.
+Authentication and the first model call are outside this Quick Start.
+Read [the terms and authentication boundary](#important-personal-antigravity-oauth-and-third-party-harnesses)
+before signing in. See [full lifecycle and profile options](docs/quick-start.md).
 
 ## Installation paths: standalone or catalog
 
-The paths are separate and composable. The provider is plain Hermes plugin
-code; Google's official ACP server is an **external native binary dependency**
-that no path ever downloads or self-updates during `plugin.yaml` loading or
-plugin import — server installation is always an explicit command.
+**Standalone:** the combined installer manages both the server and provider.
+It targets the selected Hermes home by default; use `--all-profiles` or
+`--hermes-home` only when needed. Update and delete via the same installer.
+It refuses catalog-managed or provenance-unknown provider directories;
+a provider refusal does not roll back a completed server install.
 
-**Standalone combined installer — server and provider in one command.** From a
-checkout of this repository, `scripts/install_acp.py
-install|update|status|verify|delete` installs the pinned official server and
-projects the provider code into
-`$HERMES_HOME/plugins/model-providers/antigravity-acp/` (default
-`~/.hermes/plugins/model-providers/antigravity-acp/`). Every projected tree
-carries an `install-provenance.json` ownership marker; a directory that is
-catalog-managed, installed via `hermes plugins install`, or otherwise
-unverifiable is refused before any provider files are replaced (including a
-plain `cp -r` copy with no verifiable ownership). The combined installer
-installs the server before attempting the provider projection; a provider
-refusal does not undo a completed server install. Installs predating the marker are recognized through legacy
-`par.txt`/`launch_config.json` artifacts or a full canonical managed-file set
-byte-identical to a verified pre-marker release. `delete` removes only
-standalone-owned projections plus the pinned server; the empty-`HERMES_HOME`
-lifecycle `install → status → verify → delete → reinstall` is covered by
-regression tests. Installation targets only the selected Hermes home (the
-default profile) by default; pass `--all-profiles` to include named profiles
-under that home, and use `HERMES_HOME` or `--hermes-home /path/to/.hermes`
-for a non-default home (the explicit option wins). Upgrades retain legacy
-literal launch commands/arguments and an existing per-provider `par.txt` pin;
-changing launch settings requires an explicit migration, never an incidental
-generic update.
+**Catalog path (Linux) — provider and server are separate.**
 
-**Server-only manager — also available today.** `scripts/install_official.py`
-manages only the versioned server under
-`~/.local/opt/antigravity-acp/<version>/` and the managed launcher in
-`~/.local/bin/`; it never reads, rewrites, or implicitly upgrades
-catalog-pinned provider files, and archive SHA-256 verification still happens
-before extraction. `--status` is a read-only presence report; `--verify` sends
-only the unauthenticated `initialize` request, subject to the same
-vendor-child boundary as the Quick Start;
-`--uninstall` deletes only that versioned directory and the managed launcher
-and refuses untouched any unmanaged launcher file.
-
-**Catalog path (Linux) — install the provider and server separately.**
-
-1. Run `hermes plugins install antigravity-acp-provider`. Hermes installs the
-   complete provider from `hermes-plugin/antigravity-acp/` at the catalog's
-   reviewed SHA. This step installs no Google binary.
-2. Check the [official catalog entry](https://github.com/NousResearch/hermes-agent/blob/main/plugin-catalog/antigravity-acp-provider.yaml)
+1. Run `hermes plugins install antigravity-acp-provider`. This step installs no Google binary.
+2. Read the [official catalog entry](https://github.com/NousResearch/hermes-agent/blob/main/plugin-catalog/antigravity-acp-provider.yaml)
    and check out this repository at that entry's exact `sha` (not `main`).
-   From that checkout, run `python3 scripts/install_official.py` to install
-   the matching server and launcher. For example, the catalog's `0.8.0`
-   entry pins ACP server `1.5.2`; the standalone `0.9.3` release pins
-   `1.5.2`. Do not use `scripts/install_acp.py install` for this step: it
-   also attempts to manage provider files owned by the catalog.
+   Run `python3 scripts/install_official.py` from that checkout.
 
-Both steps are needed on a fresh system. Hermes owns the catalog-installed
-provider files (`plugins/.install-metadata.json` plus the
-`.hermes-catalog.json` sidecar); use `hermes plugins update` and
-`hermes plugins remove` to manage them. A catalog pin update requires a
-separately reviewed upstream PR. `tests/test_clean_env_e2e_smoke.py` covers
-composition without credentials.
+Do not use `scripts/install_acp.py install` for this step: the combined installer
+would attempt to manage catalog-owned provider files. Use Hermes plugin
+update/remove for those files. The catalog 0.8.0 and standalone 0.9.3 pins
+both use ACP server 1.5.2; always follow the catalog SHA rather than guessing.
 
-**Publisher digest pinning.** Every downloaded server archive is verified
-against a publisher-pinned SHA-256 digest **before it is opened, extracted, or
-installed**, and before any existing installation or launcher can be replaced.
-The digests pinned in `antigravity_acp/registry.py` are the values published
-by Google's own first-party Antigravity ACP update feed
-(`https://dl.google.com/agy-extensions/releases/acp/feed/...`); Google
-publishes no detached checksum file for the archive URLs themselves, so the
-pinned server version is raised only to versions for which Google's feed
-provides verifiable first-party digests. Tampered, truncated, interrupted, or
-unpinnable downloads fail closed and leave an existing installation and
-launcher untouched. The proprietary official binary is downloaded at install
-time exclusively over HTTPS from `dl.google.com`, is never bundled in this
-repository or the plugin package, and its provenance is that publisher path
-plus the pinned digests. Rotation policy (bump `VERSION` and every digest
-together in one reviewed change, sourced from the feed) is recorded in
-`antigravity_acp/registry.py`.
-
-Default locations: launcher under `~/.local/bin/antigravity-acp-official`,
-versioned server under `~/.local/opt/antigravity-acp/<version>/`, provider
-under the selected Hermes home. For a custom launcher directory, ensure it is
-on Hermes' `PATH` or set `HERMES_ANTIGRAVITY_ACP_COMMAND` in the Hermes
-process environment; the provider resolves the standard user-scoped launcher
-dynamically and keeps any explicit command override. Install/update is
-idempotent; replaced provider code is backed up outside plugin discovery
-under `~/.hermes/plugin-backups/`. These commands do not modify Hermes user
-config, authentication, account registries, conversations, or session state.
+The server-only installer supports `--status`, `--verify`, and `--uninstall`.
+It leaves provider files untouched. All downloads verify Google's publisher
+SHA-256 before opening or extracting the archive. See the
+[ACP Registry entry](https://github.com/agentclientprotocol/registry/tree/main/antigravity-acp)
+and [installer lifecycle](docs/quick-start.md).
 
 ## Important: personal Antigravity OAuth and third-party harnesses
 
-Google's current Antigravity Terms state that using third-party software,
-tools, or services to access the Service — their example is OpenClaw with
-Antigravity OAuth — **breaches the Agreement** and may lead to suspension or
-termination of the Antigravity and/or Gemini CLI accounts (page accessed
-2026-11-08). The Antigravity FAQ answers "Why can't I use third-party
-software (such as Claude Code, OpenClaw, or OpenCode) with my Antigravity
-login?" the same way and adds: *"To use a third-party coding agent with
-Gemini, we recommend using a Gemini Enterprise or Google AI Studio API key."*
+Google's [Antigravity Terms](https://antigravity.google/terms) restrict
+third-party use of personal Antigravity OAuth and describe account suspension
+or termination for breaches. The [FAQ](https://www.antigravity.google/docs/faq/)
+recommends Gemini Enterprise or Google AI Studio API keys for third-party
+coding agents. Organizational access requires the applicable administrator grant.
 
-The boundary this project holds: the fact that Google publishes the official
-standalone ACP server — which advertises authentication methods
-`oauth-personal`, `oauth-business`, `gemini-api-key`, and `agent-platform` —
-does **not** prove that personal subscription OAuth is permitted through an
-external harness. Advertising a method is Google's server behavior;
-permission to use a method is a terms question for your account and client.
-Accordingly this project does **not** present personal Google AI /
-Antigravity subscription quota as a third-party API substitute and does not
-automate personal OAuth. All sign-in happens inside Google's official runtime
-— this repository holds and requests no credentials (`requires_env: []`).
+The official ACP server advertising an auth method does **not** prove that
+the method is permitted in a third-party client. Do not treat a personal
+subscription as a third-party API substitute or use account rotation to evade
+quotas. This project does not automate personal OAuth or hold Google credentials.
 
-For third-party clients, use an authentication route permitted by the terms
-that apply to you. Google's FAQ explicitly names **Gemini Enterprise or
-Google AI Studio API keys** for third-party coding agents; organizational
-(Gemini Enterprise / workspace) routes require your administrator's access
-grant. Google's FAQ states that wrapping `agy` inside
-third-party applications "or automating account rotation, is not supported
-under consumer plans." The optional MUX selects from configured accounts and
-uses cooldowns for future sessions after failures; this is separate from the
-single-account default. Do not use it to evade quota or assume it is permitted
-under your plan. Full licensing, attribution, and terms analysis:
-`docs/terms-and-licensing.md`.
+### Attended official-server login
 
-Official references (re-checked 2026-11-08):
-
-- Google Antigravity Terms: https://antigravity.google/terms
-- Google Antigravity FAQ: https://www.antigravity.google/docs/faq/
-- ACP Registry entry: https://github.com/agentclientprotocol/registry/tree/main/antigravity-acp
-
-## Data, permissions, and processes (summary)
-
-The full, truthful disclosure lives in `docs/data-and-permissions.md`.
-In brief:
-
-- **Runtime data to Google flows through the official server.** Hermes
-  prompts, tool-call payloads, session references, and media you attach reach
-  the `agy_acp_server` child over stdio; every model/protocol request that
-  this runtime sends onward to Google originates from that
-  Google-distributed binary. The plugin does not connect directly to Google's
-  model service or handle Google credentials. Parked-MCP opens a per-session
-  authenticated loopback HTTP endpoint on `127.0.0.1` for Hermes tool calls.
-  Distinct from that runtime traffic: the standalone installer fetches the pinned server archive over HTTPS from
-  `dl.google.com` during an explicit install command — installer asset
-  retrieval, not model/protocol traffic. This repository neither observes
-  nor bounds any other networking inside the proprietary binary.
-- **File and environment scope.** The plugin reads and writes only its own
-  state files under the selected Hermes home; the ACP child receives a
-  minimum-enumerated environment allowlist carrying no ambient provider API
-  keys, gateway tokens, or session identity variables, plus a deliberately
-  synthesized bounded set of `ACP_MUX_*` routing/session metadata (opaque
-  continuation and affinity values — never Google credentials); Hermes-side
-  file access stays behind Hermes' path-safety, redaction, and write-denial
-  policy.
-- **Persisted state.** Replay session-continuation checkpoints (including
-  the native ACP session ID needed for resume) and learned-limit state live
-  under the selected Hermes home's `cache/` (0600, bounded, expiring; see the
-  detailed data disclosure). Telemetry uses hashes rather than raw native
-  session IDs. Installer state lives under `~/.local/opt`, `~/.local/bin`,
-  and the plugin tree. Google
-  sign-in state is managed by Google's runtime in your user environment.
-- **Telemetry.** This plugin sends no telemetry of its own; usage reporting is
-  separate from billing: both engines always return `completion.usage=None`;
-  prompt-result usage is discarded and `usage_update` observations are kept
-  separately as unverified, non-billing telemetry. Any independent
-  network or background behavior inside the proprietary vendor binary is
-  attributed to Google's runtime and is neither observed nor speculated about
-  in this repository.
-- **Shell/tool boundary.** Hermes tool calls use Hermes policy. Native
-  `run_command` is disabled at session launch and every native file-mutation or
-  command permission frame is answered with the server's own reject option —
-  the plugin never auto-approves native execution, in any mode. Shell and file
-  work runs through Hermes' own approval-gated terminal and file tools.
-  Native Telegram video remains opt-in.
-- **Child processes.** The default topology launches one official server
-  child per ACP session or attempt — concurrent sessions
-  and retries can therefore yield more than one child over a Hermes process
-  lifetime. A healthy child is parked after its session ends and reused by
-  the next session with the same command, arguments, working directory,
-  conversation affinity and publisher pin (idle TTL 120s, cap 4 per
-  identity); a failed or
-  timed-out child is terminated immediately, active children are closed
-  with the client, and parked children are terminated at process exit or
-  TTL expiry. Not daemonized services: no daemons, no
-  self-updaters, no background services, no sudo.
-
-## Use with an ACP client
-
-The important contract is simply a child process whose stdin/stdout carry ACP
-v1 JSON-RPC. A generic client configuration is:
-
-```json
-{
-  "command": "antigravity-acp-official",
-  "args": []
-}
-```
-
-Clients differ in where they store that configuration. Zed and JetBrains can
-consume external ACP agents directly. OpenCode and Pi can themselves be
-exposed *as* ACP agents; using Antigravity *inside* those harnesses requires a
-client-side ACP integration/plugin in that harness rather than merely enabling
-`opencode acp` or `pi-acp`. For a custom installation, use the full launcher
-path in the client config unless its process `PATH` includes the selected bin
-directory. To probe the handshake without authenticating:
-
-```bash
-python3 scripts/acp_probe.py -- "$HOME/.local/bin/antigravity-acp-official"
-```
-
-On Linux the launcher automatically supplies Google's Registry argument
-`--uid=`. A successful probe prints the negotiated protocol version, agent
-name/version, and advertised auth methods. The probe itself sends only the
-`initialize` request — no login, no prompt; like `verify`, it starts the
-server child with your environment and no filesystem sandbox, so the vendor
-binary's own file behavior is unobserved (Quick Start boundary).
-
-## OS support and verification tiers
-
-`antigravity_acp/registry.py` pins Google's official ACP server (currently
-`1.5.2`) with first-party publisher SHA-256 digests for five platform
-targets. A pinned digest is a provenance guarantee, not an execution
-guarantee, so this repository labels every platform with an explicit
-verification tier:
-
-- **Executed clean-room tier (dedicated OS UID, GitHub-hosted CI) — Linux
-  x86_64.** The credential-free `acp-clean-room` job on a GitHub-hosted
-  `ubuntu-24.04` runner creates a dedicated OS UID (`useradd`) and performs the
-  real-binary lifecycle
-  `download/pin → official server install → status → verify →
-  unauthenticated ACP initialize → uninstall → reinstall → verify` against
-  the pinned, official Google-distributed binary with `env -i` and an empty
-  disposable `HOME`/`HERMES_HOME`, alongside an official unmodified Hermes
-  checkout installed with `uv sync --frozen`; the archive digest is
-  verified against the first-party feed pin before extraction. Hermes
-  provider selection and the model-discovery entry execute there too;
-  real-server model listing remains gated behind the server's own
-  authentication boundary, and real model inference remains NOT EXECUTED.
-  The earlier 2026-11-07 private-container lifecycle (scrubbed process
-  environment, empty `HOME` and `HERMES_HOME`) is retained only as a
-  historical observation log: it ran as a shared OS user and remains **NOT
-  EXECUTED** as clean-room acceptance evidence — an env-only scrub does not
-  establish a separate OS UID or credential-state isolation, and prior
-  attempts are never retro-promoted. The exact
-  executed/not-executed boundary, per-platform matrix, hosted Actions run
-  citation, and sanitized fingerprints are in
-  `docs/official-server-1.4.4-clean-room-e2e-2026-11-07.md` for the
-  historical `1.4.4` run. The `1.5.2` clean-room lifecycle also passed in
-  [run 44912004325](https://github.com/rhgo1749/hermes-antigravity-acp/actions/runs/44912004325)
-  at `93b75fc329099945e7b7fc1b606d09d66dfdaea4`, with all five native
-  platform jobs green. Those results apply only to that tested SHA.
-  CI checks the `1.5.2` pins against the publisher digests recorded in
-  `tests/test_registry.py` and exercises installation mechanics with a
-  fake server: that credential-free `fake-acp` registry/regression job
-  performs no live feed fetch, no authentication, and no real-binary
-  execution. Real-binary execution in CI belongs to the dedicated-UID
-  `acp-clean-room` job described above and to the platform install lanes
-  (the Windows jobs and the macOS arm64 / Linux aarch64 lifecycle lanes) —
-  each fetches the official pinned binary under the reviewed publisher pin
-  and runs only credential-free unauthenticated `initialize` probes, never
-  an authentication frame or a model prompt. An earlier initialize-only
-  operational observation is not a substitute for dedicated-UID CI evidence.
-- **Real-binary hosted-CI executed tier (not dedicated-UID clean-room) —
-  Windows x64, Windows arm64.** The Windows install jobs run the actual
-  Windows installer on `windows-2022` (x64) and `windows-11-arm` (arm64)
-  hosted runners against the real Google-distributed official server binary,
-  then verify native architecture, provider registration/enabled state, and
-  an unauthenticated ACP `initialize` (`install_acp.py verify`). This is
-  executed evidence one tier below the dedicated-UID clean-room class: no
-  dedicated OS UID isolation, and no authentication frame or model prompt is
-  ever sent. The x64 lane runs on manual full-matrix dispatch and
-  install-surface PR/main changes; the arm64 lane is an extended-ARM
-  lane (dispatch and packaging/unknown PR/main changes) —
-  its executed status for a given change is whatever the latest cited
-  green run on the relevant scope shows, never an assumption.
-- **Native-lifecycle and provider hosted-CI executed tier (not dedicated-UID
-  clean-room) — macOS arm64, Linux aarch64.**
-  These targets are registry-pinned with publisher digests, and their
-  real Google binary lifecycle has been executed on native hosted
-  runners (`macos-15` and `ubuntu-24.04-arm:`): native-architecture
-  assert → publisher-pinned download with SHA-256 verification → install
-  → status → integrity verify → unauthenticated ACP `initialize` →
-  uninstall → confirmed absence. Cited green evidence: Actions run
-  [43198795406](https://github.com/rhgo1749/hermes-antigravity-acp/actions/runs/43198795406)
-  at commit `8c054be1eaa4230a87b4e5f9f23a56e3fe74ae09` (jobs
-  `macOS arm64 install and unauthenticated ACP` and `Linux aarch64
-  install and unauthenticated ACP`, both `success`, `CI gate` green;
-  first green native executions of these lanes occurred at run
-  43184922860, `e9eb1c4`). Phase B additionally executes the shared real-Core
-  provider registration, selection and client-factory probe on both native
-  ARM runners: [run 43321929587](https://github.com/rhgo1749/hermes-antigravity-acp/actions/runs/43321929587)
-  at `93db79996c56f6c1455b25ec29fea54bbc86c558`. This resolves the previous
-  provider-registration gap, not authentication success, real model inference
-  or dedicated-UID clean-room isolation. These historical runs do not approve
-  another candidate SHA; the dispatch-only Release gate requires fresh evidence.
-- **Registry-pinned but NOT RUN tier — currently empty.** macOS arm64
-  and Linux aarch64 were promoted out of this tier only by the cited
-  green native runs above; promotion is per-platform, executed, and
-  never retroactive. Any registry-pinned target without a cited green
-  native lifecycle run belongs here, and its support claims must be
-  treated as spec-pinned, not executed.
-
-### CI tier structure (issue #9)
-
-`.github/workflows/ci.yml` is risk-tiered; the always-running **`CI gate`**
-job is the single required verdict:
-
-- **Fast PR (every event):** `fake-acp` (auto-discovered credential-free
-  regressions, Ruff, repository hygiene), `upstream-hermes-compat`
-  (official Hermes `main`), `catalog-floor-gate` (minimum supported Hermes
-  `v0.21.6`).
-- **Release / full OS:** `acp-clean-room` (Ubuntu x86_64 dedicated-UID),
-  `windows-x64`, `macos-arm64` — every manual `workflow_dispatch`
-  (full matrix, tested SHA recorded) and install-surface PR/main changes.
-- **Extended ARM:** `windows-arm64`, `linux-aarch64` — every dispatch and
-  packaging/architecture/unknown PR/main changes, not every routine push.
-- **Change detection is widen-only:** `scripts/ci_change_scope.py`
-  classifies paths; unknown paths, empty diffs, or detection failures
-  fall back to the strongest scope. `scripts/ci_gate_check.py` fails the
-  gate when any lane the scope required failed, was skipped, or never
-  reported — a skipped or missing check is never a pass. Branch
-  protection should require `CI gate`, never a conditional lane name.
-
-Phase A of [issue #28](https://github.com/rhgo1749/hermes-antigravity-acp/issues/28)
-adds an exact, reviewed platform-neutral test classification, not a pytest
-selection list. Ordinary plugin changes still require the three OS lanes;
-unreviewed tests remain full-matrix. The separate main-push follow-up reuses
-this conservative policy only for trusted fast-forward before/after ranges.
-See [the historical Phase A baseline](docs/ci-cost-phase-a.md).
-
-Phase B of the same issue adds the **release-candidate verification gate**,
-using the existing `workflow_dispatch` with `candidate_sha` (see the
-[runnable dispatch example and contract](docs/release-verification-matrix.md)).
-Every checkout, Actions execution SHA and candidate SHA must agree; each lane
-attests its executed stages and the gate rechecks the selected remote branch
-HEAD after all required jobs and `CI gate` succeed. Wrong/stale SHA, branch
-movement, skipped/cancelled/missing/failed lanes and optional substitution
-fail closed. A PASS preserves a run/attempt-bound JSON evidence artifact.
-Phase B itself did not reduce main-CI cost; see its
-[historical measurements](docs/ci-cost-phase-b.md). The separate
-[main-push scope policy](docs/ci-main-push-scope.md) classifies trusted push
-`before`/`after` ranges and runs full coverage on uncertainty. Release dispatch
-remains all-five and exact-SHA bound. Optimized-scope Hosted savings are
-**NOT VERIFIED** until a real optimized run executes; a full-matrix PR is not
-speedup evidence.
-
-### Four distinct evidence classes (never conflated)
-
-Verification reporting in this repository separates four evidence classes
-and never presents a weaker class as proof of a stronger one:
-
-1. **auth success** — a permitted authentication completed against the
-   official server.
-2. **ACP `initialize` handshake** — the unauthenticated ACP v1 handshake
-   completed; this is what `scripts/acp_probe.py` and `verify` observe.
-   A successful handshake demonstrates protocol syntax only and does not
-   infer or constitute vendor ToS blanket approval.
-3. **model list discovery** — the server advertised its model list through
-   a session; this is credential-free and does not imply auth success.
-4. **real model inference canary** — an actual model answered a prompt.
-   This may only be exercised via a user-approved, ToS-compliant auth path
-   (there is no inferred ToS blanket approval for third-party harnesses).
-
-Every credential-free test and CI run records classes 1 and 4 explicitly as
-**NOT VALIDATED / NO-GO**; a passing fake-ACP suite is class-2/3 evidence
-about protocol mechanics only. The hosted dedicated-UID `acp-clean-room` CI
-job adds real-binary class-2 (initialize) evidence on Linux x86_64 only
-(`docs/official-server-1.4.4-clean-room-e2e-2026-11-07.md`); the earlier
-2026-11-07 private-container attempt is a historical observation that
-remains NOT EXECUTED as clean-room acceptance evidence. CI itself does not
-validate authentication or inference; the earlier supervised canary used an
-older client and is not a published end-to-end result for this candidate. See
-`docs/clean-env-e2e-smoke.md` for the machine-readable evidence record and
-the standing NO-GO boundary.
-
-`scripts/acp_live_canary.py --engine parked` (issue #93) drives the deployed
-Parked-MCP provider/client end-to-end outside the gateway: credential-free
-fake-ACP verification in CI, and a class-4 live lane only under an
-operator-supervised, separately-approved run
-(`docs/live-canary.md`).
+Sign in only through Google's official runtime using a route permitted by
+your account's terms. The included attended login driver sends ACP
+`initialize` and `authenticate` only, requires confirmation and validates
+the installer-managed binary. A successful authenticate response is not proof
+of model access. See [terms and licensing](docs/terms-and-licensing.md) and
+[authentication troubleshooting](docs/troubleshooting.md).
 
 ## Hermes provider plugin
 
-`hermes-plugin/antigravity-acp/` is a standalone Hermes model-provider plugin.
-A default install registers one model-provider profile (`antigravity-acp`) —
-no tools, hooks, middleware, or commands — with optional explicit opt-in for
-the `antigravity-acp-replay` profile via `launch_config.json` (see
-"Engines" below), and replaces the old local `agy stream-json` transport with the
-official ACP wire while preserving Hermes as the owner of its own tool loop.
-The plugin supplies its own clients through Hermes' public
-`ProviderProfile.create_client()` seam; it does **not** subclass
-`agent.copilot_acp_client.CopilotACPClient` and does not require a private
-Hermes fork or ACP-specific core patches.
-
 ### Engines: Parked-MCP (default) and Replay (selectable)
 
-Since plugin 0.9.0 one plugin package carries both engines:
+| Provider ID | Engine | Registration |
+|---|---|---|
+| `antigravity-acp` | Parked-MCP | Default since 0.9.0 |
+| `antigravity-acp-replay` | Replay | Explicit opt-in |
 
-| Provider id | Engine | Source | Notes |
-|---|---|---|---|
-| `antigravity-acp` | Parked-MCP (default) | `hermes-plugin/antigravity-acp/parked/` | Public identity and the only profile a default install creates; aliases `antigravity-cli`, `agy`, `antigravity`, `agy-acp`, `antigravity-official-acp`, plus compatibility aliases `antigravity-acp-mcp`, `agy-mcp` so pre-0.9.0 `model.provider: antigravity-acp-mcp` settings keep resolving without a separately-created provider; marker `base_url` `acp://antigravity` |
-| `antigravity-acp-replay` | Replay | parent package flat modules (`client.py` et al.) | The pre-0.9.0 default engine; registers only when the installer-written `launch_config.json` declares `extra_providers: ["antigravity-acp-replay"]` (explicit install-time creation); not deprecated and not removed |
+The Parked-MCP engine was authored by [Nanako0129](https://github.com/Nanako0129)
+(MIT licensed) and integrated as the default in v0.9.0. It exposes a per-session
+loopback Streamable-HTTP MCP endpoint that parks requests for Hermes to execute.
+The Replay engine is not deprecated. Existing `antigravity-acp-mcp` and
+`agy-mcp` IDs resolve as aliases of the default provider.
 
-**Upgrade note (breaking, intentional):** a default install now creates only
-`antigravity-acp`. Existing configs that select `antigravity-acp-mcp` or
-`agy-mcp` keep resolving unchanged (they are aliases on the default profile).
-Existing configs that select `antigravity-acp-replay` stop resolving after an
-upgrade unless the installed plugin tree gains the explicit declaration:
+To enable Replay, set the following in the installed provider's
+`launch_config.json` under the selected Hermes home's
+`plugins/model-providers/antigravity-acp/`, retaining existing settings:
 
 ```json
 {"extra_providers": ["antigravity-acp-replay"]}
 ```
 
-written to `<hermes-home>/plugins/model-providers/antigravity-acp/launch_config.json`
-(then restart the Hermes process so the provider layer re-imports). Provider
-creation is explicit-declaration-only by design; there is no automatic
-migration scan.
+Restart Hermes, then select the Replay provider. Engine choice is explicit;
+there is no automatic fallback or cross-engine retry of side-effecting tools.
+The default connection resolves the official launcher and launches an official
+server child from it for each ACP session or attempt.
 
-The Parked-MCP engine parks Hermes tool calls behind a per-session loopback
-Streamable-HTTP MCP endpoint instead of letting the ACP server run native
-tools; it was authored by Nanako0129 (MIT-licensed) as the opt-in sibling
-plugin `hermes-plugin/antigravity-acp-mcp` (issues #81/#82/#83) and moved
-into `parked/` when it became the default. Its security boundaries and the
-M3 lost-response correlation contract are specified in
-[`docs/design-c-opt-in.md`](docs/design-c-opt-in.md).
+### Model listing is live-only
 
-**Selection rule: the engine is chosen solely by the provider id in the
-profile config** (`model.provider`). There is no automatic engine fallback:
-neither engine ever retries a side-effecting tool execution on the other, in
-any failure mode (timeout, transport loss, child death). Switching engines is
-an explicit config change. Launcher resolution is shared and precedence-
-ordered: explicit `command=`, then `HERMES_ANTIGRAVITY_ACP_MCP_COMMAND`,
-then `HERMES_ANTIGRAVITY_ACP_COMMAND`, then the profile default launcher.
-Authentication, MUX packaging, and live model discovery behave identically
-for both ids; the Replay engine additionally keeps `login.py`/`setup_status`
-helpers. The default-switch ships in plugin v0.9.0.
+Model discovery uses server-advertised IDs; no guessed catalog is shipped.
+Availability depends on the account, engine, and server. See
+[provider runtime](docs/provider-runtime.md) and [Parked-MCP contracts](docs/design-c-opt-in.md).
 
-Runtime contracts live in [`docs/provider-runtime.md`](docs/provider-runtime.md):
-the ACP session flow, model-attribution fail-closed rules, durable ACP
-continuation, learned native trajectory limits, fabricated-artifact grounding
-check, replay structure, the opt-in native Telegram video feature (with its
-trust warning), and the provider-mode web research bridge
-([`docs/web-research-bridge.md`](docs/web-research-bridge.md)).
+## Data, permissions, and processes (summary)
 
-**Default connection topology: one auth environment, one official server.**
-The public provider resolves one official Antigravity ACP server target —
-the launcher installed by `scripts/install_official.py` (or an explicit
-`HERMES_ANTIGRAVITY_ACP_COMMAND` override) — under the single Hermes
-home/profile the user chose at install time, and launches an official
-server child from it for each ACP session or attempt (healthy children are
-parked briefly for reuse, see "Child processes" above). The plugin and default
-installer do not use an account registry or MUX routing. CI also tests the
-optional MUX separately with synthetic fixtures.
+- **Runtime data to Google flows through the official server.** Hermes prompts,
+  tool payloads, session references and attached media references reach the child
+  over stdio; every model/protocol request that this runtime sends onward to Google
+  originates from that Google-distributed binary. The plugin does not directly
+  connect to Google's model service. Parked-MCP binds an authenticated HTTP
+  endpoint to `127.0.0.1`. Distinctly, the standalone installer fetches the pinned
+  server archive over HTTPS from `dl.google.com` during an explicit install command.
+  Other networking inside the proprietary binary is not observed or bounded here.
+- **Environment:** the ACP child receives a minimum-enumerated environment
+  allowlist carrying no ambient provider API keys, gateway tokens, or session
+  identity variables, plus a deliberately synthesized bounded set of `ACP_MUX_*`
+  routing/session metadata (not Google credentials). The vendor child runs under
+  the invoking account with no filesystem sandbox.
+- **Tools:** native `run_command` is disabled at launch; native mutation/command
+  permission requests are rejected. Hermes tools follow Hermes policy and approvals.
+  Replay reads are policy-guarded; native writes are denied.
+- **State:** Replay checkpoints include native session IDs for resume; telemetry
+  uses hashes. See the data disclosure for permissions, TTLs and cache scope.
+- **Processes:** the default topology launches one official server child per ACP
+  session or attempt, so concurrency/retries can yield more than one child over a
+  Hermes process lifetime. A healthy child is parked after its session ends and
+  reused by the next session with matching affinity and launch identity (120s TTL).
+  Failed children are terminated; active and parked children have cleanup paths.
+  Not daemonized services.
+- **Usage:** since v0.9.2, both engines always return `completion.usage=None`.
+  Prompt-result consumption is discarded; `usage_update` observations never populate
+  request usage buckets. Replay exposes non-billing `context_occupancy` and
+  `turn_consumption` and persists frame sums; Parked-MCP exposes unverified
+  `antigravity_usage_observations` without persisting those observations.
+  Core records no per-model usage rows; zero totals are not zero consumption.
+  Existing contaminated occupancy anchors can survive gateway restarts.
+  Billed tokens, context occupancy and consumption differ; `/quota` is unavailable.
 
-**Optional and external routing.** The command override can point at a
-separately managed ACP endpoint. This repository also includes an opt-in MUX
-preview that selects configured accounts and maintains session affinity; it
-is not part of the default install. Review its terms and boundaries in
-[`docs/mux-packaging.md`](docs/mux-packaging.md) before enabling it.
+See [data and permissions](docs/data-and-permissions.md) and
+[usage telemetry](docs/acp-usage-telemetry.md) for exact contracts.
 
-The plugin keeps **Hermes tools in Hermes**. The official ACP child's native
-coding tools are not auto-approved: native `run_command` is disabled at session
-launch and native file-mutation permission frames are rejected, so the model
-performs shell and file work through Hermes' own approval-gated terminal and
-file tools. The harness `fs/read` callback enforces Hermes read policy and
-redaction; `fs/write` callbacks are denied. Review
-[`docs/data-and-permissions.md`](docs/data-and-permissions.md)
-before use.
+## OS support and verification tiers
 
-**Usage telemetry:** since v0.9.2, both engines always return
-`completion.usage=None`. The ACP prompt-result usage breakdown is discarded:
-per-turn consumption sums are not context-occupancy readings and must not
-seed Hermes Core's occupancy anchor. Existing contaminated anchors can
-survive gateway restarts. Core records no per-model usage rows for ACP turns;
-zero totals are not evidence of zero consumption.
+| Platform | Evidence |
+|---|---|
+| Linux x86_64 (Ubuntu 24.04) | Dedicated OS UID, real-binary clean-room lifecycle |
+| Linux aarch64 | Native hosted CI |
+| macOS arm64 | Native hosted CI |
+| Windows x64 / arm64 | Native hosted CI |
 
-Valid `usage_update` observations are retained separately as non-billing,
-unverified server telemetry. Replay exposes `antigravity_usage_telemetry`
-and persists per-session frame sums; Parked-MCP exposes
-`antigravity_usage_observations` without persisting those observations.
-See [usage telemetry](docs/acp-usage-telemetry.md) for the exact contract.
-Quota visibility (`/quota`) is unsupported; do not conflate observations,
-context occupancy, consumption, and billed tokens.
+The [v0.9.3 release gate](https://github.com/rhgo1749/hermes-antigravity-acp/actions/runs/45870027033)
+passed all five platforms on the exact release SHA. Hosted checks do not prove
+auth, live model discovery, real inference or support for other architectures.
+
+The registry pins are checked by tests; that credential-free `fake-acp`
+registry/regression job performs no live feed fetch, no authentication, and no
+real-binary execution. Real-binary execution in CI belongs to the dedicated-UID
+`acp-clean-room` job described above and to the platform install lanes.
+
+### CI tier structure (issue #9)
+
+`CI gate` is the required verdict; release dispatch additionally requires an
+exact-SHA Release gate. See [verification matrix](docs/release-verification-matrix.md),
+[CI scope policy](docs/ci-main-push-scope.md) and [evidence ledger](docs/clean-env-e2e-smoke.md).
+
+### Four distinct evidence classes (never conflated)
+
+Authentication, ACP initialize, model discovery and real model inference are
+separate evidence classes. A credential-free handshake proves neither auth
+nor inference. Live canaries require separate approval; see [live canary](docs/live-canary.md).
+
+## Antigravity ACP MUX (optional, preview)
+
+The optional MUX is excluded from the default install and routes configured
+accounts only when explicitly selected. Review applicable terms; it is not
+a quota-evasion mechanism. See [MUX packaging](docs/mux-packaging.md).
 
 ## Troubleshooting
 
-Run `python3 scripts/install_acp.py status` first; it reports presence without
-mutation. The full symptom-indexed guide is
-[`docs/troubleshooting.md`](docs/troubleshooting.md). Quick classes:
+Run `python3 scripts/install_acp.py status` first for standalone installs.
+See [troubleshooting](docs/troubleshooting.md) for missing launchers, auth,
+version mismatches, tampered downloads, profile conflicts and gateway failures.
 
-- **Missing server binary / non-executable PATH launcher** — distinct,
-  actionable diagnostics; re-run `install`, use the full launcher path, or set
-  `HERMES_ANTIGRAVITY_ACP_COMMAND`.
-- **Pinned-version mismatch / interrupted or tampered download** — fails
-  closed before extraction; an existing installation stays untouched; retry.
-- **`verify` timeout / server waiting for login** — expected at the
-  credential-free boundary: the real server refuses unauthenticated sessions;
-  the `verify` harness itself performs no login and sends no authentication
-  exchange, and diagnostics are fingerprint-only (raw server stderr is never
-  echoed).
-- **Real-server model list "Authentication required"** — the documented
-  authentication boundary; crossing it is a standing NO-GO today.
-- **Profile conflict / refused provider directory** — a catalog-managed or
-  provenance-unknown provider tree is refused before any write; the refusal
-  names what was refused and the owner-appropriate recovery path.
-- **Non-interactive gateway failures** — session/cron scope resolution and
-  file-safety policy failures are fail-closed `RuntimeError`s by design, never
-  silent cwd/session fallbacks.
-
-## Optional deployment extensions
-
-The generic installer is intentionally separate from optional host deployment
-adapters, external account routing, and custom security overlays.
-It does not invoke external components, install domain policy, or modify existing
-Hermes configuration or runtime state. Use an optional extension only after
-reviewing and configuring it for the target environment. Custom policy
-remains fail-closed when explicitly included by a configured external
-deployment; the vanilla provider does not apply it to unrelated profiles.
-
-Custom host deployment scripts and external overlay modules are external
-operational assets and are deliberately not part of this repository. The opt-in
-mux (see [`docs/mux-packaging.md`](docs/mux-packaging.md)) is the only
-multi-account component here, and it ships strictly opt-in: it is excluded
-from the default installers and from any rotation or quota-evasion claim.
-Provider-general public setup never depends on external deployments.
-
-## Protocol behavior notes (1.2.1)
-
-`docs/official-server-1.2.1-contract.md` records the version-scoped protocol
-contract: global MCP configuration can be merged by the server, the scope of
-`_meta.agy.disabledTools` is limited to server built-ins, quota/connection-loss
-conditions may be in-band, and the adapter preserves `usage=None` when the
-server provides no usage telemetry. The credential-free tests do not assert
-live authentication or account availability.
-
-For version-specific protocol notes, see `docs/official-server-1.3.0-delta.md`,
-`docs/official-server-1.4.0-delta.md`,
-`docs/official-server-1.4.4-model-surface.md` (the two model selection axes),
-and the generic recovery guidance in
-`docs/1.3.0-canary-runbook.md`. These public docs do not describe live host or
-account deployment state.
-
-## What this repository is not
-
-- Not an OAuth extractor.
-- Not a proxy that turns a consumer subscription into an OpenAI-compatible HTTP API.
-- Not a replacement implementation of Antigravity.
-- Not a redistribution of Google's proprietary ACP binary.
-- Not a claim that every authentication method advertised by the official binary is permitted in every third-party client.
-- Not a self-updating catalog plugin: the catalog owns the provider pin, and the Google server is always installed explicitly.
-
-## Optional repository exposure audit
-
-The credential-free `python3 scripts/audit_public_tree.py` check covers only
-the current worktree. For an explicitly invoked, read-only audit of reachable
-Git history and authorized GitHub discussion, Actions, and release assets, see
-[`docs/read-only-exposure-audit.md`](docs/read-only-exposure-audit.md). The
-deeper audit is not part of normal CI and reports inaccessible or retained
-content as `NOT_VERIFIED`, never as clean.
+- [Hermes compatibility](docs/hermes-compatibility.md) · [ACP path contract](docs/acp-path-contract.md)
+- [Server protocol notes](docs/official-server-1.2.1-contract.md) · [model surfaces](docs/official-server-1.4.4-model-surface.md)
+- [Web research bridge](docs/web-research-bridge.md) · [Exposure audit](docs/read-only-exposure-audit.md)
+- [Development retrospective](docs/development-retrospective.md)
 
 ## License
 
-Code in this repository is MIT licensed. Google's Antigravity binaries and
-services remain governed by Google's licenses and terms; see `NOTICE.md` for
-the Google non-affiliation statement, the original Hermes Agent (Nous
-Research) attribution, and the MIT text, and `docs/terms-and-licensing.md`
-for the third-party terms analysis.
+Project code is MIT licensed. Google's official binaries and services remain
+subject to Google's licenses and terms. See [LICENSE](LICENSE),
+[NOTICE.md](NOTICE.md) and [terms and licensing](docs/terms-and-licensing.md)
+for non-affiliation and Hermes Agent (Nous Research) attribution.
