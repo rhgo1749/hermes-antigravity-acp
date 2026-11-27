@@ -1004,38 +1004,17 @@ def test_offline_install_flow_smoke_for_registry_pinned_unverified_platforms(
 
 
 def test_readme_declares_executed_and_not_run_os_tiers():
-    """The README tier demarcation is itself under test (docs = contract)."""
+    """Published platform tiers match the executed release evidence."""
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    heading = "## OS support and verification tiers"
-    assert heading in readme, "README must declare the verification-tier section"
-    section = readme.split(heading, 1)[1].split("\n## ", 1)[0]
-    # Tier 1: the hosted lifecycle and historical shared-UID observation
-    # must remain distinguishable, with their bounded evidence record.
-    assert "Linux x86_64" in section
-    assert "historical observation log" in section
-    assert "NOT EXECUTED" in section
-    assert "official-server-1.4.4-clean-room-e2e-2026-11-07.md" in section, (
-        "the Linux x86_64 tier must link the executed clean-room evidence record"
-    )
-    # Tier 2 (since the windows-install job runs the real binary on hosted
-    # Windows runners): Windows x64/arm64 must appear as real-binary
-    # hosted-CI executed, explicitly below the clean-room class.
-    assert "Real-binary hosted-CI executed tier" in section
-    for platform in ("Windows x64", "Windows arm64"):
-        assert platform in section
-    assert "one tier below the dedicated-UID clean-room class" in section, (
-        "the Windows tier must not be presented as clean-room-grade evidence"
-    )
-    # Tier 3: the remaining registry-pinned platforms must appear as NOT RUN.
-    assert "Registry-pinned but NOT RUN tier" in section
-    for platform in ("macOS arm64", "Linux aarch64"):
-        assert platform in section
-    # The four evidence classes and the sanctioned NO-GO must be stated.
-    for fragment in (
-        "auth success",
-        "ACP `initialize` handshake",
-        "model list discovery",
-        "real model inference",
-        "NO-GO",
-    ):
-        assert fragment in section
+    section = readme.split("## OS support and verification tiers", 1)[1].split("\n## ", 1)[0]
+    rows = [line for line in section.splitlines() if line.startswith("|")]
+    linux = next(row for row in rows if "Linux x86_64" in row)
+    assert "Dedicated OS UID" in linux and "clean-room" in linux
+    for platform in ("Linux aarch64", "macOS arm64", "Windows x64"):
+        row = next(row for row in rows if platform in row)
+        assert "Native hosted CI" in row
+        assert "clean-room" not in row
+    assert "arm64" in next(row for row in rows if "Windows x64" in row)
+    assert "release-verification-matrix.md" in section
+    for fragment in ("authentication", "initialize", "model discovery", "inference"):
+        assert fragment in section.lower()
