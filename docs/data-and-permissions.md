@@ -13,8 +13,10 @@ and marked as not observed here — never guessed.
   travels over **stdio JSON-RPC** from the Hermes process to the official
   `agy_acp_server` child process, and from there to Google's services.
 - **Runtime model/protocol traffic to Google originates from the
-  Google-distributed official binary.** The plugin itself opens no network
-  connections of its own and holds no credentials: the manifest declares
+  Google-distributed official binary.** The plugin does not connect directly
+  to Google's model service. Parked-MCP opens a per-session authenticated
+  HTTP endpoint bound to loopback (`127.0.0.1`) for Hermes tool calls.
+  The plugin holds no Google credentials: the manifest declares
   `requires_env: []` and the plugin never reads vendor token stores. On the
   download side there is one further repository-visible Google-bound fetch:
   the standalone installer (`scripts/install_official.py`) retrieves the
