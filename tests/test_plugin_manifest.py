@@ -194,14 +194,14 @@ PUBLIC_CORE_IMPORTS = frozenset({
     "agent.runtime_cwd.resolve_agent_cwd",         # per-symbol entry, all refs
     "agent.redact.redact_sensitive_text",          # catalog since v0.23.1 (upstream 79109635df)
     "agent.file_safety.get_read_block_error",      # catalog on main (upstream 9788899694)
-    "hermes_cli.plugin_session.in_delegated_child",  # catalog on main (upstream f261cd2d)
+    "hermes_cli.plugin_session.in_delegated_child",  # catalog since v0.23.5 (upstream f261cd2d)
 })
 
 # Deliberate private dependencies kept for their fail-closed security
 # contracts; see the register rows for the consequence when one is missing.
 PRIVATE_CORE_IMPORTS = frozenset({
     "tools.environments.local.hermes_subprocess_env",
-    # Floor fallback below upstream f261cd2d; the public route above is
+    # Fallback for cores below release v0.23.5; the public route above is
     # preferred whenever the core ships it.
     "agent.delegation_context.is_delegated_child_context",
     "tools.skill_provenance.get_current_write_origin",

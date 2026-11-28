@@ -444,6 +444,9 @@ def test_delegated_child_affinity_never_inherits_parent_session_key(monkeypatch)
     """Issue #2: delegate_task children inherit the parent's routing key by core
     design; affinity must key each child with its own session id instead."""
     _, _, client_module = _load(monkeypatch)
+    # Pin the public plugin_session route absent so the private delegation
+    # stub below is exercised deterministically on Hermes v0.23.5+ venvs too.
+    monkeypatch.setitem(sys.modules, "hermes_cli.plugin_session", None)
     gateway = types.ModuleType("gateway")
     gateway.__path__ = []
     session_context = types.ModuleType("gateway.session_context")
@@ -504,6 +507,9 @@ def test_delegated_child_affinity_ignores_foreign_process_env_ids(monkeypatch) -
     foreign process-env id must never leak into a child's affinity.
     """
     _, _, client_module = _load(monkeypatch)
+    # Pin the public plugin_session route absent so the private delegation
+    # stub below is exercised deterministically on Hermes v0.23.5+ venvs too.
+    monkeypatch.setitem(sys.modules, "hermes_cli.plugin_session", None)
     gateway = types.ModuleType("gateway")
     gateway.__path__ = []
     session_context = types.ModuleType("gateway.session_context")
@@ -547,6 +553,9 @@ def test_delegated_child_affinity_is_order_independent(monkeypatch) -> None:
     have been observed first, and observation order must not change any key.
     """
     _, _, client_module = _load(monkeypatch)
+    # Pin the public plugin_session route absent so the private delegation
+    # stub below is exercised deterministically on Hermes v0.23.5+ venvs too.
+    monkeypatch.setitem(sys.modules, "hermes_cli.plugin_session", None)
     gateway = types.ModuleType("gateway")
     gateway.__path__ = []
     session_context = types.ModuleType("gateway.session_context")

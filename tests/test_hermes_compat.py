@@ -119,6 +119,35 @@ def test_delegated_child_gate_public_api_raise_fails_closed_without_fallback(mon
         compat.is_delegated_child_context()
 
 
+def test_delegated_child_gate_public_module_import_failure_fails_closed_without_fallback(
+    monkeypatch, tmp_path
+):
+    """A hermes_cli.plugin_session that explodes during import must not fall through.
+
+    Only ImportError means "core below the accessor"; any other import failure
+    is a present-but-broken public route, so the gate refuses to guess and
+    never consults the private predicate.
+    """
+    _, compat = _compat(monkeypatch)
+    hermes_cli_package = types.ModuleType("hermes_cli")
+    hermes_cli_package.__path__ = [str(tmp_path)]
+    (tmp_path / "plugin_session.py").write_text(
+        "raise RuntimeError('public module body exploded')\n", encoding="utf-8"
+    )
+    monkeypatch.setitem(sys.modules, "hermes_cli", hermes_cli_package)
+    monkeypatch.delitem(sys.modules, "hermes_cli.plugin_session", raising=False)
+
+    def private_must_not_run():
+        raise AssertionError("private delegation route must not be consulted")
+
+    _fake_delegation_context(monkeypatch, private_must_not_run)
+
+    # The raw module-body failure propagates fail-closed; had the gate fallen
+    # back, the AssertionError above would surface instead.
+    with pytest.raises(RuntimeError, match="public module body exploded"):
+        compat.is_delegated_child_context()
+
+
 def test_delegated_child_gate_is_false_without_core_and_ignores_env_marker(monkeypatch):
     """Reviewer contract: the descendant env marker is NOT conversation ownership."""
     _, compat = _compat(monkeypatch)

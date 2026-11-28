@@ -168,10 +168,11 @@ def get_runtime_session_env() -> tuple[str, str]:
 
 
 # Hermes' in-process delegate_task marker is published plugin API since
-# upstream f261cd2d as ``hermes_cli.plugin_session.in_delegated_child``; the
-# private ``agent.delegation_context`` predicate stays as the guarded floor
-# fallback for cores below that commit (the declared ``>=0.21.6`` floor and
-# the stable v0.23.4 baseline both predate it).
+# upstream f261cd2d as ``hermes_cli.plugin_session.in_delegated_child``,
+# released in ``v0.23.5`` (the current mandatory stable baseline); the
+# private ``agent.delegation_context`` predicate stays as the guarded
+# fallback for cores below ``v0.23.5`` (the declared ``>=0.21.6`` floor
+# predates the accessor).
 # The core's env marker (HERMES_DELEGATED_CHILD_CONTEXT) marks DESCENDANT
 # processes of a child lineage; it does not imply ownership of the same ACP
 # conversation, so this gate deliberately never reads it — the public route
