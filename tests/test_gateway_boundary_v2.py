@@ -121,7 +121,7 @@ def test_both_outer_gates_reject_v2_contamination_and_residue():
     for lane in matrix.lanes:
         results[lane]["outputs"]["stages"] = ",".join(stage for (_, stage), owner in matrix.required_stage_lanes().items() if owner == lane)
     output = GatewayAttestationTests().outputs()
-    stable_core = "8fc0374447313e276f6b9a2764bfc750190c966a"
+    stable_core = attest.stable_baseline()["commit"]
     output["gateway_core"] = stable_core
     raw_record = output["gateway_record"]
     assert isinstance(raw_record, str)
