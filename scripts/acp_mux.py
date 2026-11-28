@@ -20,6 +20,11 @@ unexpected process failures receive separate cooldowns. If every account is
 cooling down, the account whose cooldown expires first is probed so the mux
 never turns a stale health record into a hard outage.
 
+The registry may declare a top-level ``strategy`` field: ``priority``
+(absent default; best-tier round-robin with affinity balancing) or ``lru``
+(new assignments and post-quarantine remaps rotate by least-recently-used
+selection, ranking a just-expired cooldown behind longer-idle lanes).
+
 Environment:
   ACP_MUX_HOME            shared mux control home; defaults to HERMES_REAL_HOME,
                           then HOME. Used only for default registry/state/log paths.
@@ -172,6 +177,9 @@ def _default_control_path(relative: str, env: dict[str, str] | None = None) -> s
 
 PATH_CONTRACT_VERSION = 1
 SUPPORTED_REGISTRY_SCHEMA_VERSIONS = frozenset({1})
+# Registry-level lane-selection strategies (issue #117).  An absent
+# ``strategy`` meta field means "priority" (the historical behavior).
+REGISTRY_STRATEGIES = frozenset({"priority", "lru"})
 
 # Ordered candidate environment names; the first non-empty value wins.  An
 # empty value means "unset" (a contract note operators can rely on; it used
@@ -514,6 +522,10 @@ def _load_registry_data(
     accounts = data.get("accounts")
     if not isinstance(accounts, list):
         return None, data, "missing-accounts"
+    if "strategy" in data:
+        strategy = data["strategy"]
+        if not isinstance(strategy, str) or strategy not in REGISTRY_STRATEGIES:
+            return None, data, "invalid-strategy"
     return [entry for entry in accounts if isinstance(entry, dict)], data, ""
 
 
@@ -2596,6 +2608,8 @@ def _pick_account(
 
     default_home, default_explicit = _effective_default_home(meta)
     versioned = isinstance(meta.get("schema_version"), int)
+    # Validated by _load_registry_data: absent means the historical default.
+    strategy = meta.get("strategy") or "priority"
 
     now = time.time() if now is None else now
     affinity_key = str(affinity or "").strip()
@@ -2675,6 +2689,77 @@ def _pick_account(
                 )
                 _save_state_unlocked(state)
                 return selected[2], selected[3], reason
+
+        if strategy == "lru":
+            # Issue #117: new assignments and remaps away from a quarantined
+            # lane rotate by local observation only.  A just-expired
+            # cooldown_until keeps ranking the lane behind longer-idle
+            # lanes until other lanes' last_selected values pass it, so
+            # rotation recovers with no reset logic.  Healthy affinity
+            # pins returned above; the all-cooling probe below is unchanged.
+            healthy = [row for row in rows if healthy_row(row[4]) is not None]
+            if healthy:
+                def lane_score(
+                    row: tuple[int, int, str, str, str],
+                ) -> tuple[float, int, int]:
+                    record = health.get(row[4])
+                    record = record if isinstance(record, dict) else {}
+
+                    def stamp(value: object) -> float:
+                        # A hand-edited or half-written record must never
+                        # poison the ordering (NaN keys are unordered).
+                        if (
+                            isinstance(value, (int, float))
+                            and not isinstance(value, bool)
+                            and math.isfinite(value)
+                        ):
+                            return float(value)
+                        return 0.0
+
+                    return (
+                        max(stamp(record.get("last_selected", 0)),
+                            stamp(record.get("cooldown_until", 0))),
+                        row[0],
+                        row[1],
+                    )
+
+                chosen = min(healthy, key=lane_score)
+                record = health.get(chosen[4])
+                record = record if isinstance(record, dict) else {}
+                record["last_selected"] = now
+                health[chosen[4]] = record
+                reason = "lru"
+                if affinity_key:
+                    assignment = affinities.get(affinity_digest)
+                    assignment = assignment if isinstance(assignment, dict) else {}
+                    preferred = next(
+                        (row for row in rows if row[4] == assignment.get("account_key")),
+                        None,
+                    )
+                    if pin_affinity:
+                        reason = "affinity-failover" if preferred is not None else "affinity"
+                        _store_affinity_assignment(
+                            affinities,
+                            affinity_digest,
+                            preferred[4] if preferred is not None else chosen[4],
+                            chosen[4],
+                            now,
+                        )
+                    else:
+                        _store_affinity_assignment(
+                            affinities,
+                            affinity_digest,
+                            chosen[4],
+                            chosen[4],
+                            now,
+                        )
+                saved = _save_state_unlocked(state)
+                if affinity_key and not saved:
+                    # Without a durable pin a resumed request could route
+                    # elsewhere; fall back to the stable rendezvous route.
+                    fallback = _affinity_pick(healthy, affinity_key)
+                    return fallback[2], fallback[3], "affinity-state-fallback"
+                return chosen[2], chosen[3], reason
 
         for priority in sorted({row[0] for row in rows}):
             pool = []
@@ -2909,9 +2994,9 @@ def _identity(path: str):
 
 _REGISTRY_INVALID_MESSAGE = (
     "antigravity-acp-mux: the account registry is present but unusable "
-    "(unreadable, malformed, unsupported schema_version, or no valid "
-    "accounts); refusing a silent fallback — run the mux `doctor` command "
-    "for the actionable report\n"
+    "(unreadable, malformed, unsupported schema_version, unsupported "
+    "strategy, or no valid accounts); refusing a silent fallback — run "
+    "the mux `doctor` command for the actionable report\n"
 )
 
 

@@ -8,6 +8,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import time
@@ -36,6 +37,12 @@ def env(tmp_path, monkeypatch):
 
 def _registry(env: Path, accounts: list[dict]) -> None:
     Path(acp_mux.REGISTRY_PATH).write_text(json.dumps({"accounts": accounts}))
+
+
+def _registry_strategy(env: Path, accounts: list[dict], strategy: str) -> None:
+    Path(acp_mux.REGISTRY_PATH).write_text(
+        json.dumps({"strategy": strategy, "accounts": accounts})
+    )
 
 
 def _health_key(label: str, home: str) -> str:
@@ -542,6 +549,205 @@ def test_all_quarantined_probes_earliest_recovery(env):
     assert (home, label, reason) == (b, "b", "cooldown-probe")
 
 
+def test_explicit_priority_strategy_keeps_round_robin(env):
+    a = str(env / "a")
+    b = str(env / "b")
+    _registry_strategy(env, [
+        {"home": a, "label": "a", "priority": 0},
+        {"home": b, "label": "b", "priority": 0},
+    ], "priority")
+
+    assert acp_mux._pick_account(now=100.0)[1:] == ("a", "round-robin")
+    assert acp_mux._pick_account(now=100.0)[1:] == ("b", "round-robin")
+    assert acp_mux._pick_account(now=100.0)[1:] == ("a", "round-robin")
+
+
+def test_lru_rotates_new_conversations_by_last_selected(env):
+    homes = [str(env / name) for name in ("a", "b", "c")]
+    _registry_strategy(env, [
+        {"home": home, "label": label, "priority": 0}
+        for home, label in zip(homes, ("a", "b", "c"), strict=True)
+    ], "lru")
+
+    picks = [
+        acp_mux._pick_account(now=100.0 + index)[1] for index in range(4)
+    ]
+    # Idle tie breaks by priority then registry order; afterwards the
+    # least-recently-selected lane wins.
+    assert picks == ["a", "b", "c", "a"]
+
+
+def test_lru_priority_breaks_idle_ties(env):
+    _registry_strategy(env, [
+        {"home": str(env / "slow"), "label": "slow", "priority": 5},
+        {"home": str(env / "fast"), "label": "fast", "priority": 0},
+    ], "lru")
+
+    assert acp_mux._pick_account(now=100.0)[1:] == ("fast", "lru")
+    assert acp_mux._pick_account(now=101.0)[1:] == ("slow", "lru")
+
+
+def test_lru_ranks_freshly_cooled_down_lane_behind_idle_lanes(env, monkeypatch):
+    homes = [str(env / name) for name in ("a", "b", "c")]
+    _registry_strategy(env, [
+        {"home": home, "label": label, "priority": 0}
+        for home, label in zip(homes, ("a", "b", "c"), strict=True)
+    ], "lru")
+    monkeypatch.setattr(acp_mux.time, "time", lambda: 100.0)
+    acp_mux._mark_failure(homes[0], "a", "quota", "429 quota exhausted")
+
+    # a's 900s cooldown expired at 1000; it must rank behind lanes that
+    # have been idle longer, then re-enter rotation once they advance.
+    picks = [
+        acp_mux._pick_account(now=now)[1] for now in (1001.0, 1002.0, 1003.0)
+    ]
+    assert picks == ["b", "c", "a"]
+
+
+def test_lru_preserves_healthy_affinity_pin(env):
+    homes = [str(env / name) for name in ("a", "b", "c")]
+    _registry_strategy(env, [
+        {"home": home, "label": label, "priority": 0}
+        for home, label in zip(homes, ("a", "b", "c"), strict=True)
+    ], "lru")
+
+    original = acp_mux._pick_account(now=100.0, affinity="conversation-1")
+    picks = [
+        acp_mux._pick_account(
+            now=101.0 + index,
+            affinity="conversation-1",
+            pin_affinity=True,
+        )
+        for index in range(5)
+    ]
+    assert all(pick[1] == original[1] for pick in picks)
+    assert all(pick[2] == "affinity" for pick in picks)
+
+
+def test_lru_fails_over_quarantined_pin_and_returns_to_preferred(env):
+    homes = [str(env / name) for name in ("a", "b", "c")]
+    _registry_strategy(env, [
+        {"home": home, "label": label, "priority": 0}
+        for home, label in zip(homes, ("a", "b", "c"), strict=True)
+    ], "lru")
+
+    original = acp_mux._pick_account(now=100.0, affinity="conversation-1")
+    assert original[1] == "a"
+
+    state = json.loads(Path(acp_mux.STATE_PATH).read_text(encoding="utf-8"))
+    state["accounts"][_health_key("a", homes[0])] = {"cooldown_until": 200.0}
+    Path(acp_mux.STATE_PATH).write_text(json.dumps(state))
+
+    failover = acp_mux._pick_account(
+        now=101.0, affinity="conversation-1", pin_affinity=True
+    )
+    assert failover[1] == "b"
+    assert failover[2] == "affinity-failover"
+
+    recovered = acp_mux._pick_account(
+        now=201.0, affinity="conversation-1", pin_affinity=True
+    )
+    assert recovered[1] == "a"
+    assert recovered[2] == "affinity"
+
+
+def test_lru_loads_legacy_state_without_last_selected(env):
+    homes = [str(env / name) for name in ("a", "b")]
+    _registry_strategy(env, [
+        {"home": homes[0], "label": "a", "priority": 0},
+        {"home": homes[1], "label": "b", "priority": 0},
+    ], "lru")
+    Path(acp_mux.STATE_PATH).write_text(json.dumps({
+        "version": 1,
+        "cursor": {"0": 1},
+        "accounts": {
+            _health_key("a", homes[0]): {
+                "reason": "quota",
+                "cooldown_until": 500.0,
+                "failures": 1,
+            },
+        },
+    }))
+
+    # a's expired cooldown anchors it behind never-selected b.
+    assert acp_mux._pick_account(now=600.0)[1:] == ("b", "lru")
+    assert acp_mux._pick_account(now=601.0)[1:] == ("a", "lru")
+
+    state = json.loads(Path(acp_mux.STATE_PATH).read_text(encoding="utf-8"))
+    assert state["accounts"][_health_key("a", homes[0])]["cooldown_until"] == 500.0
+    assert state["accounts"][_health_key("b", homes[1])]["last_selected"] == 600.0
+    assert state["accounts"][_health_key("a", homes[0])]["last_selected"] == 601.0
+
+
+def test_lru_affinity_save_failure_falls_back_to_rendezvous(env, monkeypatch):
+    homes = [str(env / name) for name in ("a", "b", "c")]
+    _registry_strategy(env, [
+        {"home": home, "label": label, "priority": 0}
+        for home, label in zip(homes, ("a", "b", "c"), strict=True)
+    ], "lru")
+    affinity = "persistence-failure"
+    rows = [
+        (0, index, home, label, f"{label}\t{home}")
+        for index, (home, label) in enumerate(zip(homes, ("a", "b", "c"), strict=True))
+    ]
+    expected = acp_mux._affinity_pick(rows, affinity)
+    monkeypatch.setattr(acp_mux, "_save_state_unlocked", lambda _state: False)
+
+    selected = acp_mux._pick_account(now=100.0, affinity=affinity)
+
+    assert selected[1] == expected[3]
+    assert selected[2] == "affinity-state-fallback"
+
+
+def test_lru_ignores_malformed_selection_timestamps(env):
+    homes = [str(env / name) for name in ("a", "b", "c", "d")]
+    _registry_strategy(env, [
+        {"home": home, "label": label, "priority": 0}
+        for home, label in zip(homes, ("a", "b", "c", "d"), strict=True)
+    ], "lru")
+    Path(acp_mux.STATE_PATH).write_text(json.dumps({
+        "version": 1,
+        "cursor": {},
+        "accounts": {
+            _health_key("a", homes[0]): {"last_selected": True},
+            _health_key("b", homes[1]): {"last_selected": float("nan")},
+            _health_key("c", homes[2]): {"last_selected": "yesterday"},
+            _health_key("d", homes[3]): {"cooldown_until": True},
+        },
+    }))
+
+    # Every malformed stamp reads as 0.0, so the rotation stays the
+    # deterministic priority/registry order instead of NaN poisoning.
+    picks = [
+        acp_mux._pick_account(now=100.0 + index)[1] for index in range(4)
+    ]
+    assert picks == ["a", "b", "c", "d"]
+
+
+@pytest.mark.parametrize("strategy", ["round-robin", 5, True, "", None])
+def test_invalid_registry_strategy_fails_closed(env, strategy):
+    _registry_strategy(env, [
+        {"home": str(env / "a"), "label": "a", "priority": 0},
+    ], strategy)
+
+    assert acp_mux._pick_account(now=100.0) == ("", "", "registry-invalid")
+
+
+def test_doctor_reports_invalid_registry_strategy(env, capsys):
+    _registry_strategy(env, [
+        {"home": str(env / "a"), "label": "a", "priority": 0},
+    ], "round-robin")
+
+    code = acp_mux.run_doctor(env={
+        "ACP_MUX_ACCOUNTS": str(acp_mux.REGISTRY_PATH),
+        "ACP_MUX_STATE": str(acp_mux.STATE_PATH),
+        "ACP_MUX_LOG": str(acp_mux.LOG_PATH),
+        "HOME": str(env),
+    })
+    assert code == 2
+    assert "registry-problem=invalid-strategy" in capsys.readouterr().out
+
+
 def test_failure_classification_is_strong_and_does_not_scan_normal_content():
     assert acp_mux._classify_failure("HTTP 429 RESOURCE_EXHAUSTED") == "quota"
     assert acp_mux._classify_failure("rate limit exceeded") == "quota"
@@ -694,6 +900,101 @@ def test_protocol_relay_with_fake_official_acp(tmp_path):
     reply = json.loads(completed.stdout.strip())
     assert reply == {"jsonrpc": "2.0", "id": 1, "result": {"ok": True}}
     assert "selected fake" in log.read_text()
+
+
+def test_lru_strategy_entrypoint_rotates_across_restarts(tmp_path):
+    fake = tmp_path / "fake_acp.py"
+    fake.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        "for line in sys.stdin:\n"
+        "    request = json.loads(line)\n"
+        "    print(json.dumps({'jsonrpc':'2.0','id':request.get('id'),'result':{'ok':True}}), flush=True)\n"
+    )
+    fake.chmod(0o755)
+
+    accounts = []
+    for name in ("a", "b", "c"):
+        home = tmp_path / name
+        home.mkdir()
+        accounts.append({"home": str(home), "label": name, "priority": 0})
+    registry = tmp_path / "accounts.json"
+    registry.write_text(json.dumps({"strategy": "lru", "accounts": accounts}))
+    state = tmp_path / "state.json"
+    log = tmp_path / "mux.log"
+
+    proc_env = os.environ.copy()
+    proc_env.update({
+        "ACP_MUX_ACCOUNTS": str(registry),
+        "ACP_MUX_STATE": str(state),
+        "ACP_MUX_LOG": str(log),
+        "ACP_MUX_PAR": str(fake),
+        "HOME": str(tmp_path),
+        "HERMES_REAL_HOME": str(tmp_path),
+        "HERMES_HOME": str(tmp_path / ".hermes"),
+    })
+    request = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize"}) + "\n"
+    for _ in range(3):
+        completed = subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / "acp_mux.py")],
+            input=request,
+            text=True,
+            capture_output=True,
+            env=proc_env,
+            timeout=10,
+            check=False,
+        )
+        assert completed.returncode == 0, completed.stderr
+
+    labels = re.findall(r"selected (\S+) via lru", log.read_text(encoding="utf-8"))
+    assert labels == ["a", "b", "c"]
+    persisted = json.loads(state.read_text(encoding="utf-8"))
+    assert all(
+        isinstance(record.get("last_selected"), (int, float))
+        for record in persisted["accounts"].values()
+    )
+
+
+def test_invalid_strategy_entrypoint_refuses_startup(tmp_path):
+    fake = tmp_path / "fake_acp.py"
+    fake.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        "for line in sys.stdin:\n"
+        "    request = json.loads(line)\n"
+        "    print(json.dumps({'jsonrpc':'2.0','id':request.get('id'),'result':{'ok':True}}), flush=True)\n"
+    )
+    fake.chmod(0o755)
+    home = tmp_path / "account-home"
+    home.mkdir()
+    registry = tmp_path / "accounts.json"
+    registry.write_text(json.dumps({
+        "strategy": "round-robin",
+        "accounts": [{"home": str(home), "label": "fake", "priority": 0}],
+    }))
+
+    proc_env = os.environ.copy()
+    proc_env.update({
+        "ACP_MUX_ACCOUNTS": str(registry),
+        "ACP_MUX_STATE": str(tmp_path / "state.json"),
+        "ACP_MUX_LOG": str(tmp_path / "mux.log"),
+        "ACP_MUX_PAR": str(fake),
+        "HOME": str(tmp_path),
+        "HERMES_REAL_HOME": str(tmp_path),
+        "HERMES_HOME": str(tmp_path / ".hermes"),
+    })
+    request = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize"}) + "\n"
+    completed = subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "acp_mux.py")],
+        input=request,
+        text=True,
+        capture_output=True,
+        env=proc_env,
+        timeout=10,
+        check=False,
+    )
+    assert completed.returncode == 2
+    assert "registry is present but unusable" in completed.stderr
 
 
 def test_official_mux_prunes_expired_sessions_and_keeps_resumable_ones(

@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import time
@@ -77,6 +78,200 @@ def test_entrypoint_forwards_resume_pin_to_account_selector(tmp_path) -> None:
                     {"home": str(home_a), "label": "a", "priority": 0},
                     {"home": str(home_b), "label": "b", "priority": 1},
                 ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    state = tmp_path / "state.json"
+    affinity = "sha256:opaque-affinity"
+    digest = acp_mux_guard.base._affinity_digest(affinity)
+    account_key = f"b\t{home_b}"
+    state.write_text(
+        json.dumps(
+            {
+                "accounts": {},
+                "affinities": {
+                    digest: {
+                        "account_key": account_key,
+                        "selected_key": account_key,
+                        "last_seen": time.time(),
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    fake = tmp_path / "fake-acp"
+    fake.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        "for line in sys.stdin:\n"
+        "    req = json.loads(line)\n"
+        "    print(json.dumps({'jsonrpc': '2.0', 'id': req.get('id'), 'result': {'protocolVersion': 1}}), flush=True)\n",
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+    log = tmp_path / "mux.log"
+    env = os.environ.copy()
+    env.update(
+        {
+            "ACP_MUX_ACCOUNTS": str(registry),
+            "ACP_MUX_STATE": str(state),
+            "ACP_MUX_LOG": str(log),
+            "ACP_MUX_PAR": str(fake),
+            "ACP_MUX_AFFINITY": affinity,
+            "ACP_MUX_AFFINITY_PIN": "1",
+            "HOME": str(tmp_path),
+            "HERMES_REAL_HOME": str(tmp_path),
+            "HERMES_HOME": str(tmp_path / ".hermes"),
+        }
+    )
+    proc = subprocess.run(
+        [sys.executable, str(GUARD_PATH)],
+        input=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize"}) + "\n",
+        text=True,
+        capture_output=True,
+        env=env,
+        timeout=15,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "selected b via affinity" in log.read_text(encoding="utf-8")
+
+
+def test_lru_strategy_distributes_across_guard_entrypoint_restarts(tmp_path) -> None:
+    fake = tmp_path / "fake-acp"
+    fake.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        "for line in sys.stdin:\n"
+        "    req = json.loads(line)\n"
+        "    print(json.dumps({'jsonrpc': '2.0', 'id': req.get('id'), 'result': {'protocolVersion': 1}}), flush=True)\n",
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+    accounts = []
+    for name in ("a", "b"):
+        home = tmp_path / f"account-{name}"
+        home.mkdir()
+        accounts.append({"home": str(home), "label": name, "priority": 0})
+    registry = tmp_path / "accounts.json"
+    registry.write_text(
+        json.dumps({"strategy": "lru", "accounts": accounts}), encoding="utf-8"
+    )
+    env = os.environ.copy()
+    env.update(
+        {
+            "ACP_MUX_ACCOUNTS": str(registry),
+            "ACP_MUX_STATE": str(tmp_path / "state.json"),
+            "ACP_MUX_LOG": str(tmp_path / "mux.log"),
+            "ACP_MUX_PAR": str(fake),
+            "HOME": str(tmp_path),
+            "HERMES_REAL_HOME": str(tmp_path),
+            "HERMES_HOME": str(tmp_path / ".hermes"),
+        }
+    )
+    request = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize"}) + "\n"
+    for _ in range(4):
+        proc = subprocess.run(
+            [sys.executable, str(GUARD_PATH)],
+            input=request,
+            text=True,
+            capture_output=True,
+            env=env,
+            timeout=15,
+            check=False,
+        )
+        assert proc.returncode == 0, proc.stderr
+
+    log_text = (tmp_path / "mux.log").read_text(encoding="utf-8")
+    labels = re.findall(r"selected (\S+) via lru", log_text)
+    assert labels == ["a", "b", "a", "b"]
+
+
+def test_lru_strategy_preserves_session_owner_routing(tmp_path) -> None:
+    fake = tmp_path / "fake-acp"
+    fake.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        "for line in sys.stdin:\n"
+        "    req = json.loads(line)\n"
+        "    print(json.dumps({'jsonrpc': '2.0', 'id': req.get('id'), 'result': {'protocolVersion': 1}}), flush=True)\n",
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+    home_a = tmp_path / "account-a"
+    home_b = tmp_path / "account-b"
+    home_a.mkdir()
+    home_b.mkdir()
+    registry = tmp_path / "accounts.json"
+    registry.write_text(
+        json.dumps(
+            {
+                "strategy": "lru",
+                "accounts": [
+                    {"home": str(home_a), "label": "a", "priority": 0},
+                    {"home": str(home_b), "label": "b", "priority": 0},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    state = tmp_path / "state.json"
+    session_id = "11111111-1111-4111-8111-111111111111"
+    base = acp_mux_guard.base
+    old_registry, old_state = base.REGISTRY_PATH, base.STATE_PATH
+    try:
+        base.REGISTRY_PATH = str(registry)
+        base.STATE_PATH = str(state)
+        assert base._record_session_owner(
+            session_id, str(home_b), "b", origin="agent", lifecycle="ephemeral"
+        )
+    finally:
+        base.REGISTRY_PATH, base.STATE_PATH = old_registry, old_state
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "ACP_MUX_ACCOUNTS": str(registry),
+            "ACP_MUX_STATE": str(state),
+            "ACP_MUX_LOG": str(tmp_path / "mux.log"),
+            "ACP_MUX_PAR": str(fake),
+            "ACP_MUX_SESSION_ID": session_id,
+            "HOME": str(tmp_path),
+            "HERMES_REAL_HOME": str(tmp_path),
+            "HERMES_HOME": str(tmp_path / ".hermes"),
+        }
+    )
+    proc = subprocess.run(
+        [sys.executable, str(GUARD_PATH)],
+        input=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize"}) + "\n",
+        text=True,
+        capture_output=True,
+        env=env,
+        timeout=15,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "selected b via session-owner" in (tmp_path / "mux.log").read_text(
+        encoding="utf-8"
+    )
+
+
+def test_lru_strategy_preserves_resume_pin_on_healthy_lane(tmp_path) -> None:
+    home_a = tmp_path / "account-a"
+    home_b = tmp_path / "account-b"
+    home_a.mkdir()
+    home_b.mkdir()
+    registry = tmp_path / "accounts.json"
+    registry.write_text(
+        json.dumps(
+            {
+                "strategy": "lru",
+                "accounts": [
+                    {"home": str(home_a), "label": "a", "priority": 0},
+                    {"home": str(home_b), "label": "b", "priority": 0},
+                ],
             }
         ),
         encoding="utf-8",
