@@ -221,10 +221,12 @@ def _results(matrix, *, candidate=CANDIDATE, **overrides) -> dict:
             lane, {"result": "success", "outputs": {"attested_sha": candidate}}
         )
     from scripts.gateway_e2e import REQUIRED_STAGES
+    from scripts.gateway_attestation import stable_baseline
+    stable_core = stable_baseline()["commit"]
     from scripts.gateway_docker import CHECKS
     results["upstream-hermes-compat"]["outputs"].update({
-        "gateway_core": "8fc0374447313e276f6b9a2764bfc750190c966a", "gateway_result": "success", "gateway_record": json.dumps({
-            "schema_version": 2, "candidate_sha": candidate, "hermes_commit": "8fc0374447313e276f6b9a2764bfc750190c966a", "status": "PASS",
+        "gateway_core": stable_core, "gateway_result": "success", "gateway_record": json.dumps({
+            "schema_version": 2, "candidate_sha": candidate, "hermes_commit": stable_core, "status": "PASS",
             "boundary_refusal_reasons": [],
             "owned_child_count": 2, "live_owned_children_after_exit": 0,
             "candidate_source_dirty": False,

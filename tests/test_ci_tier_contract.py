@@ -428,10 +428,12 @@ def test_pr_detection_failure_falls_back_to_strongest_scope() -> None:
 
 def _gateway_outputs(candidate="a" * 40):
     from scripts.gateway_e2e import REQUIRED_STAGES
+    from scripts.gateway_attestation import stable_baseline
+    stable_core = stable_baseline()["commit"]
     from scripts.gateway_docker import CHECKS
     # Synthetic UNIT input, never an execution receipt.
-    return {"attested_sha": candidate, "gateway_core": "8fc0374447313e276f6b9a2764bfc750190c966a", "gateway_result": "success", "gateway_record": json.dumps({
-        "schema_version": 2, "candidate_sha": candidate, "hermes_commit": "8fc0374447313e276f6b9a2764bfc750190c966a", "status": "PASS",
+    return {"attested_sha": candidate, "gateway_core": stable_core, "gateway_result": "success", "gateway_record": json.dumps({
+        "schema_version": 2, "candidate_sha": candidate, "hermes_commit": stable_core, "status": "PASS",
         "boundary_refusal_reasons": [],
         "owned_child_count": 2, "live_owned_children_after_exit": 0,
         "candidate_source_dirty": False,
