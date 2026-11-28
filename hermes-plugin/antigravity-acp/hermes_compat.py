@@ -167,10 +167,16 @@ def get_runtime_session_env() -> tuple[str, str]:
     return session_id, session_key
 
 
-# Hermes' in-process delegate_task marker lives in agent.delegation_context.
+# Hermes' in-process delegate_task marker is published plugin API since
+# upstream f261cd2d as ``hermes_cli.plugin_session.in_delegated_child``,
+# released in ``v0.23.5`` (the current mandatory stable baseline); the
+# private ``agent.delegation_context`` predicate stays as the guarded
+# fallback for cores below ``v0.23.5`` (the declared ``>=0.21.6`` floor
+# predates the accessor).
 # The core's env marker (HERMES_DELEGATED_CHILD_CONTEXT) marks DESCENDANT
 # processes of a child lineage; it does not imply ownership of the same ACP
-# conversation, so this gate deliberately never reads it.
+# conversation, so this gate deliberately never reads it — the public route
+# pins ``include_subprocesses=False``.
 def is_delegated_child_context() -> bool:
     """True only while executing for an in-process delegate_task child.
 
@@ -182,13 +188,31 @@ def is_delegated_child_context() -> bool:
     derive conversation identity must ask this gate so a child never keys
     itself with the parent's routing key.
 
-    A Hermes runtime without the delegation-context module (standalone plugin
-    use, or a core older than the shipped ``>=0.21.6`` floor, which carries
-    the module) reports no child context: standalone has no delegate runtime
-    at all, and pre-module cores keep their pre-issue-#2 keying — documented,
-    not silent. A module that is present but fails to import or evaluate
-    fails closed rather than guessing.
+    The catalog-listed public accessor is preferred when present; it delegates
+    to the same contextvar predicate, so the private-module fallback is
+    semantically identical, never weaker. A Hermes runtime without either route
+    (standalone plugin use, or a core older than the shipped ``>=0.21.6``
+    floor, which carries the private module) reports no child context:
+    standalone has no delegate runtime at all, and pre-module cores keep their
+    pre-issue-#2 keying — documented, not silent. A route that is present but
+    fails to import or evaluate fails closed rather than guessing, and a
+    raising public call is never swallowed into the fallback.
     """
+    try:
+        from hermes_cli.plugin_session import in_delegated_child
+    except ImportError:
+        return _is_delegated_child_context_private()
+    try:
+        return bool(in_delegated_child(include_subprocesses=False))
+    except Exception as exc:
+        raise RuntimeError(
+            "Hermes delegation-context lookup failed; refusing to guess whether "
+            "this turn may inherit another conversation's session identity."
+        ) from exc
+
+
+def _is_delegated_child_context_private() -> bool:
+    """Floor fallback: the private predicate on cores below upstream f261cd2d."""
     try:
         from agent.delegation_context import is_delegated_child_context as resolve_child
     except ImportError as exc:
@@ -214,7 +238,18 @@ def is_delegated_child_context() -> bool:
 
 
 def get_current_write_origin() -> str:
-    """Return the Hermes lane; unknown origin is unsafe when a session identity exists."""
+    """Return the Hermes lane; unknown origin is unsafe when a session identity exists.
+
+    The published ``hermes_cli.plugin_session.fork_origin()`` (upstream
+    ``f261cd2d``) was evaluated as a replacement and rejected: it answers
+    "which detached fork am I" and normalizes every non-fork origin — both
+    ``foreground`` and the in-turn ``assistant_tool`` lane — to ``""``. This
+    gate needs the raw lane string so any unknown or future non-fork origin
+    keys its own conversation affinity instead of silently sharing the
+    foreground ACP continuation. Rationale:
+    ``docs/hermes-compatibility.md``, register row
+    ``tools.skill_provenance.get_current_write_origin``.
+    """
     try:
         from tools.skill_provenance import get_current_write_origin as resolve_origin
     except ImportError as exc:
