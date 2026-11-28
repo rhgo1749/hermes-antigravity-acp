@@ -30,9 +30,99 @@ def _host_tools_package(monkeypatch, subprocess_env):
     monkeypatch.setitem(sys.modules, "tools.environments.local", local_module)
 
 
+def _no_public_plugin_session(monkeypatch):
+    """Simulate a core below upstream f261cd2d: no published plugin_session API.
+
+    A ``None`` sys.modules entry makes the import raise ImportError exactly
+    like an absent module, so these tests exercise the private floor-fallback
+    route deterministically whether or not Hermes is installed in the lane.
+    """
+    monkeypatch.setitem(sys.modules, "hermes_cli.plugin_session", None)
+
+
+def _fake_public_plugin_session(monkeypatch, in_delegated_child):
+    hermes_cli_package = types.ModuleType("hermes_cli")
+    hermes_cli_package.__path__ = []
+    plugin_session = types.ModuleType("hermes_cli.plugin_session")
+    setattr(plugin_session, "in_delegated_child", in_delegated_child)
+    monkeypatch.setitem(sys.modules, "hermes_cli", hermes_cli_package)
+    monkeypatch.setitem(sys.modules, "hermes_cli.plugin_session", plugin_session)
+
+
+def _fake_delegation_context(monkeypatch, predicate):
+    agent_package = types.ModuleType("agent")
+    agent_package.__path__ = []
+    delegation = types.ModuleType("agent.delegation_context")
+    setattr(delegation, "is_delegated_child_context", predicate)
+    monkeypatch.setitem(sys.modules, "agent", agent_package)
+    monkeypatch.setitem(sys.modules, "agent.delegation_context", delegation)
+    return delegation
+
+
+def test_delegated_child_gate_prefers_public_api_and_pins_no_subprocesses(monkeypatch):
+    """Public plugin_session route wins and is called with include_subprocesses=False.
+
+    ``include_subprocesses=False`` is what keeps the descendant env marker
+    (HERMES_DELEGATED_CHILD_CONTEXT) unread: a stale marker must never flip
+    the gate on the public route either.
+    """
+    _, compat = _compat(monkeypatch)
+    calls = []
+
+    def in_delegated_child(*, include_subprocesses):
+        calls.append(include_subprocesses)
+        return True
+
+    _fake_public_plugin_session(monkeypatch, in_delegated_child)
+
+    def private_must_not_run():
+        raise AssertionError("private delegation route must not be consulted")
+
+    _fake_delegation_context(monkeypatch, private_must_not_run)
+    monkeypatch.setenv("HERMES_DELEGATED_CHILD_CONTEXT", "1")
+
+    assert compat.is_delegated_child_context() is True
+    assert calls == [False]
+
+
+def test_delegated_child_gate_falls_back_to_private_module_below_public_floor(monkeypatch):
+    """Cores without hermes_cli.plugin_session keep the private route (>=0.21.6 floor)."""
+    _, compat = _compat(monkeypatch)
+    _no_public_plugin_session(monkeypatch)
+    _fake_delegation_context(monkeypatch, lambda: True)
+    assert compat.is_delegated_child_context() is True
+
+    # A plugin_session module that exists but lacks the symbol (a core between
+    # the module's introduction and the accessor's) falls back the same way.
+    hermes_cli_package = types.ModuleType("hermes_cli")
+    hermes_cli_package.__path__ = []
+    monkeypatch.setitem(sys.modules, "hermes_cli", hermes_cli_package)
+    monkeypatch.setitem(
+        sys.modules, "hermes_cli.plugin_session", types.ModuleType("hermes_cli.plugin_session")
+    )
+    assert compat.is_delegated_child_context() is True
+
+
+def test_delegated_child_gate_public_api_raise_fails_closed_without_fallback(monkeypatch):
+    """A raising public call is never swallowed into the private fallback."""
+    _, compat = _compat(monkeypatch)
+
+    def exploding_in_delegated_child(*, include_subprocesses):
+        raise RuntimeError("simulated public delegation lookup crash")
+
+    _fake_public_plugin_session(monkeypatch, exploding_in_delegated_child)
+    # Even a perfectly healthy private route must not rescue the failing
+    # public call: falling through would guess which route Core trusts.
+    _fake_delegation_context(monkeypatch, lambda: False)
+
+    with pytest.raises(RuntimeError, match="delegation-context lookup failed"):
+        compat.is_delegated_child_context()
+
+
 def test_delegated_child_gate_is_false_without_core_and_ignores_env_marker(monkeypatch):
     """Reviewer contract: the descendant env marker is NOT conversation ownership."""
     _, compat = _compat(monkeypatch)
+    _no_public_plugin_session(monkeypatch)
     monkeypatch.delitem(sys.modules, "agent", raising=False)
     monkeypatch.delitem(sys.modules, "agent.delegation_context", raising=False)
     monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
@@ -47,6 +137,7 @@ def test_delegated_child_gate_is_false_without_core_and_ignores_env_marker(monke
 def test_delegated_child_gate_is_false_on_cores_without_the_module(monkeypatch, tmp_path):
     """A Hermes older than the shipped floor has no delegation_context module."""
     _, compat = _compat(monkeypatch)
+    _no_public_plugin_session(monkeypatch)
     agent_pkg = types.ModuleType("agent")
     agent_pkg.__path__ = [str(tmp_path)]  # real, empty directory: no submodule
     monkeypatch.setitem(sys.modules, "agent", agent_pkg)
@@ -57,6 +148,7 @@ def test_delegated_child_gate_is_false_on_cores_without_the_module(monkeypatch, 
 def test_delegated_child_gate_fails_closed_on_present_but_broken_module(monkeypatch, tmp_path):
     """Module file exists but explodes on import: refuse to guess."""
     _, compat = _compat(monkeypatch)
+    _no_public_plugin_session(monkeypatch)
     (tmp_path / "delegation_context.py").write_text(
         "raise RuntimeError('module body exploded')\n", encoding="utf-8"
     )
@@ -70,6 +162,7 @@ def test_delegated_child_gate_fails_closed_on_present_but_broken_module(monkeypa
 
 def test_delegated_child_gate_uses_core_contextvar_and_fails_closed_on_api_loss(monkeypatch):
     _, compat = _compat(monkeypatch)
+    _no_public_plugin_session(monkeypatch)
     agent_pkg = types.ModuleType("agent")
     agent_pkg.__path__ = []
     delegation = types.ModuleType("agent.delegation_context")
@@ -99,6 +192,7 @@ def test_session_lookup_failure_fails_closed_for_children_keeps_env_fallback_oth
     documented env fallback.
     """
     _, compat = _compat(monkeypatch)
+    _no_public_plugin_session(monkeypatch)
     gateway = types.ModuleType("gateway")
     gateway.__path__ = []
     session_context = types.ModuleType("gateway.session_context")
