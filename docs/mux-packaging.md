@@ -45,6 +45,23 @@ explicitly (see the environment table in `scripts/acp_mux.py`, e.g.
 Google's official ACP runtime; the mux never reads credential files or
 exchanges tokens.
 
+### Lane selection strategy (`accounts.json` `"strategy"`)
+
+`accounts.json` accepts an optional top-level `"strategy"` field:
+
+- `"priority"` (absent default): new sessions fill the best healthy
+  priority tier via round-robin / least-assigned affinity balancing.
+- `"lru"`: new assignments and remaps away from a quarantined lane pick
+  the healthy lane with the oldest `max(last_selected, last_cooldown)`
+  (recorded in the mux state file), with `priority` as tie-breaker. A
+  lane that just exited a quota cooldown therefore ranks behind lanes
+  that have been idle longer and re-enters rotation automatically once
+  the others are used again.
+
+`session-owner` routing and affinity pins on healthy lanes are unchanged
+by the strategy. Any other `"strategy"` value makes the registry invalid
+(mux refuses to start; `doctor` reports `registry-problem=invalid-strategy`).
+
 ## Status (doctor)
 
 ```sh
