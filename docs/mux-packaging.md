@@ -52,15 +52,18 @@ exchanges tokens.
 - `"priority"` (absent default): new sessions fill the best healthy
   priority tier via round-robin / least-assigned affinity balancing.
 - `"lru"`: new assignments and remaps away from a quarantined lane pick
-  the healthy lane with the oldest `max(last_selected, last_cooldown)`
+  the healthy lane with the oldest `max(last_selected, cooldown_until)`
   (recorded in the mux state file), with `priority` as tie-breaker. A
   lane that just exited a quota cooldown therefore ranks behind lanes
   that have been idle longer and re-enters rotation automatically once
   the others are used again.
 
-`session-owner` routing and affinity pins on healthy lanes are unchanged
-by the strategy. Any other `"strategy"` value makes the registry invalid
-(mux refuses to start; `doctor` reports `registry-problem=invalid-strategy`).
+`last_selected` is refreshed only on new assignments and post-quarantine
+remaps; `session-owner` routing and healthy `affinity` pin hits never
+touch it. `session-owner` routing and affinity pins on healthy lanes are
+otherwise unchanged by the strategy. Any other `"strategy"` value
+(including an explicit `null`) makes the registry invalid (mux refuses
+to start; `doctor` reports `registry-problem=invalid-strategy`).
 
 ## Status (doctor)
 

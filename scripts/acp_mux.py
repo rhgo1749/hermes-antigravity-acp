@@ -522,11 +522,10 @@ def _load_registry_data(
     accounts = data.get("accounts")
     if not isinstance(accounts, list):
         return None, data, "missing-accounts"
-    strategy = data.get("strategy")
-    if strategy is not None and (
-        not isinstance(strategy, str) or strategy not in REGISTRY_STRATEGIES
-    ):
-        return None, data, "invalid-strategy"
+    if "strategy" in data:
+        strategy = data["strategy"]
+        if not isinstance(strategy, str) or strategy not in REGISTRY_STRATEGIES:
+            return None, data, "invalid-strategy"
     return [entry for entry in accounts if isinstance(entry, dict)], data, ""
 
 
@@ -2705,15 +2704,24 @@ def _pick_account(
                 ) -> tuple[float, int, int]:
                     record = health.get(row[4])
                     record = record if isinstance(record, dict) else {}
-                    last_selected = record.get("last_selected", 0)
-                    last_selected = (
-                        float(last_selected)
-                        if isinstance(last_selected, (int, float))
-                        else 0.0
+
+                    def stamp(value: object) -> float:
+                        # A hand-edited or half-written record must never
+                        # poison the ordering (NaN keys are unordered).
+                        if (
+                            isinstance(value, (int, float))
+                            and not isinstance(value, bool)
+                            and math.isfinite(value)
+                        ):
+                            return float(value)
+                        return 0.0
+
+                    return (
+                        max(stamp(record.get("last_selected", 0)),
+                            stamp(record.get("cooldown_until", 0))),
+                        row[0],
+                        row[1],
                     )
-                    until = record.get("cooldown_until", 0)
-                    until = float(until) if isinstance(until, (int, float)) else 0.0
-                    return (max(last_selected, until), row[0], row[1])
 
                 chosen = min(healthy, key=lane_score)
                 record = health.get(chosen[4])

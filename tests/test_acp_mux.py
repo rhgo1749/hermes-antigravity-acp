@@ -624,7 +624,7 @@ def test_lru_preserves_healthy_affinity_pin(env):
     assert all(pick[2] == "affinity" for pick in picks)
 
 
-def test_lru_fails_over_quarantined_pin_and_returns_by_idle_order(env):
+def test_lru_fails_over_quarantined_pin_and_returns_to_preferred(env):
     homes = [str(env / name) for name in ("a", "b", "c")]
     _registry_strategy(env, [
         {"home": home, "label": label, "priority": 0}
@@ -679,7 +679,52 @@ def test_lru_loads_legacy_state_without_last_selected(env):
     assert state["accounts"][_health_key("a", homes[0])]["last_selected"] == 601.0
 
 
-@pytest.mark.parametrize("strategy", ["round-robin", 5, True, ""])
+def test_lru_affinity_save_failure_falls_back_to_rendezvous(env, monkeypatch):
+    homes = [str(env / name) for name in ("a", "b", "c")]
+    _registry_strategy(env, [
+        {"home": home, "label": label, "priority": 0}
+        for home, label in zip(homes, ("a", "b", "c"), strict=True)
+    ], "lru")
+    affinity = "persistence-failure"
+    rows = [
+        (0, index, home, label, f"{label}\t{home}")
+        for index, (home, label) in enumerate(zip(homes, ("a", "b", "c"), strict=True))
+    ]
+    expected = acp_mux._affinity_pick(rows, affinity)
+    monkeypatch.setattr(acp_mux, "_save_state_unlocked", lambda _state: False)
+
+    selected = acp_mux._pick_account(now=100.0, affinity=affinity)
+
+    assert selected[1] == expected[3]
+    assert selected[2] == "affinity-state-fallback"
+
+
+def test_lru_ignores_malformed_selection_timestamps(env):
+    homes = [str(env / name) for name in ("a", "b", "c", "d")]
+    _registry_strategy(env, [
+        {"home": home, "label": label, "priority": 0}
+        for home, label in zip(homes, ("a", "b", "c", "d"), strict=True)
+    ], "lru")
+    Path(acp_mux.STATE_PATH).write_text(json.dumps({
+        "version": 1,
+        "cursor": {},
+        "accounts": {
+            _health_key("a", homes[0]): {"last_selected": True},
+            _health_key("b", homes[1]): {"last_selected": float("nan")},
+            _health_key("c", homes[2]): {"last_selected": "yesterday"},
+            _health_key("d", homes[3]): {"cooldown_until": True},
+        },
+    }))
+
+    # Every malformed stamp reads as 0.0, so the rotation stays the
+    # deterministic priority/registry order instead of NaN poisoning.
+    picks = [
+        acp_mux._pick_account(now=100.0 + index)[1] for index in range(4)
+    ]
+    assert picks == ["a", "b", "c", "d"]
+
+
+@pytest.mark.parametrize("strategy", ["round-robin", 5, True, "", None])
 def test_invalid_registry_strategy_fails_closed(env, strategy):
     _registry_strategy(env, [
         {"home": str(env / "a"), "label": "a", "priority": 0},
